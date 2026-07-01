@@ -1,0 +1,11 @@
+# Build artifacts
+/tshare
+/dist/
+
+# Runtime state / inboxes (created by `tshare -u` / folder shares)
+/tshare-inbox/
+*.enc
+
+# macOS / editor / sync cruft
+.DS_Store
+.stfolder/

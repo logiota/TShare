@@ -1,0 +1,36 @@
+# tshare config — copy to ~/.config/tshare/config
+# Keys are long flag names (without the leading --). Bare key = true.
+# The [default] section always applies; a [name] section applies with --profile name.
+# CLI flags always override the config.
+
+[default]
+# password   = shiv.ivar        # or prefer the TSHARE_PASSWORD env var
+expires      = 7d
+qr           = true
+# no-lan     = true
+# max-rate   = 5M               # throttle served bandwidth to ~5 MB/s
+# min-free   = 32G              # refuse uploads below this much free disk (0 = off)
+# abuse-contact = abuse@example.com   # small-font takedown line on public pages
+
+# tshare --profile public ~/file
+[public]
+expires      = 24h
+max-bytes    = 5G
+require-identity = false
+
+# tshare --profile private ~/file   (tailnet only, longer-lived)
+[private]
+tailnet      = true
+expires      = never
+
+# tshare --profile media ~/Movies
+[media]
+transcode    = true
+heif         = true
+strip-exif   = true
+
+# Optional org policy (opt-in). Applied at share-creation; CLI flags CANNOT
+# override these. Omit the whole section for no policy (the default).
+# [policy]
+# require_password = true       # refuse to start a share without -p
+# max_expires      = 7d         # cap any longer / "never" expiry down to this
