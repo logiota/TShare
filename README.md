@@ -23,6 +23,9 @@ tshare --once secrets.env              # link dies after first download
 tshare -z -e 1w ~/Photos/trip          # folder as one .zip, lives a week
 tshare -u -e 2d                        # inbox: others upload files TO you
 tshare -i                              # blackhole inbox: count uploads, keep nothing
+tshare --room standup                  # video room on your local MiroTalk (auto-started)
+tshare --call                          # the link IS a built-in 1:1 video call
+tshare --p2p big.iso                   # ⚡ direct browser-to-browser transfer + fallback
 tshare --allow-upload -p pw ~/proj     # collaboration: browse + upload, password-gated
 tshare a.pdf b.png notes/              # multiple items → combined listing
 tshare -t plan.md                      # tailnet-only (tailscale serve, not public)
@@ -94,6 +97,38 @@ tshare -s http://192.168.1.9:9000      # any reachable host:port with -s
 ```
 
 Same subpath caveat as `--site`: the app is served under `/<token>/`, so **relative asset paths** work; root-absolute (`/assets/…`) need your dev server's base path set to the share path (pair with `--name`). For Vite/webpack that's `base`/`publicPath`.
+
+## Video rooms (local MiroTalk, auto-managed)
+
+`--room` turns a secret link into the door to a [MiroTalk](https://github.com/miroslavpejic85/mirotalk) video room running **on your own machine**. One-time setup, then it's fully automatic:
+
+```sh
+tshare room install        # once: clones MiroTalk from GitHub into ~/.tshare/mirotalk,
+                           # copies its .env/config templates, installs deps (npm or
+                           # docker), and records the location in your tshare config
+tshare --room standup      # every time after: tshare starts MiroTalk (if it isn't
+                           # already running), health-checks it, exposes it at your
+                           # funnel ROOT, and prints the token-gated room link
+```
+
+The landing page has a **Join call** button and an optional display-name field; your `-p` password, `-e` expiry and the unguessable token decide **who reaches the join button**. The join URL is the documented `…/join?room=<name>` form. Room ids are random and unguessable unless you name one (`Team Sync` → `Team-Sync`). `?go=1` on the share link skips the landing page and 302s straight into the call. When the share stops, the MiroTalk it started stops with it (a MiroTalk you started yourself is reused and left alone); `tshare panic` reaps it too. Media never touches the server — MiroTalk P2P is mesh WebRTC, so the local instance only carries **signaling**; tshare runs it with `NODE_ENV=production`.
+
+`--mirotalk-url https://meet.mycorp.com` still points at a remote self-hosted instance instead; `tshare room status` shows what's installed/running. Caveats: MiroTalk needs the funnel **root** path (it's mounted at `/`, coexisting with token-path shares), and expiry/revocation gates *new* visitors — people already in the room hold the room URL.
+
+## ⚡ P2P direct transfers (`--p2p`) and built-in calls (`--call`)
+
+`--p2p` on a single-file share adds a **browser-to-browser WebRTC DataChannel** path: the visitor clicks *⚡ Direct P2P download* and the bytes flow straight from your machine to theirs — **skipping the funnel relay entirely** when the STUN hole-punch succeeds (most home NATs and many CGNATs, since Funnel-relayed HTTPS is bandwidth-capped while a direct UDP path runs at line speed). The normal HTTPS download stays one click away as the fallback, so nothing can get *slower* by adding `--p2p`.
+
+```sh
+tshare --p2p big.iso            # share + auto-open the local ⚡ sender tab
+tshare --p2p -p pw big.iso      # password still gates receivers (sender tab uses its own key)
+tshare --p2p --turn turn:t.example.com:3478 --turn-user u --turn-pass p big.iso
+tshare --call                   # the link IS a 1:1 video call — no MiroTalk, no setup
+```
+
+How it works (the Go binary stays stdlib-only): tshare hosts the pages and a tiny token-gated signaling relay; all WebRTC runs in browsers. The **sender side is a local tab** that auto-opens (`--no-open` prints its URL instead) and must stay open — it streams the file from loopback into per-receiver DataChannels with backpressure, shows live per-transfer speed, and heartbeats presence so receiver pages can tell whether ⚡ is available. Receivers stream to disk via the File System Access API (Chromium; other browsers assemble in memory, capped at 1.5 GB). Completed P2P transfers count toward `-n`/`--once`; P2P bytes don't count toward `--max-bytes` (they never ride the funnel). Direct connections need UDP hole-punch — when both ends sit behind symmetric NAT/hard CGNAT it fails cleanly and the page says to use the standard download; configure `--turn` for a guaranteed relay path.
+
+`--call` serves a minimal 1:1 call page (camera/mic, mute, cam toggle, leave) using the same signaling — perfect for "jump on a quick call" without installing anything. Two participants max; the secret link is the room. Needs HTTPS for camera/mic, which funnel/serve provide.
 
 ## Static websites over Funnel (v1.8)
 
