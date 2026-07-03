@@ -2877,13 +2877,19 @@ function rand(){ var a=new Uint8Array(12); crypto.getRandomValues(a);
   return Array.from(a,function(b){return b.toString(16).padStart(2,'0');}).join(''); }
 async function post(ep,body){ return fetch('__rtc/'+ep,{method:'POST',
   headers:{'Content-Type':'application/json'},body:body?JSON.stringify(body):'{}'}); }
-fetch('__rtc/presence').then(function(r){return r.json();}).then(function(j){
-  say(j.online ? 'sender online — ready for direct P2P' :
-    'sender tab offline — use the standard download');
-  if(!j.online) btn.disabled = true;
-}).catch(function(){ say('ready'); });
+var started = false;                                       // stop presence UI once a transfer runs
+(function watchPresence(){
+  fetch('__rtc/presence').then(function(r){return r.json();}).then(function(j){
+    if (started) return;
+    btn.disabled = !j.online;
+    say(j.online ? 'sender online — ready for direct P2P' :
+      'sender tab not responding — retrying… (or use the standard download)');
+  }).catch(function(){}).then(function(){
+    if (!started) setTimeout(watchPresence, 4000);
+  });
+})();
 btn.onclick = async function(){
-  btn.disabled = true;
+  btn.disabled = true; started = true;
   var writer=null, parts=null;
   try{
     if (window.showSaveFilePicker) {                       // stream to disk
@@ -2893,7 +2899,7 @@ btn.onclick = async function(){
       if (SIZE > 1500000000) { say('file too big for in-memory receive here — use standard download'); return; }
       parts = [];
     }
-  }catch(e){ btn.disabled=false; return; }                 // picker cancelled
+  }catch(e){ btn.disabled=false; started=false; return; }  // picker cancelled
   var sid = rand(), got = 0, t0 = Date.now(), connected = false, done = false;
   var pc = new RTCPeerConnection({iceServers:ICE});
   pc.onicecandidate = function(e){ if(e.candidate) post('msg?sid='+sid+'&from=b',{t:'cand',c:e.candidate}); };
@@ -2960,27 +2966,45 @@ ul#xfers li { padding:8px 10px; border-bottom:1px solid var(--line); font-size:1
 </style></head>
 <body>
 <div class="hd"><h1>⚡ P2P sender</h1><div class="fn">{{.Name}} · {{.SizeH}}</div></div>
-<div class="warn">keep this tab open — it streams the file directly to downloaders.<br>closing it disables ⚡ P2P (the standard funnel download keeps working).</div>
+<div class="warn">keep this tab open <b>and visible</b> — it streams the file directly to downloaders.<br>
+Safari pauses background tabs (transfers stall until you return); Chrome keeps them running.<br>
+closing it disables ⚡ P2P (the standard funnel download keeps working).</div>
+<div class="warn" id="health" style="color:var(--acc)">starting…</div>
 <ul id="xfers"></ul>
 <script>
 var ICE = {{.Ice}}, NAME = {{.Name}};
 var KEY = new URLSearchParams(location.search).get('k') || '';
 var KQ = '?k='+encodeURIComponent(KEY), KA = '&k='+encodeURIComponent(KEY);
 var CHUNK = 65536, HIGH = 8388608, LOW = 1048576, active = 0;
-var list = document.getElementById('xfers');
+var list = document.getElementById('xfers'), health = document.getElementById('health');
 function sleep(ms){ return new Promise(function(r){ setTimeout(r,ms); }); }
 async function post(ep,body){ return fetch('../__rtc/'+ep+KA,{method:'POST',
   headers:{'Content-Type':'application/json'},body:JSON.stringify(body)}); }
-setInterval(function(){ fetch('../__rtc/presence'+KQ,{method:'POST'}); }, 5000);
-fetch('../__rtc/presence'+KQ,{method:'POST'});
+function beat(){ fetch('../__rtc/presence'+KQ,{method:'POST'}).catch(function(){}); }
+setInterval(beat, 5000); beat();
+document.addEventListener('visibilitychange', beat);       // instant beat on tab return
 (async function loop(){
+  var fails = 0;
   for(;;){
-    if (active >= 4) { await sleep(500); continue; }
-    var r = await fetch('../__rtc/next'+KQ+'&wait=1');
-    if (r.status === 204) continue;
-    if (!r.ok) { await sleep(1500); continue; }
-    var j = await r.json();
-    if (j.sid) serve(j.sid);
+    try{
+      if (active >= 4) { await sleep(500); continue; }
+      var r = await fetch('../__rtc/next'+KQ+'&wait=1');
+      if (r.status === 403 || r.status === 404) {          // stale tab: share restarted
+        health.textContent = '✕ this sender tab is STALE — the share was restarted. Close it and use the newly opened one.';
+        health.style.color = '#c33'; return;
+      }
+      fails = 0;
+      health.textContent = '● online — waiting for downloaders ('+active+' active)';
+      if (r.status === 204) continue;
+      if (!r.ok) { await sleep(1500); continue; }
+      var j = await r.json();
+      if (j.sid) serve(j.sid);
+    }catch(e){                                             // network hiccup / share gone
+      fails++;
+      if (fails > 20) { health.textContent = '✕ share unreachable — was it stopped? (Ctrl-C in the terminal ends P2P)'; health.style.color = '#c33'; return; }
+      health.textContent = '… reconnecting ('+fails+')';
+      await sleep(2000);
+    }
   }
 })();
 async function serve(sid){
@@ -2993,41 +3017,45 @@ async function serve(sid){
   pc.onicecandidate = function(e){ if(e.candidate) post('msg?sid='+sid+'&from=a',{t:'cand',c:e.candidate}); };
   var finished = false, sent = 0, t0 = 0;
   dc.onopen = async function(){
-    t0 = Date.now();
-    dc.send(JSON.stringify({t:'meta',name:NAME}));
-    var resp = await fetch('../' + encodeURIComponent(NAME) + '?raw=1' + KA);
-    var reader = resp.body.getReader();
-    for(;;){
-      var rr = await reader.read();
-      if (rr.done) break;
-      var buf = rr.value;
-      for (var off = 0; off < buf.byteLength; off += CHUNK) {
-        while (dc.bufferedAmount > HIGH) {
-          await new Promise(function(res){ dc.onbufferedamountlow = res; });
+    try{
+      t0 = Date.now();
+      dc.send(JSON.stringify({t:'meta',name:NAME}));
+      var resp = await fetch('../' + encodeURIComponent(NAME) + '?raw=1' + KA);
+      var reader = resp.body.getReader();
+      for(;;){
+        var rr = await reader.read();
+        if (rr.done) break;
+        var buf = rr.value;
+        for (var off = 0; off < buf.byteLength; off += CHUNK) {
+          while (dc.bufferedAmount > HIGH) {
+            await new Promise(function(res){ dc.onbufferedamountlow = res; });
+          }
+          dc.send(buf.subarray(off, Math.min(off+CHUNK, buf.byteLength)));
+          sent += Math.min(CHUNK, buf.byteLength-off);
         }
-        dc.send(buf.subarray(off, Math.min(off+CHUNK, buf.byteLength)));
-        sent += Math.min(CHUNK, buf.byteLength-off);
+        var mbps = sent/1048576/((Date.now()-t0)/1000);
+        li.textContent = sid.slice(0,8)+' — '+(sent/1048576).toFixed(1)+' MB · '+mbps.toFixed(1)+' MB/s';
       }
-      var mbps = sent/1048576/((Date.now()-t0)/1000);
-      li.textContent = sid.slice(0,8)+' — '+(sent/1048576).toFixed(1)+' MB · '+mbps.toFixed(1)+' MB/s';
-    }
-    while (dc.bufferedAmount > 0) { await sleep(100); }
-    dc.send(JSON.stringify({t:'eof'}));
-    li.textContent = sid.slice(0,8)+' — ✓ sent '+(sent/1048576).toFixed(1)+' MB';
+      while (dc.bufferedAmount > 0) { await sleep(100); }
+      dc.send(JSON.stringify({t:'eof'}));
+      li.textContent = sid.slice(0,8)+' — ✓ sent '+(sent/1048576).toFixed(1)+' MB';
+    }catch(e){ li.textContent = sid.slice(0,8)+' — ✕ send failed: '+(e && e.message || e); }
     finished = true;
   };
-  var offer = await pc.createOffer(); await pc.setLocalDescription(offer);
-  post('msg?sid='+sid+'&from=a',{t:'offer',sdp:pc.localDescription});
-  var deadline = Date.now() + 600000;
-  while (!finished && Date.now() < deadline) {             // answer/cands (+ack)
-    var r = await fetch('../__rtc/msg?sid='+sid+'&as=a&wait=1'+KA);
-    if (r.status === 204) continue;
-    if (!r.ok) { await sleep(1000); continue; }
-    var m = await r.json();
-    if (m.t === 'answer') await pc.setRemoteDescription(m.sdp);
-    else if (m.t === 'cand') { try { await pc.addIceCandidate(m.c); } catch(e){} }
-    else if (m.t === 'ack') break;
-  }
+  try{
+    var offer = await pc.createOffer(); await pc.setLocalDescription(offer);
+    post('msg?sid='+sid+'&from=a',{t:'offer',sdp:pc.localDescription});
+    var deadline = Date.now() + 600000;
+    while (!finished && Date.now() < deadline) {           // answer/cands (+ack)
+      var r = await fetch('../__rtc/msg?sid='+sid+'&as=a&wait=1'+KA);
+      if (r.status === 204) continue;
+      if (!r.ok) { await sleep(1000); continue; }
+      var m = await r.json();
+      if (m.t === 'answer') await pc.setRemoteDescription(m.sdp);
+      else if (m.t === 'cand') { try { await pc.addIceCandidate(m.c); } catch(e){} }
+      else if (m.t === 'ack') break;
+    }
+  }catch(e){ li.textContent = sid.slice(0,8)+' — ✕ '+(e && e.message || 'failed'); }
   setTimeout(function(){ pc.close(); }, 3000);
   active--;
 }
@@ -5123,9 +5151,10 @@ func appendConfigKeys(kv map[string]string) error {
 type rtcHub struct {
 	mu         sync.Mutex
 	sessions   map[string]*rtcSess
-	pending    []string      // receiver sids waiting for the sender tab
-	pendCh     chan struct{} // signaled when pending grows
-	senderSeen time.Time     // --p2p sender-tab heartbeat
+	pending     []string      // receiver sids waiting for the sender tab
+	pendCh      chan struct{} // signaled when pending grows
+	senderSeen  time.Time     // --p2p sender-tab heartbeat
+	senderPolls int           // open sender long-polls (a connected poll = alive)
 	claims     map[string]time.Time // --call: role → last heartbeat
 	lastGC     time.Time
 }
@@ -5284,10 +5313,16 @@ func (h *rtcHub) beat(role string) {
 }
 
 func (h *rtcHub) senderBeat() { h.mu.Lock(); h.senderSeen = time.Now(); h.mu.Unlock() }
+
+// senderOnline is deliberately generous: Safari throttles or suspends timers
+// in background tabs, so explicit heartbeats can stall while the tab is still
+// perfectly able to serve (its chained long-poll is network-event driven and
+// keeps running). An open long-poll counts as a live beat (see handleRTC), and
+// the window is a full minute so a throttled-but-alive tab stays "online".
 func (h *rtcHub) senderOnline() bool {
 	h.mu.Lock()
 	defer h.mu.Unlock()
-	return time.Since(h.senderSeen) < 12*time.Second
+	return h.senderPolls > 0 || time.Since(h.senderSeen) < 60*time.Second
 }
 
 // senderReq: the auto-opened local sender tab authenticates with a per-share
@@ -5386,7 +5421,18 @@ func (s *share) handleRTC(w *respRec, r *http.Request, ep string) {
 			http.Error(w, "403", http.StatusForbidden)
 			return
 		}
-		if sid := s.hub.next(r.Context(), q.Get("wait") == "1"); sid != "" {
+		// the connected poll itself is proof of life — beats survive Safari's
+		// background-tab timer throttling, which stalls setInterval heartbeats
+		s.hub.senderBeat()
+		s.hub.mu.Lock()
+		s.hub.senderPolls++
+		s.hub.mu.Unlock()
+		sid := s.hub.next(r.Context(), q.Get("wait") == "1")
+		s.hub.mu.Lock()
+		s.hub.senderPolls--
+		s.hub.mu.Unlock()
+		s.hub.senderBeat()
+		if sid != "" {
 			jsonOK(map[string]any{"sid": sid})
 			return
 		}
