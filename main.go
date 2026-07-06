@@ -1512,15 +1512,17 @@ func randToken(n int) string {
 }
 
 // randSid mints a GIGA-NET/1-L session id — lowercase alphanumeric only, since
-// that's the charset the game pages accept in #gn=/#gnhost= fragments.
+// that's the charset the game pages accept in #gn=/#gnhost= fragments. A
+// 32-char set indexed with &31 keeps the draw uniform (no modulo bias); the
+// share token remains the actual access gate, the sid just names the session.
 func randSid(n int) string {
-	const cs = "0123456789abcdefghijklmnopqrstuvwxyz"
+	const cs = "0123456789abcdefghijklmnopqrstuv" // 32 chars ⊂ [a-z0-9]
 	b := make([]byte, n)
 	if _, err := rand.Read(b); err != nil {
 		panic(err)
 	}
 	for i := range b {
-		b[i] = cs[int(b[i])%len(cs)]
+		b[i] = cs[b[i]&31]
 	}
 	return string(b)
 }
@@ -3588,6 +3590,8 @@ type stateRec struct {
 	Expires   time.Time `json:"expires,omitempty"`
 	MTPid     int       `json:"mirotalk_pid,omitempty"`   // local MiroTalk child we own
 	RootMount bool      `json:"root_mount,omitempty"`     // we hold the funnel/serve root path
+	GameJoin  string    `json:"game_join,omitempty"`      // --gamelink: the JOIN link (child's live session id)
+	GameHost  string    `json:"game_host,omitempty"`      // --gamelink: the auto-host (#gnhost) link
 }
 
 func stateDir() string {
@@ -3608,6 +3612,7 @@ func (s *share) stateRec(port int) stateRec {
 	if s.mtCmd != nil && s.mtCmd.Process != nil {
 		mtPid = s.mtCmd.Process.Pid
 	}
+	gameJoin, gameHost := s.gameLinks()
 	return stateRec{
 		ID: s.id, PID: os.Getpid(), Token: s.token, Mode: s.mode,
 		URL: s.prettyURL(), Target: target, Tailnet: s.cfg.Tailnet, Local: s.cfg.Local,
@@ -3615,6 +3620,7 @@ func (s *share) stateRec(port int) stateRec {
 		MaxDL: s.maxDL.Load(), Downloads: s.dl.Load(), Uploads: s.upCount.Load(),
 		Created: s.createdAt, Expires: s.getExpires(),
 		MTPid: mtPid, RootMount: s.mtRootMounted,
+		GameJoin: gameJoin, GameHost: gameHost,
 	}
 }
 
@@ -3760,19 +3766,38 @@ func daemonize(s *share) error {
 			continue
 		}
 		if s.cfg.Quiet {
-			fmt.Println(rec.URL)
+			if rec.GameJoin != "" { // game share: the JOIN link is the artifact you pipe/send
+				fmt.Println(rec.GameJoin)
+			} else {
+				fmt.Println(rec.URL)
+			}
 		} else if s.cfg.JSON {
-			fmt.Println(string(b))
+			fmt.Println(string(b)) // state JSON includes game_join/game_host for -g shares
 		} else {
 			fmt.Printf("\n  ✓ sharing in background  (id %s, pid %d)\n", rec.ID, pid)
 			fmt.Printf("  link     %s\n", rec.URL)
+			if rec.GameJoin != "" {
+				fmt.Printf("  🎮 join  %s   ← send THIS to the other player\n", rec.GameJoin)
+				fmt.Printf("  🎮 host  %s\n", rec.GameHost)
+			}
 			if !rec.Expires.IsZero() {
 				fmt.Printf("  expires  %s (use -e never to keep)\n", rec.Expires.Format("Jan 2 15:04"))
 			}
 			fmt.Printf("  log      %s\n", filepath.Join(logDir, s.id+".log"))
 			fmt.Printf("  stop     tshare rm %s\n\n", rec.ID)
 		}
-		linkExtras(s.cfg, rec.URL)
+		if rec.GameJoin != "" {
+			linkExtras(s.cfg, rec.GameJoin) // clipboard/QR get the join link, matching foreground -g
+			// mirror foreground auto-open: the daemon child never opens a browser, so the parent does
+			if s.cfg.NoOpen {
+				fmt.Fprintf(os.Stderr, "  🎮 open this on the host machine: %s\n", rec.GameHost)
+			} else {
+				fmt.Fprintf(os.Stderr, "  🎮 host page opened — send the join link (already on your clipboard)\n")
+				openBrowser(rec.GameHost)
+			}
+		} else {
+			linkExtras(s.cfg, rec.URL)
+		}
 		return nil
 	}
 	return errors.New("timed out waiting for background share (check tshare ls / logs)")
