@@ -68,12 +68,16 @@ USAGE
   tshare -                            share stdin (pipe)
   tshare -u [dir]                     inbox: link where others UPLOAD to you
   tshare -i                           blackhole inbox: accept & count uploads, keep nothing
+  tshare --room [name]                video-room link (local MiroTalk, auto-started)
+  tshare room install                 one-time: install MiroTalk locally from GitHub
+  tshare --call                       the link IS a 1:1 video call (built-in WebRTC)
   tshare set <id> [-p pw] [-e dur] [-n N]   change options on a RUNNING share
   tshare extend <id> [dur]            push out expiry (no dur = DOUBLE the time left)
   tshare info <id>                    live stats for a running share
   tshare ls [--json]                  list active shares
   tshare rm <id>... | --all           stop share(s), remove funnel mount
   tshare panic                        kill ALL shares NOW & wipe every token/state
+  tshare template save/ls/rm          manage reusable flag presets (templates)
   tshare resume                       restart shares saved with --persist
   tshare decrypt [-p pw] <f.enc>...   decrypt files received by an --encrypt inbox
   tshare doctor                       check tailscale / funnel / tools
@@ -119,6 +123,9 @@ SECURITY FLAGS
       --require-identity  funnel: require a Tailscale login (blocks anon public)
       --encrypt           encrypt received uploads at rest (AES-256-GCM)
       --abuse-contact <s> show a small-font takedown/abuse line on public pages
+      --legal             show a minimal copyright + removal-request line in the
+                          banner (opt-in; US law mandates no banner for a personal
+                          self-hosted share — this is a courtesy notice, not legal advice)
       --token-len <n>     secret token length, default 16 (~95 bits)
       --name <slug>       vanity path instead of random token (weaker secrecy!)
 
@@ -128,6 +135,27 @@ MODES
   -i, --blackhole         write-only sink: uploads are read, counted & notified,
                           but the bytes are discarded (nothing hits disk). Best
                           over the printed 'lan' URL for a direct throughput test.
+      --room [name]       secret link → a token-gated landing page that opens a
+                          MiroTalk video room (random room id if none given).
+                          -p/-e gate who reaches the join button. With no
+                          --mirotalk-url this uses YOUR LOCAL install: one-time
+                          "tshare room install", then tshare auto-starts it,
+                          mounts it at the funnel root, and stops it on exit.
+                          Media is WebRTC P2P; signaling stays on your node.
+      --mirotalk-url <u>  use a remote self-hosted instance instead
+      --room-name <id>    explicit room id instead of a positional / random one
+      --mirotalk-dir/-method/-port   where/how the local install runs
+      --call              the secret link IS a built-in 1:1 WebRTC video call —
+                          no MiroTalk needed. Two participants, mute/cam/leave.
+      --p2p               single-file share also offers ⚡ DIRECT browser-to-
+                          browser transfer (WebRTC DataChannel): bytes skip the
+                          funnel relay entirely when STUN hole-punch succeeds
+                          (most NATs, many CGNATs) — much faster for big files.
+                          A local sender tab auto-opens (keep it open); the
+                          normal HTTPS download stays as one-click fallback.
+      --stun <urls>       ICE STUN servers (comma list; sane public defaults)
+      --turn <url>        optional TURN relay (+ --turn-user/--turn-pass) for a
+                          guaranteed direct-ish path when hole-punch fails
       --allow-upload      folder share also accepts uploads (collaboration)
 
 FOLDER ENGINE
@@ -145,6 +173,12 @@ FOLDER ENGINE
                           and folders without an index get a browsable listing.
                           Scripts run (no sandbox); expiry defaults to never.
                           Pair with --name for a stable /<name>/ path
+  -g, --gamelink          host a GIGA-NET/1-L multiplayer game page in one shot:
+                          implies --site --allow-upload, prints + copies a JOIN
+                          link for the other player, and auto-opens the page here
+                          in host mode — zero clicks (e.g. GigaSnakes). Over
+                          funnel/tailnet the game hole-punches via STUN (add
+                          --turn for symmetric NAT); -l keeps it LAN-only
   -l, --local             no tailscale: plain HTTP on your LAN (testing/offline)
       --lan-https         --local: serve HTTPS with a self-signed cert
       --no-lan            funnel/serve only — don't also expose on the LAN
@@ -153,6 +187,7 @@ FOLDER ENGINE
       --watch             watch a shared folder; announce new files as they land
       --persist           remember this share so 'tshare resume' restarts it
       --profile <name>    use a [name] section from ~/.config/tshare/config
+      --template <name>   apply a saved template (== a profile; see: tshare template)
       --no-config         ignore the config file
       --inline            display in browser instead of forcing download
   -Y, --yt-dlp            force treating the argument as a yt-dlp URL
@@ -185,6 +220,7 @@ OUTPUT & LIFECYCLE
   -c, --copy              copy link to clipboard — ON by default
       --no-qr             disable the QR code
       --no-copy           don't touch the clipboard
+      --no-open           don't auto-open pages (--p2p sender tab: URL printed instead)
       --no-notify         disable desktop notifications (uploads received;
                           invalid/unauthorized access attempts with IP + URL)
       --open              also open the link in your browser
@@ -227,6 +263,7 @@ type config struct {
 	AllowUpload bool
 	Zip         bool
 	Site        bool // serve a folder as a live static website (index.html)
+	GameLink    bool // --gamelink: --site --allow-upload + pre-minted GIGA-NET/1-L host/join links (one-command game hosting)
 	Local       bool
 	LAN         bool // also serve directly on the LAN (default on)
 	NoLAN       bool // disable LAN serving (loopback only)
@@ -237,6 +274,7 @@ type config struct {
 	NoQR        bool
 	NoCopy      bool
 	NoNotify    bool
+	NoOpen      bool // suppress auto-opened pages (--p2p sender tab)
 	Open        bool
 	Quiet       bool
 	JSON        bool
@@ -267,8 +305,25 @@ type config struct {
 	// inbox / blackhole
 	Blackhole bool // -i: accept + count uploads but discard the bytes (throughput sink)
 
+	// video rooms (MiroTalk)
+	Room           bool   // --room / --mirotalk: share a video-call room behind the secret link
+	RoomName       string // explicit room id (else the positional arg, else random)
+	MirotalkURL    string // remote instance base URL ("" = use/spawn the local install)
+	MirotalkDir    string // local MiroTalk checkout (default ~/.tshare/mirotalk)
+	MirotalkMethod string // how the local instance runs: npm | docker (auto-detected if "")
+	MirotalkPort   int    // local MiroTalk port (default 3000)
+
+	// browser WebRTC (P2P direct transfer + built-in call)
+	P2P      bool   // --p2p: single-file share also offers a direct DataChannel transfer
+	Call     bool   // --call: built-in 1:1 WebRTC video call page (no MiroTalk needed)
+	STUN     string // comma-separated STUN urls for ICE (NAT/CGNAT hole-punch)
+	TURN     string // optional TURN url (guaranteed relay when hole-punch fails)
+	TURNUser string // TURN credentials
+	TURNPass string
+
 	// abuse / legal
 	AbuseContact string // small-font takedown/abuse contact shown on public share pages ("" = hidden)
+	Legal        bool   // show a minimal copyright + DMCA-takedown line in the banner (opt-in)
 
 	// media
 	Transcode bool // pre-transcode incompatible video to MP4 (ffmpeg)
@@ -323,6 +378,8 @@ func registerFlags(fs *flag.FlagSet, c *config) {
 	fs.BoolVar(&c.Zip, "zip", c.Zip, "")
 	fs.BoolVar(&c.Site, "site", c.Site, "")
 	fs.BoolVar(&c.Site, "web", c.Site, "")
+	fs.BoolVar(&c.GameLink, "gamelink", c.GameLink, "")
+	fs.BoolVar(&c.GameLink, "g", c.GameLink, "")
 	fs.BoolVar(&c.Local, "l", c.Local, "")
 	fs.BoolVar(&c.Local, "local", c.Local, "")
 	fs.BoolVar(&c.LAN, "lan", c.LAN, "")
@@ -337,6 +394,7 @@ func registerFlags(fs *flag.FlagSet, c *config) {
 	fs.BoolVar(&c.NoQR, "no-qr", c.NoQR, "")
 	fs.BoolVar(&c.NoCopy, "no-copy", c.NoCopy, "")
 	fs.BoolVar(&c.NoNotify, "no-notify", c.NoNotify, "")
+	fs.BoolVar(&c.NoOpen, "no-open", c.NoOpen, "")
 	fs.BoolVar(&c.Open, "open", c.Open, "")
 	fs.BoolVar(&c.Quiet, "quiet", c.Quiet, "")
 	fs.BoolVar(&c.JSON, "json", c.JSON, "")
@@ -363,7 +421,21 @@ func registerFlags(fs *flag.FlagSet, c *config) {
 	fs.StringVar(&c.MinFree, "min-free", c.MinFree, "")
 	fs.BoolVar(&c.Blackhole, "i", c.Blackhole, "")
 	fs.BoolVar(&c.Blackhole, "blackhole", c.Blackhole, "")
+	fs.BoolVar(&c.Room, "room", c.Room, "")
+	fs.BoolVar(&c.Room, "mirotalk", c.Room, "")
+	fs.StringVar(&c.RoomName, "room-name", c.RoomName, "")
+	fs.StringVar(&c.MirotalkURL, "mirotalk-url", c.MirotalkURL, "")
+	fs.StringVar(&c.MirotalkDir, "mirotalk-dir", c.MirotalkDir, "")
+	fs.StringVar(&c.MirotalkMethod, "mirotalk-method", c.MirotalkMethod, "")
+	fs.IntVar(&c.MirotalkPort, "mirotalk-port", c.MirotalkPort, "")
+	fs.BoolVar(&c.P2P, "p2p", c.P2P, "")
+	fs.BoolVar(&c.Call, "call", c.Call, "")
+	fs.StringVar(&c.STUN, "stun", c.STUN, "")
+	fs.StringVar(&c.TURN, "turn", c.TURN, "")
+	fs.StringVar(&c.TURNUser, "turn-user", c.TURNUser, "")
+	fs.StringVar(&c.TURNPass, "turn-pass", c.TURNPass, "")
 	fs.StringVar(&c.AbuseContact, "abuse-contact", c.AbuseContact, "")
+	fs.BoolVar(&c.Legal, "legal", c.Legal, "")
 	fs.BoolVar(&c.Transcode, "transcode", c.Transcode, "")
 	fs.BoolVar(&c.Hevc, "hevc", c.Hevc, "")
 	fs.BoolVar(&c.H265, "265", c.H265, "")
@@ -378,6 +450,7 @@ func registerFlags(fs *flag.FlagSet, c *config) {
 	fs.StringVar(&c.CopypartyArgs, "copyparty-args", c.CopypartyArgs, "")
 	fs.BoolVar(&c.LanHTTPS, "lan-https", c.LanHTTPS, "")
 	fs.StringVar(&c.Profile, "profile", c.Profile, "")
+	fs.StringVar(&c.Profile, "template", c.Profile, "") // --template = apply a saved preset
 	fs.BoolVar(&c.NoConf, "no-config", c.NoConf, "")
 	fs.BoolVar(&c.Watch, "watch", c.Watch, "")
 	fs.BoolVar(&c.Persist, "persist", c.Persist, "")
@@ -573,6 +646,12 @@ func main() {
 		case "panic", "--panic":
 			cmdPanic()
 			return
+		case "room":
+			cmdRoom(args[1:])
+			return
+		case "template", "templates":
+			cmdTemplate(args[1:])
+			return
 		case "info":
 			cmdInfo(args[1:])
 			return
@@ -595,7 +674,9 @@ func main() {
 	}
 
 	c := &config{TokenLen: 16, HTTPSPort: 443, MaxUpload: "5G", MinFree: "32G", CQ: 50,
-		Copy: true, LAN: true, Password: os.Getenv("TSHARE_PASSWORD")}
+		MirotalkPort: 3000,
+		STUN:         "stun:stun.l.google.com:19302,stun:stun.cloudflare.com:3478",
+		Copy:         true, LAN: true, Password: os.Getenv("TSHARE_PASSWORD")}
 	// config file (#71): defaults < config file/profile < CLI flags
 	applyConfig(c, args)
 	if err := parseArgs(args, c); err != nil {
@@ -635,6 +716,7 @@ type share struct {
 	mode      string // "file" | "dir" | "multi" | "inbox" | "site"
 	roots     []rootEnt
 	siteIndex string // default document for a "site" share (index.html)
+	gameSid   string // --gamelink: pre-minted GIGA-NET/1-L session id baked into the printed links
 	upDir     string // where uploads land
 	baseURL   string // https://host[:p]/<token>  (funnel/tailnet)
 	lanURL    string // http://<lan-ip>:<port>/<token>  (direct LAN, if enabled)
@@ -681,6 +763,15 @@ type share struct {
 
 	srvProxy *httputil.ReverseProxy // -s: reverse proxy to a user-run server
 	srvURL   string                 // its target URL (for display)
+
+	roomName      string    // --room: MiroTalk room id
+	roomURL       string    // --room: full MiroTalk join URL
+	roomLocal     bool      // --room: using the local MiroTalk install
+	mtCmd         *exec.Cmd // local MiroTalk child we spawned (nil if reusing/remote)
+	mtRootMounted bool      // we mounted the funnel/serve ROOT path → unmount on exit
+
+	senderKey string  // --p2p: secret that authenticates the local sender tab
+	hub       *rtcHub // --p2p / --call: in-memory WebRTC signaling relay
 }
 
 func (s *share) getPassword() string {
@@ -739,6 +830,15 @@ func runShare(c *config) error {
 	// links default to a 15-day lifetime so forgotten public links don't
 	// live forever; any explicit -e (including "never") overrides, and a
 	// running share can be changed later: tshare set <id> -e <dur|never>.
+	// --gamelink is sugar: a --site --allow-upload share of the game page, plus
+	// a pre-minted GIGA-NET/1-L session — the join link is printed/copied and
+	// this machine auto-opens the page in host mode (#gnhost), so starting a
+	// multiplayer game is one command and zero clicks.
+	if c.GameLink {
+		c.Site = true
+		c.AllowUpload = true
+	}
+
 	// Websites are long-term by nature, so --site defaults to never.
 	if !c.ExpiresSet && c.Expires == 0 && !c.Site {
 		c.Expires = 15 * 24 * time.Hour
@@ -774,7 +874,7 @@ func runShare(c *config) error {
 	}
 
 	// resolve targets
-	oneInput := !c.Upload && !c.Blackhole && len(c.Paths) == 1
+	oneInput := !c.Upload && !c.Blackhole && !c.Room && !c.Call && len(c.Paths) == 1
 	// -s, or a localhost URL ("automatically if it is not a website"), means
 	// reverse-proxy a running server rather than download it.
 	serverMode := oneInput && looksLikeURL(c.Paths[0]) && (c.Server || isLocalServerURL(c.Paths[0]))
@@ -793,6 +893,12 @@ func runShare(c *config) error {
 		s.mode = "site"
 		s.siteIndex = index
 		s.roots = []rootEnt{{Name: filepath.Base(root), Abs: root, IsDir: true}}
+		if c.AllowUpload { // --site --allow-upload: pages run as a site AND __upload works (e.g. GIGA-NET/1-L game signalling)
+			s.upDir = root
+		}
+		if c.GameLink {
+			s.gameSid = randSid(8)
+		}
 		if !c.Quiet {
 			fmt.Fprintf(os.Stderr, "  🌐 serving site root %s (index: %s)\n", root, index)
 		}
@@ -877,6 +983,52 @@ func runShare(c *config) error {
 		s.tmpRoot = p
 		s.tmpFile = p
 		s.roots = []rootEnt{{Name: name, Abs: p, IsDir: false, Size: fi.Size()}}
+	case c.Call:
+		// --call: the secret link IS a 1:1 WebRTC video call. tshare hosts the
+		// page + signaling; media flows peer-to-peer. No MiroTalk needed.
+		if len(c.Paths) > 0 {
+			return errors.New("--call takes no path — the link itself is the call")
+		}
+		s.mode = "call"
+		s.hub = newRTCHub()
+		s.roots = []rootEnt{{Name: "call", Abs: "webrtc-call", IsDir: false}}
+	case c.Room:
+		// --room: no file at all — serve a token-gated landing page that opens a
+		// MiroTalk video room. The secret link (and any -p/-e) gate who reaches the
+		// join button; the call itself runs on the MiroTalk instance. With no
+		// --mirotalk-url the LOCAL install is used (started on demand and exposed
+		// at the funnel ROOT path — MiroTalk needs root, it breaks under /<token>/).
+		name := c.RoomName
+		if name == "" && len(c.Paths) == 1 {
+			name = c.Paths[0]
+		} else if len(c.Paths) > 1 {
+			return errors.New("--room takes at most one room name")
+		}
+		if name == "" {
+			name = "tshare-" + randToken(5) // unguessable room id
+		}
+		name = sanitizeRoomName(name)
+		if name == "" {
+			return errors.New("--room name may contain only letters, digits, dash, underscore")
+		}
+		s.mode = "room"
+		s.roomName = name
+		base := strings.TrimRight(c.MirotalkURL, "/")
+		switch {
+		case base != "":
+			if !strings.HasPrefix(base, "http://") && !strings.HasPrefix(base, "https://") {
+				return errors.New("--mirotalk-url must be an http(s) URL")
+			}
+			s.roomURL = base + "/join?room=" + url.QueryEscape(name)
+		default:
+			// local instance: resolved/started later (needs the funnel host for the
+			// join URL). Verify it's locatable now so the error comes before mounting.
+			if _, _, err := mirotalkLocal(c); err != nil {
+				return err
+			}
+			s.roomLocal = true
+		}
+		s.roots = []rootEnt{{Name: name, Abs: "mirotalk:" + name, IsDir: false}}
 	case c.Blackhole:
 		// -i: a write-only sink. Uploads are read, counted and notified, but the
 		// bytes are streamed to io.Discard — nothing ever touches disk. upDir is a
@@ -954,6 +1106,18 @@ func runShare(c *config) error {
 	}
 	if c.Zip && s.mode == "file" {
 		c.Zip = false // zipping one file is pointless; serve as-is
+	}
+	// --p2p: enable the direct WebRTC transfer path for a single-file share.
+	// A local browser tab is the sender, so it needs a foreground share.
+	if c.P2P {
+		if s.mode != "file" {
+			return errors.New("--p2p works with a single-file share")
+		}
+		if c.Background {
+			return errors.New("--p2p needs a foreground share — a local sender tab must stay open (-b won't have one)")
+		}
+		s.senderKey = randToken(16)
+		s.hub = newRTCHub()
 	}
 	// --filename also renames any single-file share's public name
 	if c.FileName != "" && s.mode == "file" {
@@ -1125,8 +1289,42 @@ func runShare(c *config) error {
 		if s.cpCmd != nil && s.cpCmd.Process != nil {
 			s.cpCmd.Process.Kill()
 		}
+		if s.mtRootMounted {
+			tsUnmount(c, "") // root path we mounted for local MiroTalk
+		}
+		stopMirotalk(s)
 	}
 	defer cleanup()
+
+	// --room with the LOCAL MiroTalk: start it (or reuse a running one), expose
+	// it at the funnel/serve ROOT path, and point the join URL at that origin.
+	// Runs after `defer cleanup()` so a failure can't leak the child process.
+	if s.roomLocal {
+		if err := startLocalMirotalk(s); err != nil {
+			return err
+		}
+		if c.Local {
+			// same-machine testing only: cam/mic need a secure context, so plain
+			// LAN HTTP works from this machine (localhost) but not from others.
+			origin := fmt.Sprintf("http://%s:%d", lanIP(), c.MirotalkPort)
+			s.roomURL = origin + "/join?room=" + url.QueryEscape(s.roomName)
+			if !c.Quiet {
+				log.Printf("  ⚠ --local room: browsers block cam/mic on plain HTTP except on this machine — use funnel/serve for real calls")
+			}
+		} else {
+			if out, err := tsMount(c, "", c.MirotalkPort); err != nil {
+				return fmt.Errorf("mounting MiroTalk at the %s root failed:\n%s", verb(c), strings.TrimSpace(out))
+			}
+			s.mtRootMounted = true
+			u, err := url.Parse(s.baseURL)
+			if err != nil {
+				return err
+			}
+			s.roomURL = u.Scheme + "://" + u.Host + "/join?room=" + url.QueryEscape(s.roomName)
+		}
+		s.roots[0].Abs = s.roomURL
+		s.updateState() // re-record: join URL + child pid + root mount now exist
+	}
 
 	// copyparty folder engine: for single-folder browse/upload shares, hand the
 	// heavy lifting (resumable uploads, dedup, thumbnails, WebDAV) to copyparty
@@ -1155,6 +1353,29 @@ func runShare(c *config) error {
 
 	// announce
 	s.announce(port)
+
+	// --gamelink: open this machine's browser straight into host mode — the page
+	// creates the WebRTC offer itself (#gnhost), so hosting needs zero clicks.
+	if s.gameSid != "" && !c.daemonChild {
+		_, hostURL := s.gameLinks()
+		if c.NoOpen {
+			fmt.Fprintf(os.Stderr, "  🎮 open this on the host machine: %s\n", hostURL)
+		} else {
+			fmt.Fprintf(os.Stderr, "  🎮 host page opened — send the join link (already on your clipboard)\n")
+			openBrowser(hostURL)
+		}
+	}
+
+	// --p2p: open the local sender tab (it streams the file into DataChannels).
+	if s.senderKey != "" {
+		sendURL := fmt.Sprintf("http://127.0.0.1:%d/%s/__p2p/send?k=%s", port, s.token, s.senderKey)
+		if c.NoOpen {
+			fmt.Fprintf(os.Stderr, "  ⚡ p2p sender page (open it and keep the tab up): %s\n", sendURL)
+		} else {
+			fmt.Fprintf(os.Stderr, "  ⚡ p2p sender tab opened — keep it open (re-open: %s)\n", sendURL)
+			openBrowser(sendURL)
+		}
+	}
 
 	// start any deferred work that should run only after the link/QR is printed
 	// (e.g. the background yt-dlp download for a single-file share)
@@ -1257,6 +1478,27 @@ func validSlug(s string) bool {
 	return true
 }
 
+// sanitizeRoomName keeps a MiroTalk room id URL-safe: spaces → dashes, then only
+// letters/digits/dash/underscore/dot survive. "" if nothing usable is left.
+func sanitizeRoomName(n string) string {
+	n = strings.TrimSpace(n)
+	var b strings.Builder
+	for _, r := range n {
+		switch {
+		case r == ' ':
+			b.WriteByte('-')
+		case r == '.' || r == '-' || r == '_' ||
+			(r >= 'a' && r <= 'z') || (r >= 'A' && r <= 'Z') || (r >= '0' && r <= '9'):
+			b.WriteRune(r)
+		}
+	}
+	out := b.String()
+	if len(out) > 64 {
+		out = out[:64]
+	}
+	return out
+}
+
 func randToken(n int) string {
 	const cs = "abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789-_"
 	b := make([]byte, n)
@@ -1269,9 +1511,24 @@ func randToken(n int) string {
 	return string(b)
 }
 
+// randSid mints a GIGA-NET/1-L session id — lowercase alphanumeric only, since
+// that's the charset the game pages accept in #gn=/#gnhost= fragments.
+func randSid(n int) string {
+	const cs = "0123456789abcdefghijklmnopqrstuvwxyz"
+	b := make([]byte, n)
+	if _, err := rand.Read(b); err != nil {
+		panic(err)
+	}
+	for i := range b {
+		b[i] = cs[int(b[i])%len(cs)]
+	}
+	return string(b)
+}
+
 func (s *share) announce(port int) {
 	c := s.cfg
 	link := s.prettyURL()
+	gameJoin, gameHost := s.gameLinks()
 	if c.JSON {
 		meta := map[string]any{
 			"id": s.id, "url": link, "base": s.baseURL + "/", "mode": s.mode,
@@ -1279,13 +1536,21 @@ func (s *share) announce(port int) {
 			"tailnet_only": c.Tailnet, "local": c.Local,
 			"max_downloads": c.MaxDL, "pid": os.Getpid(),
 		}
+		if gameJoin != "" {
+			meta["game_join"] = gameJoin
+			meta["game_host"] = gameHost
+		}
 		if t := s.getExpires(); !t.IsZero() {
 			meta["expires_at"] = t.Format(time.RFC3339)
 		}
 		j, _ := json.MarshalIndent(meta, "", "  ")
 		fmt.Println(string(j))
 	} else if c.Quiet {
-		fmt.Println(link)
+		if gameJoin != "" { // the join link is the artifact you want to pipe/send
+			fmt.Println(gameJoin)
+		} else {
+			fmt.Println(link)
+		}
 	} else {
 		scope := "public + tailnet (funnel)"
 		if c.Tailnet {
@@ -1318,6 +1583,10 @@ func (s *share) announce(port int) {
 		if s.lanURL != "" {
 			fmt.Printf("  lan        %s   (same network, faster, no internet)\n", s.lanLink())
 		}
+		if gameJoin != "" {
+			fmt.Printf("  🎮 join    %s   ← send THIS to the other player\n", gameJoin)
+			fmt.Printf("  🎮 host    %s   (opens here automatically)\n", gameHost)
+		}
 		fmt.Printf("  curl       %s\n", s.curlHint())
 		fmt.Printf("  scope      %-28s id        %s\n", scope, s.id)
 		fmt.Printf("  password   %-28s expires   %s\n", pw, exp)
@@ -1330,7 +1599,11 @@ func (s *share) announce(port int) {
 		fmt.Println()
 	}
 	if !c.daemonChild { // daemon child logs to a file; parent handles extras
-		linkExtras(c, link)
+		if gameJoin != "" {
+			linkExtras(c, gameJoin) // for a game share, the JOIN link is what gets copied/QR'd
+		} else {
+			linkExtras(c, link)
+		}
 	}
 }
 
@@ -1372,6 +1645,10 @@ func (s *share) describe() string {
 		return "reverse proxy → " + s.srvURL
 	case "site":
 		return fmt.Sprintf("website %s (index: %s)", s.roots[0].Abs, s.siteIndex)
+	case "room":
+		return "video room → " + s.roomURL
+	case "call":
+		return "video call (built-in 1:1, WebRTC P2P)"
 	case "inbox":
 		return fmt.Sprintf("inbox → %s%s", s.upDir, cp)
 	case "multi":
@@ -1393,6 +1670,17 @@ func (s *share) prettyURL() string {
 		return s.baseURL + "/" + url.PathEscape(s.roots[0].Name)
 	}
 	return s.baseURL + "/"
+}
+
+// gameLinks returns the GIGA-NET/1-L join/host URLs for a --gamelink share.
+// The game page is the site's default document, so the bare share URL renders
+// it; the fragment stays client-side and never appears in any server log.
+func (s *share) gameLinks() (join, host string) {
+	if s.gameSid == "" {
+		return "", ""
+	}
+	base := s.prettyURL()
+	return base + "#gn=" + s.gameSid, base + "#gnhost=" + s.gameSid
 }
 
 // lanLink is the direct-LAN equivalent of prettyURL (plain HTTP, token in path).
@@ -1418,6 +1706,10 @@ func (s *share) curlHint() string {
 		return "open " + s.baseURL + "/   (proxies " + s.srvURL + ")"
 	case "site":
 		return "open " + s.baseURL + "/   (live website)"
+	case "room":
+		return "open " + s.baseURL + "/   (video room: " + s.roomName + ")"
+	case "call":
+		return "open " + s.baseURL + "/   (send this link to ONE other person)"
 	case "inbox":
 		return "curl " + auth + "-F f=@file.txt " + s.baseURL + "/__upload"
 	default:
@@ -1475,9 +1767,10 @@ func (s *share) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	if u := r.Header.Get("Tailscale-User-Login"); u != "" {
 		who += " (" + u + ")"
 	}
+	senderTab := s.senderReq(r) // --p2p local sender: free (loopback, not funnel egress)
 	defer func() {
 		// #13 byte cap: tally served bytes; stop at the 1.5× hard ceiling
-		if s.maxBytes > 0 && rec.bytes > 0 {
+		if s.maxBytes > 0 && rec.bytes > 0 && !senderTab {
 			if s.bytesServed.Add(rec.bytes) >= s.maxBytes*3/2 {
 				s.trigger("byte cap reached (1.5×)")
 			}
@@ -1544,8 +1837,10 @@ func (s *share) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	// optional password (HTTP Basic, any username)
-	if want := s.getPassword(); want != "" {
+	// optional password (HTTP Basic, any username). The --p2p sender tab
+	// authenticates with its own per-share secret key instead (it is opened
+	// locally and can't carry Basic-Auth creds through the auto-open).
+	if want := s.getPassword(); want != "" && !s.senderReq(r) {
 		_, pw, ok := r.BasicAuth()
 		if !ok || subtle.ConstantTimeCompare([]byte(pw), []byte(want)) != 1 {
 			rec.Header().Set("WWW-Authenticate", `Basic realm="tshare"`)
@@ -1555,6 +1850,16 @@ func (s *share) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	}
 
 	rel := strings.Trim(path.Clean("/"+p), "/") // ""=root, no dot-dots
+
+	// WebRTC signaling (--p2p / --call) + the local sender tab page
+	if s.hub != nil && (rel == "__rtc" || strings.HasPrefix(rel, "__rtc/")) {
+		s.handleRTC(rec, r, strings.TrimPrefix(strings.TrimPrefix(rel, "__rtc"), "/"))
+		return
+	}
+	if s.senderKey != "" && rel == "__p2p/send" {
+		s.renderP2PSend(rec, r)
+		return
+	}
 
 	// copyparty folder engine: forward everything (browse, upload, WebDAV,
 	// thumbnails, any method) to copyparty on loopback, normalising the path to
@@ -1582,8 +1887,19 @@ func (s *share) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	}
 
 	// #site: serve the folder as a live website (index.html routing, real
-	// content-types, scripts allowed). Owns all routing — no upload/zip.
+	// content-types, scripts allowed). Owns all routing — no zip; __upload only
+	// when --allow-upload opted in (e.g. GIGA-NET/1-L game signalling).
 	if s.mode == "site" {
+		if s.upDir != "" && (rel == "__upload" || strings.HasSuffix(rel, "/__upload")) {
+			s.handleUpload(rec, r, strings.TrimSuffix(strings.TrimSuffix(rel, "__upload"), "/"))
+			return
+		}
+		// --gamelink: hand the GIGA-NET/1-L page its ICE config so a funnel/tailnet
+		// game can hole-punch across networks (STUN/TURN); -l stays pure LAN.
+		if s.gameSid != "" && (rel == "__ice" || strings.HasSuffix(rel, "/__ice")) {
+			s.handleGameIce(rec, r)
+			return
+		}
 		if r.Method != http.MethodGet && r.Method != http.MethodHead {
 			http.Error(rec, "405 method not allowed", http.StatusMethodNotAllowed)
 			return
@@ -1615,6 +1931,22 @@ func (s *share) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	}
 
 	switch s.mode {
+	case "room":
+		if rel != "" {
+			http.NotFound(rec, r)
+			return
+		}
+		if r.URL.Query().Get("go") == "1" { // deep-link straight into the call
+			http.Redirect(rec, r, s.roomURL, http.StatusFound)
+			return
+		}
+		s.renderRoom(rec)
+	case "call":
+		if rel != "" {
+			http.NotFound(rec, r)
+			return
+		}
+		s.renderCall(rec)
 	case "inbox":
 		if rel != "" {
 			http.NotFound(rec, r)
@@ -1622,6 +1954,14 @@ func (s *share) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		}
 		s.renderInbox(rec, urlBase)
 	case "file":
+		// --p2p: browser navigations get the direct-transfer page (P2P attempt
+		// + standard-download fallback); ?dl=1 / ?raw=1 / curl get bytes as ever.
+		if s.senderKey != "" && r.Method == http.MethodGet &&
+			r.URL.Query().Get("dl") != "1" && r.URL.Query().Get("raw") != "1" &&
+			strings.Contains(r.Header.Get("Accept"), "text/html") {
+			s.renderP2PRecv(rec)
+			return
+		}
 		s.serveFile(rec, r, s.roots[0].Abs, s.roots[0].Name)
 	case "dir", "multi":
 		if rel == "" && s.cfg.Zip {
@@ -1976,7 +2316,7 @@ func (s *share) serveFile(w *respRec, r *http.Request, abs, name string) {
 		if e := strings.ToLower(filepath.Ext(name)); e == ".html" || e == ".htm" {
 			w.Header().Set("Content-Type", "text/html; charset=utf-8")
 			http.ServeContent(w, r, name, fi.ModTime(), f)
-			if r.Method == http.MethodGet && w.status == http.StatusOK {
+			if r.Method == http.MethodGet && w.status == http.StatusOK && !s.senderReq(r) {
 				s.countDownload()
 			}
 			return
@@ -2012,8 +2352,9 @@ func (s *share) serveFile(w *respRec, r *http.Request, abs, name string) {
 	w.Header().Set("Accept-Ranges", "bytes")
 	http.ServeContent(w, r, name, fi.ModTime(), f) // handles Range + 206 itself
 	// count a download only on a full 200 GET, not partial 206 range chunks,
-	// so a seeking video player isn't counted as many downloads.
-	if r.Method == http.MethodGet && w.status == http.StatusOK {
+	// so a seeking video player isn't counted as many downloads. The --p2p
+	// sender tab reading the file over loopback isn't a download either.
+	if r.Method == http.MethodGet && w.status == http.StatusOK && !s.senderReq(r) {
 		s.countDownload()
 	}
 }
@@ -2189,7 +2530,7 @@ func (s *share) handleZip(w *respRec, r *http.Request, dirRel string) {
 		http.Error(w, "405", http.StatusMethodNotAllowed)
 		return
 	}
-	if s.mode == "file" || s.mode == "inbox" {
+	if s.mode == "file" || s.mode == "inbox" || s.mode == "room" || s.mode == "call" {
 		http.NotFound(w, r)
 		return
 	}
@@ -2567,6 +2908,354 @@ var inboxTmpl = template.Must(template.New("inbox").Parse(`<!doctype html>
 <div class="foot">powered by tshare · link is private — don't repost it</div>{{.Abuse}}
 </body></html>`))
 
+// roomTmpl is the --room landing page: a token-gated door to a MiroTalk video
+// room. The Join button links straight to the room URL; an optional display
+// name is appended as ?name=.
+var roomTmpl = template.Must(template.New("room").Parse(`<!doctype html>
+<html><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1">
+<meta name="robots" content="noindex,nofollow"><title>join video room</title>
+<style>` + pageCSS + `
+.room { text-align:center; padding:22px 0; }
+.room .big { font-size:46px; margin-bottom:2px; }
+.room .rn { font-family:ui-monospace,SFMono-Regular,Menlo,monospace; background:var(--card); border:1px solid var(--line); border-radius:8px; padding:4px 10px; display:inline-block; margin:8px 0 18px; }
+.room input.dn { width:min(320px,90%); padding:9px 12px; border:1px solid var(--line); border-radius:8px; background:var(--card); color:var(--fg); font-size:15px; margin-bottom:14px; display:block; margin-left:auto; margin-right:auto; }
+.room a.go { font-size:16px; padding:12px 26px; display:inline-block; }
+</style></head>
+<body>
+<div class="room">
+ <div class="big">📹</div>
+ <h1>Video room</h1>
+ <div class="rn">{{.RoomName}}</div>
+ <input class="dn" id="dn" placeholder="Your name (optional)" autocomplete="name">
+ <a class="btn go" id="join" href="{{.RoomURL}}" target="_blank" rel="noopener noreferrer">Join call →</a>
+ <div class="foot">powered by tshare · opens MiroTalk in a new tab · link is private — don't repost it</div>{{.Abuse}}
+</div>
+<script>
+(function(){
+ var join=document.getElementById('join'), dn=document.getElementById('dn'), base=join.getAttribute('href');
+ function upd(){ var n=dn.value.trim(); join.href = n ? base+(base.indexOf('?')<0?'?':'&')+'name='+encodeURIComponent(n) : base; }
+ dn.addEventListener('input', upd);
+ dn.addEventListener('keydown', function(e){ if(e.key==='Enter'){ upd(); join.click(); } });
+})();
+</script>
+</body></html>`))
+
+// p2pRecvTmpl is the --p2p transfer page a visitor sees: try a direct WebRTC
+// DataChannel first (fast path, bytes never ride the funnel relay), with the
+// standard HTTPS download always one click away as fallback.
+var p2pRecvTmpl = template.Must(template.New("p2precv").Parse(`<!doctype html>
+<html><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1">
+<meta name="robots" content="noindex,nofollow"><title>{{.Name}}</title>
+<style>` + pageCSS + `
+.xfer { text-align:center; padding:20px 0; }
+.xfer .big { font-size:44px; }
+.fn { font-family:ui-monospace,SFMono-Regular,Menlo,monospace; background:var(--card); border:1px solid var(--line); border-radius:8px; padding:4px 10px; display:inline-block; margin:10px 0 4px; }
+.sz { color:var(--mut); font-size:13px; margin-bottom:18px; }
+.prog { width:min(420px,92%); height:10px; background:var(--card); border:1px solid var(--line); border-radius:6px; margin:14px auto 6px; overflow:hidden; display:none; }
+.prog i { display:block; height:100%; width:0%; background:var(--acc); transition:width .15s; }
+.stat { color:var(--mut); font-size:13px; min-height:20px; }
+.btn.big2 { font-size:15px; padding:11px 22px; margin:6px; display:inline-block; }
+</style></head>
+<body>
+<div class="xfer">
+ <div class="big">⚡</div>
+ <h1>Direct transfer</h1>
+ <div class="fn">{{.Name}}</div>
+ <div class="sz">{{.SizeH}}</div>
+ <button class="btn big2" id="p2pbtn">⚡ Direct P2P download</button>
+ <a class="btn sec big2" href="?dl=1">standard download</a>
+ <div class="prog" id="prog"><i id="bar"></i></div>
+ <div class="stat" id="stat">checking for the sender…</div>
+ <div class="foot">P2P goes browser-to-browser (fastest); standard rides the share host · link is private</div>{{.Abuse}}
+</div>
+<script>
+var ICE = {{.Ice}}, SIZE = {{.Size}}, NAME = {{.Name}};
+var stat=document.getElementById('stat'), bar=document.getElementById('bar'),
+    prog=document.getElementById('prog'), btn=document.getElementById('p2pbtn');
+function say(t){ stat.textContent=t; }
+function sleep(ms){ return new Promise(function(r){ setTimeout(r,ms); }); }
+function rand(){ var a=new Uint8Array(12); crypto.getRandomValues(a);
+  return Array.from(a,function(b){return b.toString(16).padStart(2,'0');}).join(''); }
+async function post(ep,body){ return fetch('__rtc/'+ep,{method:'POST',
+  headers:{'Content-Type':'application/json'},body:body?JSON.stringify(body):'{}'}); }
+var started = false;                                       // stop presence UI once a transfer runs
+(function watchPresence(){
+  fetch('__rtc/presence').then(function(r){return r.json();}).then(function(j){
+    if (started) return;
+    btn.disabled = !j.online;
+    say(j.online ? 'sender online — ready for direct P2P' :
+      'sender tab not responding — retrying… (or use the standard download)');
+  }).catch(function(){}).then(function(){
+    if (!started) setTimeout(watchPresence, 4000);
+  });
+})();
+btn.onclick = async function(){
+  btn.disabled = true; started = true;
+  var writer=null, parts=null;
+  try{
+    if (window.showSaveFilePicker) {                       // stream to disk
+      var h = await showSaveFilePicker({suggestedName:NAME});
+      writer = await h.createWritable();
+    } else {
+      if (SIZE > 1500000000) { say('file too big for in-memory receive here — use standard download'); return; }
+      parts = [];
+    }
+  }catch(e){ btn.disabled=false; started=false; return; }  // picker cancelled
+  var sid = rand(), got = 0, t0 = Date.now(), connected = false, done = false;
+  var pc = new RTCPeerConnection({iceServers:ICE});
+  pc.onicecandidate = function(e){ if(e.candidate) post('msg?sid='+sid+'&from=b',{t:'cand',c:e.candidate}); };
+  pc.ondatachannel = function(e){
+    var dc = e.channel; dc.binaryType='arraybuffer'; connected = true;
+    prog.style.display='block'; say('connected — receiving…');
+    dc.onmessage = async function(ev){
+      if (typeof ev.data === 'string') {
+        var m = JSON.parse(ev.data);
+        if (m.t === 'eof') {
+          done = true;
+          if (writer) await writer.close();
+          else { var blob=new Blob(parts); var a=document.createElement('a');
+                 a.href=URL.createObjectURL(blob); a.download=NAME; a.click(); }
+          post('msg?sid='+sid+'&from=b',{t:'ack'});
+          post('done?sid='+sid);
+          bar.style.width='100%'; say('✓ done — '+fmt(got)+' in '+((Date.now()-t0)/1000).toFixed(1)+'s');
+          dc.close(); pc.close();
+        }
+        return;
+      }
+      got += ev.data.byteLength;
+      if (writer) await writer.write(ev.data); else parts.push(ev.data);
+      var pct = SIZE>0 ? Math.min(100, got*100/SIZE) : 0;
+      bar.style.width = pct+'%';
+      var mbps = got/1048576/((Date.now()-t0)/1000);
+      say(fmt(got)+' / '+fmt(SIZE)+'  ·  '+mbps.toFixed(1)+' MB/s');
+    };
+  };
+  await post('hello?sid='+sid);
+  say('waiting for direct connection…');
+  setTimeout(function(){ if(!connected && !done){ say('no direct path (hard NAT both sides?) — use the standard download'); btn.disabled=false; } }, 20000);
+  while (!done) {                                          // signaling poll
+    var r = await fetch('__rtc/msg?sid='+sid+'&as=b&wait=1');
+    if (r.status === 204) continue;
+    if (!r.ok) { await sleep(1000); continue; }
+    var m = await r.json();
+    if (m.t === 'offer') {
+      await pc.setRemoteDescription(m.sdp);
+      var ans = await pc.createAnswer(); await pc.setLocalDescription(ans);
+      post('msg?sid='+sid+'&from=b',{t:'answer',sdp:pc.localDescription});
+    } else if (m.t === 'cand') {
+      try { await pc.addIceCandidate(m.c); } catch(e){}
+    }
+  }
+};
+function fmt(n){ if(n<1048576) return (n/1024).toFixed(0)+' KB';
+  if(n<1073741824) return (n/1048576).toFixed(1)+' MB'; return (n/1073741824).toFixed(2)+' GB'; }
+</script>
+</body></html>`))
+
+// p2pSendTmpl runs in the auto-opened LOCAL tab on the sharer's machine: it
+// long-polls for receivers, streams the file from loopback into a DataChannel
+// per receiver, and heartbeats presence so receiver pages can show ⚡.
+var p2pSendTmpl = template.Must(template.New("p2psend").Parse(`<!doctype html>
+<html><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1">
+<meta name="robots" content="noindex,nofollow"><title>tshare p2p sender</title>
+<style>` + pageCSS + `
+.hd { text-align:center; padding:14px 0 4px; }
+.fn { font-family:ui-monospace,SFMono-Regular,Menlo,monospace; background:var(--card); border:1px solid var(--line); border-radius:8px; padding:4px 10px; display:inline-block; }
+.warn { color:var(--mut); font-size:13px; text-align:center; margin:8px 0 18px; }
+ul#xfers { list-style:none; padding:0; max-width:480px; margin:0 auto; }
+ul#xfers li { padding:8px 10px; border-bottom:1px solid var(--line); font-size:14px; }
+</style></head>
+<body>
+<div class="hd"><h1>⚡ P2P sender</h1><div class="fn">{{.Name}} · {{.SizeH}}</div></div>
+<div class="warn">keep this tab open <b>and visible</b> — it streams the file directly to downloaders.<br>
+Safari pauses background tabs (transfers stall until you return); Chrome keeps them running.<br>
+closing it disables ⚡ P2P (the standard funnel download keeps working).</div>
+<div class="warn" id="health" style="color:var(--acc)">starting…</div>
+<ul id="xfers"></ul>
+<script>
+var ICE = {{.Ice}}, NAME = {{.Name}};
+var KEY = new URLSearchParams(location.search).get('k') || '';
+var KQ = '?k='+encodeURIComponent(KEY), KA = '&k='+encodeURIComponent(KEY);
+var CHUNK = 65536, HIGH = 8388608, LOW = 1048576, active = 0;
+var list = document.getElementById('xfers'), health = document.getElementById('health');
+function sleep(ms){ return new Promise(function(r){ setTimeout(r,ms); }); }
+async function post(ep,body){ return fetch('../__rtc/'+ep+KA,{method:'POST',
+  headers:{'Content-Type':'application/json'},body:JSON.stringify(body)}); }
+function beat(){ fetch('../__rtc/presence'+KQ,{method:'POST'}).catch(function(){}); }
+setInterval(beat, 5000); beat();
+document.addEventListener('visibilitychange', beat);       // instant beat on tab return
+(async function loop(){
+  var fails = 0;
+  for(;;){
+    try{
+      if (active >= 4) { await sleep(500); continue; }
+      var r = await fetch('../__rtc/next'+KQ+'&wait=1');
+      if (r.status === 403 || r.status === 404) {          // stale tab: share restarted
+        health.textContent = '✕ this sender tab is STALE — the share was restarted. Close it and use the newly opened one.';
+        health.style.color = '#c33'; return;
+      }
+      fails = 0;
+      health.textContent = '● online — waiting for downloaders ('+active+' active)';
+      if (r.status === 204) continue;
+      if (!r.ok) { await sleep(1500); continue; }
+      var j = await r.json();
+      if (j.sid) serve(j.sid);
+    }catch(e){                                             // network hiccup / share gone
+      fails++;
+      if (fails > 20) { health.textContent = '✕ share unreachable — was it stopped? (Ctrl-C in the terminal ends P2P)'; health.style.color = '#c33'; return; }
+      health.textContent = '… reconnecting ('+fails+')';
+      await sleep(2000);
+    }
+  }
+})();
+async function serve(sid){
+  active++;
+  var li = document.createElement('li'); li.textContent = sid.slice(0,8)+' — connecting…';
+  list.appendChild(li);
+  var pc = new RTCPeerConnection({iceServers:ICE});
+  var dc = pc.createDataChannel('file', {ordered:true});
+  dc.binaryType = 'arraybuffer'; dc.bufferedAmountLowThreshold = LOW;
+  pc.onicecandidate = function(e){ if(e.candidate) post('msg?sid='+sid+'&from=a',{t:'cand',c:e.candidate}); };
+  var finished = false, sent = 0, t0 = 0;
+  dc.onopen = async function(){
+    try{
+      t0 = Date.now();
+      dc.send(JSON.stringify({t:'meta',name:NAME}));
+      var resp = await fetch('../' + encodeURIComponent(NAME) + '?raw=1' + KA);
+      var reader = resp.body.getReader();
+      for(;;){
+        var rr = await reader.read();
+        if (rr.done) break;
+        var buf = rr.value;
+        for (var off = 0; off < buf.byteLength; off += CHUNK) {
+          while (dc.bufferedAmount > HIGH) {
+            await new Promise(function(res){ dc.onbufferedamountlow = res; });
+          }
+          dc.send(buf.subarray(off, Math.min(off+CHUNK, buf.byteLength)));
+          sent += Math.min(CHUNK, buf.byteLength-off);
+        }
+        var mbps = sent/1048576/((Date.now()-t0)/1000);
+        li.textContent = sid.slice(0,8)+' — '+(sent/1048576).toFixed(1)+' MB · '+mbps.toFixed(1)+' MB/s';
+      }
+      while (dc.bufferedAmount > 0) { await sleep(100); }
+      dc.send(JSON.stringify({t:'eof'}));
+      li.textContent = sid.slice(0,8)+' — ✓ sent '+(sent/1048576).toFixed(1)+' MB';
+    }catch(e){ li.textContent = sid.slice(0,8)+' — ✕ send failed: '+(e && e.message || e); }
+    finished = true;
+  };
+  try{
+    var offer = await pc.createOffer(); await pc.setLocalDescription(offer);
+    post('msg?sid='+sid+'&from=a',{t:'offer',sdp:pc.localDescription});
+    var deadline = Date.now() + 600000;
+    while (!finished && Date.now() < deadline) {           // answer/cands (+ack)
+      var r = await fetch('../__rtc/msg?sid='+sid+'&as=a&wait=1'+KA);
+      if (r.status === 204) continue;
+      if (!r.ok) { await sleep(1000); continue; }
+      var m = await r.json();
+      if (m.t === 'answer') await pc.setRemoteDescription(m.sdp);
+      else if (m.t === 'cand') { try { await pc.addIceCandidate(m.c); } catch(e){} }
+      else if (m.t === 'ack') break;
+    }
+  }catch(e){ li.textContent = sid.slice(0,8)+' — ✕ '+(e && e.message || 'failed'); }
+  setTimeout(function(){ pc.close(); }, 3000);
+  active--;
+}
+</script>
+</body></html>`))
+
+// callTmpl is the built-in 1:1 WebRTC call (--call): getUserMedia + perfect
+// negotiation over the same signaling relay. No MiroTalk needed for a quick
+// two-person call — the secret link IS the room.
+var callTmpl = template.Must(template.New("call").Parse(`<!doctype html>
+<html><head><meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1,viewport-fit=cover">
+<meta name="robots" content="noindex,nofollow"><title>tshare call</title>
+<style>
+:root{color-scheme:dark light}
+*{margin:0;box-sizing:border-box}
+html,body{height:100%}
+body{background:#000;color:#ececf4;font:14px/1.5 -apple-system,BlinkMacSystemFont,'Segoe UI',Roboto,sans-serif;display:flex;flex-direction:column;min-height:100%}
+.stage{flex:1;position:relative;display:flex;align-items:center;justify-content:center;overflow:hidden}
+video#rv{width:100%;height:100%;object-fit:contain;background:#000}
+video#lv{position:absolute;right:14px;bottom:14px;width:26vw;max-width:220px;border-radius:10px;border:1px solid #26263a;background:#101018}
+.bar{display:flex;gap:10px;align-items:center;justify-content:center;padding:12px 14px calc(12px + env(safe-area-inset-bottom));border-top:1px solid #23232f;background:#101018}
+.bar button{background:#181826;color:#ececf4;border:1px solid #26263a;border-radius:10px;padding:10px 16px;font-size:14px;cursor:pointer}
+.bar button.off{background:#3a1820;border-color:#5c2430}
+.bar .st{color:#9a9aac;font-size:13px;margin-right:8px}
+.abuse{color:#6a6a7c;font-size:11px;text-align:center;padding:4px 12px;opacity:.8}
+</style></head>
+<body>
+<div class="stage"><video id="rv" autoplay playsinline></video><video id="lv" autoplay playsinline muted></video></div>
+<div class="bar">
+ <span class="st" id="st">joining…</span>
+ <button id="mute">🎙 mute</button>
+ <button id="cam">🎥 cam</button>
+ <button id="bye">⏻ leave</button>
+</div>{{.Abuse}}
+<script>
+var ICE = {{.Ice}}, SID = 'call';
+var st=document.getElementById('st'), lv=document.getElementById('lv'), rv=document.getElementById('rv');
+function say(t){ st.textContent = t; }
+function sleep(ms){ return new Promise(function(r){ setTimeout(r,ms); }); }
+async function post(body,role){ return fetch('__rtc/msg?sid='+SID+'&from='+role,{method:'POST',
+  headers:{'Content-Type':'application/json'},body:JSON.stringify(body)}); }
+(async function(){
+  var cr = await fetch('__rtc/claim');
+  if (cr.status === 409) { say('call is full (two participants max)'); return; }
+  var role = (await cr.json()).role, polite = role === 'b';
+  setInterval(function(){ fetch('__rtc/presence?as='+role,{method:'POST'}); }, 5000);
+  var stream;
+  try { stream = await navigator.mediaDevices.getUserMedia({video:true,audio:true}); }
+  catch(e){ say('camera/mic blocked — check permissions (needs HTTPS)'); return; }
+  lv.srcObject = stream;
+  var pc = new RTCPeerConnection({iceServers:ICE});
+  stream.getTracks().forEach(function(t){ pc.addTrack(t, stream); });
+  pc.ontrack = function(e){ rv.srcObject = e.streams[0]; say('connected'); };
+  pc.onicecandidate = function(e){ if(e.candidate) post({t:'cand',c:e.candidate},role); };
+  pc.onconnectionstatechange = function(){
+    if (pc.connectionState==='disconnected'||pc.connectionState==='failed') say('peer left / connection lost');
+  };
+  var makingOffer = false, ignoreOffer = false;
+  pc.onnegotiationneeded = async function(){
+    try { makingOffer = true; await pc.setLocalDescription();
+      post({t:'sdp',sdp:pc.localDescription},role); }
+    catch(e){} finally { makingOffer = false; }
+  };
+  say(role==='a' ? 'waiting for the other side…' : 'connecting…');
+  document.getElementById('mute').onclick = function(){
+    var t = stream.getAudioTracks()[0]; t.enabled = !t.enabled;
+    this.classList.toggle('off', !t.enabled);
+  };
+  document.getElementById('cam').onclick = function(){
+    var t = stream.getVideoTracks()[0]; t.enabled = !t.enabled;
+    this.classList.toggle('off', !t.enabled);
+  };
+  document.getElementById('bye').onclick = function(){
+    pc.close(); stream.getTracks().forEach(function(t){ t.stop(); }); say('left the call');
+  };
+  for(;;){                                                 // signaling poll
+    var r = await fetch('__rtc/msg?sid='+SID+'&as='+role+'&wait=1');
+    if (r.status === 204) continue;
+    if (!r.ok) { await sleep(1000); continue; }
+    var m = await r.json();
+    if (m.t === 'sdp') {
+      var desc = m.sdp;
+      var collision = desc.type === 'offer' && (makingOffer || pc.signalingState !== 'stable');
+      ignoreOffer = !polite && collision;
+      if (ignoreOffer) continue;
+      await pc.setRemoteDescription(desc);
+      if (desc.type === 'offer') {
+        await pc.setLocalDescription();
+        post({t:'sdp',sdp:pc.localDescription},role);
+      }
+    } else if (m.t === 'cand') {
+      try { await pc.addIceCandidate(m.c); } catch(e){ if(!ignoreOffer) console.warn(e); }
+    }
+  }
+})();
+</script>
+</body></html>`))
+
 // mediaTmpl is a minimal, iOS-friendly player page. The media element streams
 // from ?raw=1 (Range-served), playsinline keeps iOS from forcing an odd
 // fullscreen frame, and the viewport/CSS make it fill the screen responsively.
@@ -2756,6 +3445,56 @@ func (s *share) renderInbox(w *respRec, urlBase string) {
 	}
 }
 
+func (s *share) renderRoom(w *respRec) {
+	if w.status != 0 {
+		return
+	}
+	w.Header().Set("Content-Type", "text/html; charset=utf-8")
+	data := map[string]any{"RoomName": s.roomName, "RoomURL": s.roomURL, "Abuse": s.abuseHTML()}
+	if err := roomTmpl.Execute(w, data); err != nil && !s.cfg.Quiet {
+		log.Printf("template: %v", err)
+	}
+}
+
+func (s *share) renderP2PRecv(w *respRec) {
+	if w.status != 0 {
+		return
+	}
+	w.Header().Set("Content-Type", "text/html; charset=utf-8")
+	data := map[string]any{
+		"Name": s.roots[0].Name, "Size": s.roots[0].Size,
+		"SizeH": humanSize(s.roots[0].Size), "Ice": s.iceJSON(), "Abuse": s.abuseHTML(),
+	}
+	if err := p2pRecvTmpl.Execute(w, data); err != nil && !s.cfg.Quiet {
+		log.Printf("template: %v", err)
+	}
+}
+
+func (s *share) renderP2PSend(w *respRec, r *http.Request) {
+	if !s.senderReq(r) {
+		http.Error(w, "403", http.StatusForbidden)
+		return
+	}
+	w.Header().Set("Content-Type", "text/html; charset=utf-8")
+	data := map[string]any{
+		"Name": s.roots[0].Name, "SizeH": humanSize(s.roots[0].Size), "Ice": s.iceJSON(),
+	}
+	if err := p2pSendTmpl.Execute(w, data); err != nil && !s.cfg.Quiet {
+		log.Printf("template: %v", err)
+	}
+}
+
+func (s *share) renderCall(w *respRec) {
+	if w.status != 0 {
+		return
+	}
+	w.Header().Set("Content-Type", "text/html; charset=utf-8")
+	data := map[string]any{"Ice": s.iceJSON(), "Abuse": s.abuseHTML()}
+	if err := callTmpl.Execute(w, data); err != nil && !s.cfg.Quiet {
+		log.Printf("template: %v", err)
+	}
+}
+
 // ---------------------------------------------------------------------------
 // tailscale integration
 
@@ -2847,6 +3586,8 @@ type stateRec struct {
 	Uploads   int64     `json:"uploads"`
 	Created   time.Time `json:"created"`
 	Expires   time.Time `json:"expires,omitempty"`
+	MTPid     int       `json:"mirotalk_pid,omitempty"`   // local MiroTalk child we own
+	RootMount bool      `json:"root_mount,omitempty"`     // we hold the funnel/serve root path
 }
 
 func stateDir() string {
@@ -2863,12 +3604,17 @@ func stateFile(id string) string { return filepath.Join(stateDir(), id+".json") 
 
 func (s *share) stateRec(port int) stateRec {
 	target := s.describe()
+	mtPid := 0
+	if s.mtCmd != nil && s.mtCmd.Process != nil {
+		mtPid = s.mtCmd.Process.Pid
+	}
 	return stateRec{
 		ID: s.id, PID: os.Getpid(), Token: s.token, Mode: s.mode,
 		URL: s.prettyURL(), Target: target, Tailnet: s.cfg.Tailnet, Local: s.cfg.Local,
 		HTTPSPort: s.cfg.HTTPSPort, Port: port, Password: s.getPassword() != "",
 		MaxDL: s.maxDL.Load(), Downloads: s.dl.Load(), Uploads: s.upCount.Load(),
 		Created: s.createdAt, Expires: s.getExpires(),
+		MTPid: mtPid, RootMount: s.mtRootMounted,
 	}
 }
 
@@ -3137,10 +3883,17 @@ func cmdRm(args []string) {
 				syscall.Kill(r.PID, syscall.SIGKILL)
 			}
 		}
-		// belt & braces: remove funnel mount + state even if process is gone
+		// belt & braces: remove funnel mount + state even if process is gone;
+		// reap an owned MiroTalk child if the share died without cleanup.
+		if r.MTPid > 0 && !pidAlive(r.PID) && pidAlive(r.MTPid) {
+			syscall.Kill(-r.MTPid, syscall.SIGTERM)
+		}
 		if !r.Local {
 			c := &config{Tailnet: r.Tailnet, HTTPSPort: r.HTTPSPort}
 			tsUnmount(c, r.Token)
+			if r.RootMount && !pidAlive(r.PID) {
+				tsUnmount(c, "")
+			}
 		}
 		os.Remove(stateFile(r.ID))
 		fmt.Printf("  ✓ stopped %s (%s)\n", r.ID, r.URL)
@@ -3159,8 +3912,16 @@ func cmdPanic() {
 		if pidAlive(r.PID) {
 			syscall.Kill(r.PID, syscall.SIGKILL) // no waiting — this is a panic
 		}
+		// SIGKILL means the share's own cleanup never ran: reap the local
+		// MiroTalk child (whole process group) and the funnel ROOT mount too.
+		if r.MTPid > 0 {
+			syscall.Kill(-r.MTPid, syscall.SIGKILL)
+		}
 		if !r.Local {
 			tsUnmount(&config{Tailnet: r.Tailnet, HTTPSPort: r.HTTPSPort}, r.Token)
+			if r.RootMount {
+				tsUnmount(&config{Tailnet: r.Tailnet, HTTPSPort: r.HTTPSPort}, "")
+			}
 		}
 		os.Remove(stateFile(r.ID))
 		os.Remove(persistFile(r.ID))
@@ -4151,6 +4912,683 @@ func (b *bufPool) Put(x []byte) { b.p.Put(x) }
 
 var proxyBufPool = &bufPool{p: sync.Pool{New: func() any { return make([]byte, 64<<10) }}}
 
+// ---------------------------------------------------------------------------
+// local MiroTalk engine (--room without --mirotalk-url)
+//
+// One-time setup: `tshare room install` clones github.com/miroslavpejic85/mirotalk
+// into ~/.tshare/mirotalk, copies its .env / config templates and installs deps
+// (npm, or docker compose). After that `tshare --room <name>` starts it on
+// demand, health-checks it, exposes it at the funnel/serve ROOT path (MiroTalk
+// is a root-path SPA — it breaks under /<token>/), and stops it again on exit.
+// Signaling stays on your node; the actual call media is WebRTC peer-to-peer.
+
+const mirotalkRepo = "https://github.com/miroslavpejic85/mirotalk"
+
+func mirotalkDefaultDir() string {
+	home, err := os.UserHomeDir()
+	if err != nil {
+		home = os.TempDir()
+	}
+	return filepath.Join(home, ".tshare", "mirotalk")
+}
+
+func mirotalkResolvedDir(c *config) string {
+	if c.MirotalkDir != "" {
+		return c.MirotalkDir
+	}
+	return mirotalkDefaultDir()
+}
+
+// mirotalkAlive probes 127.0.0.1:<port> and classifies it: "mirotalk" (usable),
+// "other" (port busy with something else), or "" (nothing listening).
+func mirotalkAlive(port int) string {
+	client := &http.Client{Timeout: 1500 * time.Millisecond}
+	resp, err := client.Get(fmt.Sprintf("http://127.0.0.1:%d/", port))
+	if err != nil {
+		return ""
+	}
+	defer resp.Body.Close()
+	body, _ := io.ReadAll(io.LimitReader(resp.Body, 64<<10))
+	if strings.Contains(strings.ToLower(string(body)), "mirotalk") {
+		return "mirotalk"
+	}
+	return "other"
+}
+
+// mirotalkLocal locates a usable local MiroTalk: an already-running instance on
+// the configured port, or an installed checkout to spawn. Returned dir is ""
+// when an already-running instance should simply be reused.
+func mirotalkLocal(c *config) (dir string, running bool, err error) {
+	switch mirotalkAlive(c.MirotalkPort) {
+	case "mirotalk":
+		return "", true, nil
+	case "other":
+		return "", false, fmt.Errorf("port %d is serving something that isn't MiroTalk — set mirotalk-port / stop it", c.MirotalkPort)
+	}
+	dir = mirotalkResolvedDir(c)
+	if fileExists(filepath.Join(dir, "package.json")) {
+		return dir, false, nil
+	}
+	return "", false, errors.New("--room needs a MiroTalk instance. One-time local setup:\n" +
+		"      tshare room install        (clones + installs " + mirotalkRepo + ")\n" +
+		"      …or point at a remote one: --mirotalk-url https://meet.example.com")
+}
+
+// mirotalkMethod picks how to run the checkout: explicit config wins, then a
+// prepared docker-compose.yml with docker present, then npm.
+func mirotalkMethod(c *config, dir string) string {
+	if c.MirotalkMethod == "npm" || c.MirotalkMethod == "docker" {
+		return c.MirotalkMethod
+	}
+	if fileExists(filepath.Join(dir, "docker-compose.yml")) && haveExec("docker") {
+		return "docker"
+	}
+	return "npm"
+}
+
+func haveExec(name string) bool { _, err := exec.LookPath(name); return err == nil }
+
+// startLocalMirotalk makes sure a local MiroTalk answers on the configured
+// port, spawning the installed checkout when needed. The spawned child is
+// owned by this share and stopped on exit; a pre-existing instance is reused
+// untouched.
+func startLocalMirotalk(s *share) error {
+	c := s.cfg
+	dir, running, err := mirotalkLocal(c)
+	if err != nil {
+		return err
+	}
+	if running {
+		if !c.Quiet {
+			log.Printf("  ▷ reusing MiroTalk already running on :%d", c.MirotalkPort)
+		}
+		return nil
+	}
+	method := mirotalkMethod(c, dir)
+	logPath := filepath.Join(filepath.Dir(dir), "mirotalk.log")
+	logf, err := os.Create(logPath)
+	if err != nil {
+		logf = nil
+	}
+	var cmd *exec.Cmd
+	if method == "docker" {
+		// foreground `up` (not -d): the compose child is ours, SIGTERM stops the
+		// containers with it — same ownership model as the npm route.
+		cmd = exec.Command("docker", "compose", "up")
+	} else {
+		cmd = exec.Command("npm", "start")
+	}
+	cmd.Dir = dir
+	cmd.Env = append(os.Environ(), "NODE_ENV=production", fmt.Sprintf("PORT=%d", c.MirotalkPort))
+	if logf != nil {
+		cmd.Stdout, cmd.Stderr = logf, logf
+	}
+	cmd.SysProcAttr = &syscall.SysProcAttr{Setpgid: true} // npm/compose spawn children — kill the group
+	if err := cmd.Start(); err != nil {
+		return fmt.Errorf("starting mirotalk (%s): %w", method, err)
+	}
+	s.mtCmd = cmd
+	deadline := time.Now().Add(60 * time.Second)
+	for time.Now().Before(deadline) {
+		if mirotalkAlive(c.MirotalkPort) == "mirotalk" {
+			if !c.Quiet {
+				log.Printf("  ▷ local MiroTalk up on :%d (%s, pid %d, log %s)", c.MirotalkPort, method, cmd.Process.Pid, logPath)
+			}
+			return nil
+		}
+		time.Sleep(500 * time.Millisecond)
+	}
+	stopMirotalk(s)
+	return fmt.Errorf("mirotalk did not become healthy on :%d within 60s — see %s", c.MirotalkPort, logPath)
+}
+
+func stopMirotalk(s *share) {
+	if s.mtCmd == nil || s.mtCmd.Process == nil {
+		return
+	}
+	pid := s.mtCmd.Process.Pid
+	syscall.Kill(-pid, syscall.SIGTERM) // whole process group (npm→node, compose→containers)
+	done := make(chan struct{})
+	go func() { s.mtCmd.Wait(); close(done) }()
+	select {
+	case <-done:
+	case <-time.After(8 * time.Second):
+		syscall.Kill(-pid, syscall.SIGKILL)
+	}
+	s.mtCmd = nil
+}
+
+// cmdRoom implements `tshare room install|status` — the one-time local setup.
+func cmdRoom(args []string) {
+	c := &config{MirotalkPort: 3000}
+	applyConfig(c, args)
+	sub := ""
+	if len(args) > 0 {
+		sub = args[0]
+	}
+	switch sub {
+	case "install", "setup":
+		if err := roomInstall(c, args[1:]); err != nil {
+			log.Fatalf("tshare: %v", err)
+		}
+	case "status":
+		dir := mirotalkResolvedDir(c)
+		fmt.Printf("  install dir : %s (installed: %v)\n", dir, fileExists(filepath.Join(dir, "package.json")))
+		fmt.Printf("  method      : %s\n", mirotalkMethod(c, dir))
+		state := mirotalkAlive(c.MirotalkPort)
+		if state == "" {
+			state = "not running"
+		}
+		fmt.Printf("  port %d   : %s\n", c.MirotalkPort, state)
+	default:
+		fmt.Println("usage: tshare room install   (one-time local MiroTalk setup from GitHub)")
+		fmt.Println("       tshare room status    (where it is, how it runs, is it up)")
+	}
+}
+
+func roomInstall(c *config, args []string) error {
+	method := ""
+	for _, a := range args {
+		switch a {
+		case "--docker":
+			method = "docker"
+		case "--npm":
+			method = "npm"
+		}
+	}
+	if !haveExec("git") {
+		return errors.New("git is required (brew install git)")
+	}
+	if method == "" {
+		if haveExec("node") && haveExec("npm") {
+			method = "npm"
+		} else if haveExec("docker") {
+			method = "docker"
+		} else {
+			return errors.New("need node+npm or docker to run MiroTalk\n" +
+				"      brew install node        (lightest)\n" +
+				"      …or install Docker Desktop, then re-run: tshare room install")
+		}
+	}
+	dir := mirotalkResolvedDir(c)
+	if fileExists(filepath.Join(dir, "package.json")) {
+		fmt.Printf("  ✓ already cloned: %s (updating)\n", dir)
+		if out, err := exec.Command("git", "-C", dir, "pull", "--ff-only").CombinedOutput(); err != nil {
+			fmt.Printf("  ⚠ update skipped: %s\n", strings.TrimSpace(string(out)))
+		}
+	} else {
+		fmt.Printf("  ⇣ cloning %s → %s\n", mirotalkRepo, dir)
+		if err := os.MkdirAll(filepath.Dir(dir), 0o700); err != nil {
+			return err
+		}
+		cmd := exec.Command("git", "clone", "--depth", "1", mirotalkRepo, dir)
+		cmd.Stdout, cmd.Stderr = os.Stderr, os.Stderr
+		if err := cmd.Run(); err != nil {
+			return fmt.Errorf("git clone failed: %w", err)
+		}
+	}
+	// template files (only if the real one doesn't exist yet — never clobber)
+	copies := [][2]string{
+		{".env.template", ".env"},
+		{filepath.Join("app", "src", "config.template.js"), filepath.Join("app", "src", "config.js")},
+	}
+	if method == "docker" {
+		copies = append(copies, [2]string{"docker-compose.template.yml", "docker-compose.yml"})
+	}
+	for _, cp := range copies {
+		src, dst := filepath.Join(dir, cp[0]), filepath.Join(dir, cp[1])
+		if fileExists(dst) || !fileExists(src) {
+			continue
+		}
+		b, err := os.ReadFile(src)
+		if err != nil {
+			return err
+		}
+		if err := os.WriteFile(dst, b, 0o644); err != nil {
+			return err
+		}
+		fmt.Printf("  ✓ %s → %s\n", cp[0], cp[1])
+	}
+	// dependencies
+	if method == "npm" {
+		fmt.Println("  ⇣ npm install (production deps)…")
+		cmd := exec.Command("npm", "ci", "--omit=dev")
+		cmd.Dir = dir
+		cmd.Stdout, cmd.Stderr = os.Stderr, os.Stderr
+		if err := cmd.Run(); err != nil {
+			cmd = exec.Command("npm", "install", "--omit=dev")
+			cmd.Dir = dir
+			cmd.Stdout, cmd.Stderr = os.Stderr, os.Stderr
+			if err := cmd.Run(); err != nil {
+				return fmt.Errorf("npm install failed: %w", err)
+			}
+		}
+	} else {
+		fmt.Println("  ⇣ docker compose pull…")
+		cmd := exec.Command("docker", "compose", "pull")
+		cmd.Dir = dir
+		cmd.Stdout, cmd.Stderr = os.Stderr, os.Stderr
+		if err := cmd.Run(); err != nil {
+			return fmt.Errorf("docker compose pull failed: %w", err)
+		}
+	}
+	// remember location + method in the config file (create/append, never clobber)
+	if err := appendConfigKeys(map[string]string{
+		"mirotalk-dir":    dir,
+		"mirotalk-method": method,
+	}); err != nil {
+		fmt.Printf("  ⚠ couldn't update config (%v) — pass --mirotalk-dir %s manually\n", err, dir)
+	} else {
+		fmt.Printf("  ✓ saved mirotalk-dir + mirotalk-method to %s\n", configPath())
+	}
+	fmt.Println("\n  done. start a room:  tshare --room standup")
+	fmt.Println("  (first visitor spins it up; media is P2P, signaling stays on your node)")
+	return nil
+}
+
+// appendConfigKeys adds key = value lines to the config file so they apply to
+// every run: inserted right after the [default] header when one exists, else at
+// the very top (keys before any [section] are global). Existing keys are never
+// touched; the file is created 0600 if missing.
+func appendConfigKeys(kv map[string]string) error {
+	path := configPath()
+	if path == "" {
+		return errors.New("no config path")
+	}
+	existing, _ := os.ReadFile(path)
+	var add []string
+	for k, v := range kv {
+		if regexp.MustCompile(`(?m)^\s*(--)?` + regexp.QuoteMeta(k) + `\s*=`).Match(existing) {
+			continue
+		}
+		add = append(add, fmt.Sprintf("%s = %s", k, v))
+	}
+	if len(add) == 0 {
+		return nil
+	}
+	sort.Strings(add)
+	block := "# added by `tshare room install`\n" + strings.Join(add, "\n") + "\n"
+	var out string
+	switch {
+	case len(existing) == 0:
+		out = "# tshare config (see config.example)\n[default]\n" + block
+	default:
+		lines := strings.SplitAfter(string(existing), "\n")
+		at := -1 // insert index: after [default], else before the first section
+		for i, l := range lines {
+			t := strings.TrimSpace(l)
+			if t == "[default]" {
+				at = i + 1
+				break
+			}
+			if strings.HasPrefix(t, "[") && at == -1 {
+				at = i
+				break
+			}
+		}
+		if at == -1 { // no sections at all → append (still global)
+			at = len(lines)
+		}
+		out = strings.Join(lines[:at], "") + block + strings.Join(lines[at:], "")
+	}
+	if err := os.MkdirAll(filepath.Dir(path), 0o700); err != nil {
+		return err
+	}
+	return os.WriteFile(path, []byte(out), 0o600)
+}
+
+// ---------------------------------------------------------------------------
+// browser WebRTC: P2P direct transfer (--p2p) + built-in 1:1 call (--call)
+//
+// The Go binary stays stdlib-only: all WebRTC runs in the browsers. tshare is
+// the token-gated signaling relay (tiny JSON mailboxes with HTTP long-poll)
+// plus the static pages. For --p2p the SENDER side is an auto-opened local
+// browser tab that streams the file from loopback into a DataChannel; the
+// receiver's browser hole-punches a direct connection (STUN → works through
+// most NATs and many CGNATs), so the bytes never ride the funnel relay — that
+// is the performance win. When ICE fails, the normal HTTPS download through
+// the funnel is one click away. Optional TURN (--turn) guarantees delivery.
+
+type rtcHub struct {
+	mu         sync.Mutex
+	sessions   map[string]*rtcSess
+	pending     []string      // receiver sids waiting for the sender tab
+	pendCh      chan struct{} // signaled when pending grows
+	senderSeen  time.Time     // --p2p sender-tab heartbeat
+	senderPolls int           // open sender long-polls (a connected poll = alive)
+	claims     map[string]time.Time // --call: role → last heartbeat
+	lastGC     time.Time
+}
+
+type rtcSess struct {
+	touched time.Time
+	q       map[string][][]byte      // per-recipient FIFO ("a" / "b")
+	ch      map[string]chan struct{} // wake channels for long-pollers
+}
+
+func newRTCHub() *rtcHub {
+	return &rtcHub{sessions: map[string]*rtcSess{}, pendCh: make(chan struct{}, 1),
+		claims: map[string]time.Time{}}
+}
+
+func validSID(sid string) bool {
+	if len(sid) < 4 || len(sid) > 64 {
+		return false
+	}
+	for _, r := range sid {
+		if !(r == '-' || r == '_' || (r >= 'a' && r <= 'z') || (r >= 'A' && r <= 'Z') || (r >= '0' && r <= '9')) {
+			return false
+		}
+	}
+	return true
+}
+
+// locked helpers -------------------------------------------------------------
+
+func (h *rtcHub) gcLocked() {
+	if time.Since(h.lastGC) < 30*time.Second {
+		return
+	}
+	h.lastGC = time.Now()
+	for sid, s := range h.sessions {
+		if time.Since(s.touched) > 10*time.Minute {
+			delete(h.sessions, sid)
+		}
+	}
+}
+
+func (h *rtcHub) sessLocked(sid string) *rtcSess {
+	s := h.sessions[sid]
+	if s == nil {
+		s = &rtcSess{q: map[string][][]byte{}, ch: map[string]chan struct{}{
+			"a": make(chan struct{}, 1), "b": make(chan struct{}, 1)}}
+		h.sessions[sid] = s
+	}
+	s.touched = time.Now()
+	return s
+}
+
+// post delivers one signaling message to `to` ("a"|"b") in session sid.
+func (h *rtcHub) post(sid, to string, msg []byte) error {
+	h.mu.Lock()
+	defer h.mu.Unlock()
+	h.gcLocked()
+	if len(h.sessions) > 64 && h.sessions[sid] == nil {
+		return errors.New("too many sessions")
+	}
+	s := h.sessLocked(sid)
+	if len(s.q[to]) > 512 {
+		return errors.New("queue full")
+	}
+	s.q[to] = append(s.q[to], msg)
+	select {
+	case s.ch[to] <- struct{}{}:
+	default:
+	}
+	return nil
+}
+
+// take pops the oldest message for `as`, long-polling up to 25s when wait.
+func (h *rtcHub) take(ctx context.Context, sid, as string, wait bool) []byte {
+	deadline := time.After(25 * time.Second)
+	for {
+		h.mu.Lock()
+		s := h.sessLocked(sid)
+		if q := s.q[as]; len(q) > 0 {
+			msg := q[0]
+			s.q[as] = q[1:]
+			h.mu.Unlock()
+			return msg
+		}
+		ch := s.ch[as]
+		h.mu.Unlock()
+		if !wait {
+			return nil
+		}
+		select {
+		case <-ch:
+		case <-deadline:
+			return nil
+		case <-ctx.Done():
+			return nil
+		}
+	}
+}
+
+// announce / next: receivers announce their sid; the sender tab pops them.
+func (h *rtcHub) announce(sid string) {
+	h.mu.Lock()
+	h.pending = append(h.pending, sid)
+	h.sessLocked(sid)
+	h.mu.Unlock()
+	select {
+	case h.pendCh <- struct{}{}:
+	default:
+	}
+}
+
+func (h *rtcHub) next(ctx context.Context, wait bool) string {
+	deadline := time.After(25 * time.Second)
+	for {
+		h.mu.Lock()
+		if len(h.pending) > 0 {
+			sid := h.pending[0]
+			h.pending = h.pending[1:]
+			h.mu.Unlock()
+			return sid
+		}
+		h.mu.Unlock()
+		if !wait {
+			return ""
+		}
+		select {
+		case <-h.pendCh:
+		case <-deadline:
+			return ""
+		case <-ctx.Done():
+			return ""
+		}
+	}
+}
+
+// claim hands out the two --call roles; a role is reclaimable once its peer
+// stops heartbeating for 15s (page closed), so a dropped caller can rejoin.
+func (h *rtcHub) claim() (string, bool) {
+	h.mu.Lock()
+	defer h.mu.Unlock()
+	for _, role := range []string{"a", "b"} {
+		if time.Since(h.claims[role]) > 15*time.Second {
+			h.claims[role] = time.Now()
+			return role, true
+		}
+	}
+	return "", false
+}
+
+func (h *rtcHub) beat(role string) {
+	h.mu.Lock()
+	if _, ok := h.claims[role]; ok || role == "a" || role == "b" {
+		h.claims[role] = time.Now()
+	}
+	h.mu.Unlock()
+}
+
+func (h *rtcHub) senderBeat() { h.mu.Lock(); h.senderSeen = time.Now(); h.mu.Unlock() }
+
+// senderOnline is deliberately generous: Safari throttles or suspends timers
+// in background tabs, so explicit heartbeats can stall while the tab is still
+// perfectly able to serve (its chained long-poll is network-event driven and
+// keeps running). An open long-poll counts as a live beat (see handleRTC), and
+// the window is a full minute so a throttled-but-alive tab stays "online".
+func (h *rtcHub) senderOnline() bool {
+	h.mu.Lock()
+	defer h.mu.Unlock()
+	return h.senderPolls > 0 || time.Since(h.senderSeen) < 60*time.Second
+}
+
+// senderReq: the auto-opened local sender tab authenticates with a per-share
+// secret key (bypasses the Basic-Auth password, never counts as a download).
+func (s *share) senderReq(r *http.Request) bool {
+	return s.senderKey != "" &&
+		subtle.ConstantTimeCompare([]byte(r.URL.Query().Get("k")), []byte(s.senderKey)) == 1
+}
+
+// handleGameIce serves the RTCPeerConnection iceServers config to a GIGA-NET/1-L
+// game page (same-origin, token/password-gated like everything else). Over
+// funnel/tailnet it returns the STUN/TURN config so peers on different networks
+// can hole-punch; in --local mode it returns [] so LAN play stays pure and
+// instant (host candidates only — nothing reaches a public STUN server).
+func (s *share) handleGameIce(w *respRec, r *http.Request) {
+	if r.Method != http.MethodGet && r.Method != http.MethodHead {
+		http.Error(w, "405 method not allowed", http.StatusMethodNotAllowed)
+		return
+	}
+	body := "[]"
+	if !s.cfg.Local {
+		body = string(s.iceJSON())
+	}
+	w.Header().Set("Content-Type", "application/json; charset=utf-8")
+	w.Header().Set("Cache-Control", "no-store")
+	if r.Method == http.MethodHead {
+		return
+	}
+	io.WriteString(w, body)
+}
+
+// iceJSON builds the RTCPeerConnection iceServers config from --stun/--turn.
+func (s *share) iceJSON() template.JS {
+	type entry struct {
+		URLs       []string `json:"urls"`
+		Username   string   `json:"username,omitempty"`
+		Credential string   `json:"credential,omitempty"`
+	}
+	var servers []entry
+	var stuns []string
+	for _, u := range strings.Split(s.cfg.STUN, ",") {
+		if u = strings.TrimSpace(u); u != "" {
+			stuns = append(stuns, u)
+		}
+	}
+	if len(stuns) > 0 {
+		servers = append(servers, entry{URLs: stuns})
+	}
+	if t := strings.TrimSpace(s.cfg.TURN); t != "" {
+		servers = append(servers, entry{URLs: []string{t}, Username: s.cfg.TURNUser, Credential: s.cfg.TURNPass})
+	}
+	b, _ := json.Marshal(servers)
+	return template.JS(b)
+}
+
+// handleRTC serves the signaling endpoints under __rtc/. Receiver-side calls
+// arrive through the normal token+password gate; sender-tab calls carry ?k=.
+func (s *share) handleRTC(w *respRec, r *http.Request, ep string) {
+	if s.hub == nil {
+		http.NotFound(w, r)
+		return
+	}
+	q := r.URL.Query()
+	jsonOK := func(v any) {
+		w.Header().Set("Content-Type", "application/json")
+		b, _ := json.Marshal(v)
+		w.Write(b)
+	}
+	role := func(k string) string { // constrain to a|b
+		if v := q.Get(k); v == "a" || v == "b" {
+			return v
+		}
+		return ""
+	}
+	switch {
+	case ep == "msg" && r.Method == http.MethodPost:
+		sid, from := q.Get("sid"), role("from")
+		if !validSID(sid) || from == "" {
+			http.Error(w, "bad sid/from", http.StatusBadRequest)
+			return
+		}
+		body, err := io.ReadAll(http.MaxBytesReader(w, r.Body, 64<<10))
+		if err != nil {
+			http.Error(w, "message too large", http.StatusRequestEntityTooLarge)
+			return
+		}
+		to := "a"
+		if from == "a" {
+			to = "b"
+		}
+		if err := s.hub.post(sid, to, body); err != nil {
+			http.Error(w, err.Error(), http.StatusServiceUnavailable)
+			return
+		}
+		jsonOK(map[string]any{"ok": true})
+	case ep == "msg":
+		sid, as := q.Get("sid"), role("as")
+		if !validSID(sid) || as == "" {
+			http.Error(w, "bad sid/as", http.StatusBadRequest)
+			return
+		}
+		if msg := s.hub.take(r.Context(), sid, as, q.Get("wait") == "1"); msg != nil {
+			w.Header().Set("Content-Type", "application/json")
+			w.Write(msg)
+			return
+		}
+		w.WriteHeader(http.StatusNoContent)
+	case ep == "hello" && r.Method == http.MethodPost:
+		sid := q.Get("sid")
+		if !validSID(sid) {
+			http.Error(w, "bad sid", http.StatusBadRequest)
+			return
+		}
+		s.hub.announce(sid)
+		jsonOK(map[string]any{"ok": true})
+	case ep == "next":
+		if !s.senderReq(r) {
+			http.Error(w, "403", http.StatusForbidden)
+			return
+		}
+		// the connected poll itself is proof of life — beats survive Safari's
+		// background-tab timer throttling, which stalls setInterval heartbeats
+		s.hub.senderBeat()
+		s.hub.mu.Lock()
+		s.hub.senderPolls++
+		s.hub.mu.Unlock()
+		sid := s.hub.next(r.Context(), q.Get("wait") == "1")
+		s.hub.mu.Lock()
+		s.hub.senderPolls--
+		s.hub.mu.Unlock()
+		s.hub.senderBeat()
+		if sid != "" {
+			jsonOK(map[string]any{"sid": sid})
+			return
+		}
+		w.WriteHeader(http.StatusNoContent)
+	case ep == "presence" && r.Method == http.MethodPost:
+		if s.senderReq(r) {
+			s.hub.senderBeat()
+		} else if ro := role("as"); ro != "" {
+			s.hub.beat(ro)
+		}
+		jsonOK(map[string]any{"ok": true})
+	case ep == "presence":
+		jsonOK(map[string]any{"online": s.hub.senderOnline()})
+	case ep == "claim":
+		ro, ok := s.hub.claim()
+		if !ok {
+			http.Error(w, "call is full (two participants)", http.StatusConflict)
+			return
+		}
+		jsonOK(map[string]any{"role": ro})
+	case ep == "done" && r.Method == http.MethodPost:
+		if s.senderKey != "" { // p2p transfer completed → counts as a download
+			s.countDownload()
+			if !s.cfg.Quiet {
+				log.Printf("  ⚡ p2p transfer complete (%s)", q.Get("sid"))
+			}
+		}
+		jsonOK(map[string]any{"ok": true})
+	default:
+		http.NotFound(w, r)
+	}
+}
+
 func freePort() (int, error) {
 	ln, err := net.Listen("tcp", "127.0.0.1:0")
 	if err != nil {
@@ -5064,6 +6502,9 @@ func applyConfig(c *config, args []string) {
 		return
 	}
 	profile := argValue(args, "--profile")
+	if profile == "" {
+		profile = argValue(args, "--template") // templates are named presets (== profiles)
+	}
 	cfgArgs := loadConfigArgs(configPath(), profile)
 	if len(cfgArgs) > 0 {
 		fs := flag.NewFlagSet("config", flag.ContinueOnError)
@@ -5135,6 +6576,135 @@ func loadConfigArgs(path, profile string) []string {
 		}
 	}
 	return out
+}
+
+// cmdTemplate manages share templates — named presets of flags stored as
+// config sections (#25). Templates ARE config profiles; this just lets you
+// save/list/remove them from the CLI instead of hand-editing the config, and
+// apply one with `tshare --template <name> <path>`.
+func cmdTemplate(args []string) {
+	sub := ""
+	if len(args) > 0 {
+		sub = args[0]
+	}
+	switch sub {
+	case "save", "set":
+		if len(args) < 2 || strings.HasPrefix(args[1], "-") {
+			log.Fatal("usage: tshare template save <name> <flags…>   e.g. tshare template save client -p pw -e 7d --site")
+		}
+		name := args[1]
+		if !validSlug(name) || name == "default" || name == "policy" {
+			log.Fatalf("template name %q must be a simple slug (not 'default'/'policy')", name)
+		}
+		c := &config{}
+		fs := flag.NewFlagSet("template", flag.ContinueOnError)
+		registerFlags(fs, c)
+		if err := fs.Parse(args[2:]); err != nil {
+			log.Fatalf("tshare: %v", err)
+		}
+		var lines []string
+		fs.Visit(func(f *flag.Flag) {
+			if strings.HasPrefix(f.Name, "__") || f.Name == "template" || f.Name == "profile" {
+				return
+			}
+			switch v := f.Value.String(); v {
+			case "true":
+				lines = append(lines, f.Name)
+			case "false", "0", "":
+				// off / empty → nothing to store
+			default:
+				lines = append(lines, f.Name+" = "+v)
+			}
+		})
+		if len(lines) == 0 {
+			log.Fatal("nothing to save — pass the flags this template should set")
+		}
+		sort.Strings(lines)
+		if err := upsertConfigSection(name, lines); err != nil {
+			log.Fatalf("tshare: %v", err)
+		}
+		fmt.Printf("  ✓ saved template [%s] → %s\n", name, configPath())
+		fmt.Printf("  use it:  tshare --template %s <path>\n", name)
+	case "ls", "list":
+		names := configSections()
+		if len(names) == 0 {
+			fmt.Println("no templates yet — save one: tshare template save client -p pw -e 7d")
+			return
+		}
+		fmt.Println("  templates (tshare --template <name> …):")
+		for _, n := range names {
+			fmt.Printf("    %s\n", n)
+		}
+	case "rm", "remove", "delete":
+		if len(args) < 2 {
+			log.Fatal("usage: tshare template rm <name>")
+		}
+		if err := upsertConfigSection(args[1], nil); err != nil {
+			log.Fatalf("tshare: %v", err)
+		}
+		fmt.Printf("  ✓ removed template [%s]\n", args[1])
+	default:
+		fmt.Println("usage: tshare template save <name> <flags…>   save the flags as a reusable preset")
+		fmt.Println("       tshare template ls                     list saved templates")
+		fmt.Println("       tshare template rm <name>              delete one")
+		fmt.Println("apply: tshare --template <name> <path>        (a template is a config profile)")
+	}
+}
+
+// configSections lists the [named] sections in the config file, excluding the
+// special [default] and [policy] blocks.
+func configSections() []string {
+	b, err := os.ReadFile(configPath())
+	if err != nil {
+		return nil
+	}
+	re := regexp.MustCompile(`(?m)^\[([^\]]+)\]\s*$`)
+	var out []string
+	for _, m := range re.FindAllStringSubmatch(string(b), -1) {
+		s := strings.TrimSpace(m[1])
+		if s != "default" && s != "policy" {
+			out = append(out, s)
+		}
+	}
+	sort.Strings(out)
+	return out
+}
+
+// upsertConfigSection replaces the [name] block with the given lines (creating
+// the file/section if needed); nil lines removes the section entirely.
+func upsertConfigSection(name string, lines []string) error {
+	path := configPath()
+	if path == "" {
+		return errors.New("no config path")
+	}
+	existing, _ := os.ReadFile(path)
+	text := string(existing)
+	var block string
+	if lines != nil {
+		block = "[" + name + "]\n" + strings.Join(lines, "\n") + "\n"
+	}
+	secRe := regexp.MustCompile(`(?m)^\[` + regexp.QuoteMeta(name) + `\]\s*$`)
+	if loc := secRe.FindStringIndex(text); loc != nil {
+		rest := text[loc[1]:]
+		end := len(text)
+		if n := regexp.MustCompile(`(?m)^\[`).FindStringIndex(rest); n != nil {
+			end = loc[1] + n[0]
+		}
+		text = text[:loc[0]] + block + text[end:]
+	} else if lines != nil {
+		if text == "" {
+			text = "# tshare config (see config.example)\n"
+		} else if !strings.HasSuffix(text, "\n") {
+			text += "\n"
+		}
+		text += "\n" + block
+	} else {
+		return nil // asked to remove a section that isn't there
+	}
+	if err := os.MkdirAll(filepath.Dir(path), 0o700); err != nil {
+		return err
+	}
+	return os.WriteFile(path, []byte(text), 0o600)
 }
 
 // policy is optional, config-file-only org governance (#186). It lives in a
@@ -5361,21 +6931,38 @@ func (s *share) replExtend(spec string) {
 	fmt.Fprintf(os.Stderr, "  ⚙ %s\n", note)
 }
 
-// abuseHTML returns the small-font takedown/abuse line for public share pages,
-// or "" when no --abuse-contact is configured. The minimum needed for a public
-// host to display a report/takedown path; kept deliberately unobtrusive.
+// abuseHTML returns the small-font notice for share pages, or "" when neither
+// --abuse-contact nor --legal is set. Two opt-in flavours:
+//   --abuse-contact  →  "Report abuse / request takedown: <contact>"
+//   --legal          →  a minimal copyright + DMCA-§512 removal line
+// Note: US law mandates NO specific banner for a self-hosted personal share;
+// --legal is the closest honest "bare minimum" (a visible infringement/removal
+// path), not a legal guarantee. Kept deliberately unobtrusive.
 func (s *share) abuseHTML() template.HTML {
-	c := strings.TrimSpace(s.cfg.AbuseContact)
-	if c == "" {
+	contact := strings.TrimSpace(s.cfg.AbuseContact)
+	if contact == "" && !s.cfg.Legal {
 		return ""
 	}
-	inner := template.HTMLEscapeString(c)
-	if strings.Contains(c, "@") && !strings.Contains(c, " ") {
-		inner = `<a href="mailto:` + inner + `">` + inner + `</a>`
-	} else if strings.HasPrefix(c, "http://") || strings.HasPrefix(c, "https://") {
-		inner = `<a href="` + inner + `" rel="nofollow noreferrer">` + inner + `</a>`
+	linkOf := func(c string) string {
+		e := template.HTMLEscapeString(c)
+		switch {
+		case strings.Contains(c, "@") && !strings.Contains(c, " "):
+			return `<a href="mailto:` + e + `">` + e + `</a>`
+		case strings.HasPrefix(c, "http://") || strings.HasPrefix(c, "https://"):
+			return `<a href="` + e + `" rel="nofollow noreferrer">` + e + `</a>`
+		default:
+			return e
+		}
 	}
-	return template.HTML(`<div class="abuse">Report abuse / request takedown: ` + inner + `</div>`)
+	if s.cfg.Legal {
+		who := "the operator of this link"
+		if contact != "" {
+			who = linkOf(contact)
+		}
+		return template.HTML(`<div class="abuse">© Shared content remains the property of its ` +
+			`respective owners. Report infringement or request removal: ` + who + `</div>`)
+	}
+	return template.HTML(`<div class="abuse">Report abuse / request takedown: ` + linkOf(contact) + `</div>`)
 }
 
 func (s *share) expiresLabel() string {

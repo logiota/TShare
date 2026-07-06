@@ -11,6 +11,12 @@ qr           = true
 # max-rate   = 5M               # throttle served bandwidth to ~5 MB/s
 # min-free   = 32G              # refuse uploads below this much free disk (0 = off)
 # abuse-contact = abuse@example.com   # small-font takedown line on public pages
+# --room video rooms: `tshare room install` fills mirotalk-dir/-method for you.
+# mirotalk-url  = https://meet.example.com   # remote instance instead of the local one
+# mirotalk-port = 3000                       # where the local instance listens
+# WebRTC (--p2p / --call): STUN defaults are sane; add TURN for hard-NAT fallback.
+# stun = stun:stun.l.google.com:19302,stun:stun.cloudflare.com:3478
+# turn = turn:turn.example.com:3478          # + turn-user / turn-pass
 
 # tshare --profile public ~/file
 [public]

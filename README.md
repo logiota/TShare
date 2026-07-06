@@ -23,7 +23,13 @@ tshare --once secrets.env              # link dies after first download
 tshare -z -e 1w ~/Photos/trip          # folder as one .zip, lives a week
 tshare -u -e 2d                        # inbox: others upload files TO you
 tshare -i                              # blackhole inbox: count uploads, keep nothing
+tshare --room standup                  # video room on your local MiroTalk (auto-started)
+tshare --call                          # the link IS a built-in 1:1 video call
+tshare --p2p big.iso                   # ⚡ direct browser-to-browser transfer + fallback
 tshare --allow-upload -p pw ~/proj     # collaboration: browse + upload, password-gated
+tshare -g game.html                    # 🎮 host a GIGA-NET/1-L multiplayer game over the internet:
+                                       #    auto-opens as host, join link printed + on your clipboard
+tshare -l -g game.html                 # ^ same but LAN-only (no Tailscale; no STUN)
 tshare a.pdf b.png notes/              # multiple items → combined listing
 tshare -t plan.md                      # tailnet-only (tailscale serve, not public)
 tshare --max-rate 2M report.iso        # throttle served bandwidth to ~2 MB/s
@@ -95,6 +101,38 @@ tshare -s http://192.168.1.9:9000      # any reachable host:port with -s
 
 Same subpath caveat as `--site`: the app is served under `/<token>/`, so **relative asset paths** work; root-absolute (`/assets/…`) need your dev server's base path set to the share path (pair with `--name`). For Vite/webpack that's `base`/`publicPath`.
 
+## Video rooms (local MiroTalk, auto-managed)
+
+`--room` turns a secret link into the door to a [MiroTalk](https://github.com/miroslavpejic85/mirotalk) video room running **on your own machine**. One-time setup, then it's fully automatic:
+
+```sh
+tshare room install        # once: clones MiroTalk from GitHub into ~/.tshare/mirotalk,
+                           # copies its .env/config templates, installs deps (npm or
+                           # docker), and records the location in your tshare config
+tshare --room standup      # every time after: tshare starts MiroTalk (if it isn't
+                           # already running), health-checks it, exposes it at your
+                           # funnel ROOT, and prints the token-gated room link
+```
+
+The landing page has a **Join call** button and an optional display-name field; your `-p` password, `-e` expiry and the unguessable token decide **who reaches the join button**. The join URL is the documented `…/join?room=<name>` form. Room ids are random and unguessable unless you name one (`Team Sync` → `Team-Sync`). `?go=1` on the share link skips the landing page and 302s straight into the call. When the share stops, the MiroTalk it started stops with it (a MiroTalk you started yourself is reused and left alone); `tshare panic` reaps it too. Media never touches the server — MiroTalk P2P is mesh WebRTC, so the local instance only carries **signaling**; tshare runs it with `NODE_ENV=production`.
+
+`--mirotalk-url https://meet.mycorp.com` still points at a remote self-hosted instance instead; `tshare room status` shows what's installed/running. Caveats: MiroTalk needs the funnel **root** path (it's mounted at `/`, coexisting with token-path shares), and expiry/revocation gates *new* visitors — people already in the room hold the room URL.
+
+## ⚡ P2P direct transfers (`--p2p`) and built-in calls (`--call`)
+
+`--p2p` on a single-file share adds a **browser-to-browser WebRTC DataChannel** path: the visitor clicks *⚡ Direct P2P download* and the bytes flow straight from your machine to theirs — **skipping the funnel relay entirely** when the STUN hole-punch succeeds (most home NATs and many CGNATs, since Funnel-relayed HTTPS is bandwidth-capped while a direct UDP path runs at line speed). The normal HTTPS download stays one click away as the fallback, so nothing can get *slower* by adding `--p2p`.
+
+```sh
+tshare --p2p big.iso            # share + auto-open the local ⚡ sender tab
+tshare --p2p -p pw big.iso      # password still gates receivers (sender tab uses its own key)
+tshare --p2p --turn turn:t.example.com:3478 --turn-user u --turn-pass p big.iso
+tshare --call                   # the link IS a 1:1 video call — no MiroTalk, no setup
+```
+
+How it works (the Go binary stays stdlib-only): tshare hosts the pages and a tiny token-gated signaling relay; all WebRTC runs in browsers. The **sender side is a local tab** that auto-opens (`--no-open` prints its URL instead) and must stay open — it streams the file from loopback into per-receiver DataChannels with backpressure, shows live per-transfer speed, and heartbeats presence so receiver pages can tell whether ⚡ is available. Receivers stream to disk via the File System Access API (Chromium; other browsers assemble in memory, capped at 1.5 GB). Completed P2P transfers count toward `-n`/`--once`; P2P bytes don't count toward `--max-bytes` (they never ride the funnel). Direct connections need UDP hole-punch — when both ends sit behind symmetric NAT/hard CGNAT it fails cleanly and the page says to use the standard download; configure `--turn` for a guaranteed relay path.
+
+`--call` serves a minimal 1:1 call page (camera/mic, mute, cam toggle, leave) using the same signaling — perfect for "jump on a quick call" without installing anything. Two participants max; the secret link is the room. Needs HTTPS for camera/mic, which funnel/serve provide.
+
 ## Static websites over Funnel (v1.8)
 
 `--site` (or `--web`) serves a folder as a **live website** instead of a file browser — `index.html` routing, correct content-types, scripts run (no sandbox, no forced download), `404.html` fallback if present, and `ServeContent` caching (Last-Modified/ETag/304). Expiry defaults to **never** since sites are long-term.
@@ -104,7 +142,14 @@ tshare --site ~/blog                 # serve the folder as a website
 tshare --site ~/blog/index.html      # same — a lone .html uses its folder as root
 tshare --name blog --site ~/blog     # stable path: https://<host>.ts.net/blog/
 tshare --site -p hunter2 ~/blog      # password-gated site
+tshare --site --allow-upload ~/app   # site whose pages can ALSO POST files to __upload
 ```
+
+`--site --allow-upload` keeps the pages running as a live site *and* enables the `__upload` endpoint (uploads land in the site root). That lets an in-page app use the share as its own tiny data channel — e.g. the Giga games' [GIGA-NET/1-L automatic multiplayer links](../GigaSnake/WEBRTC-MULTIPLAYER.md), where WebRTC offer/answer files ride the share instead of being copy-pasted.
+
+`-g` / `--gamelink <game.html>` goes one step further and makes game hosting a **single command**: it implies `--site --allow-upload`, pre-mints a GIGA-NET/1-L session id, prints a 🎮 **join** link (also copied to your clipboard, and the QR if enabled) and a 🎮 **host** link, then auto-opens the host link here (`--no-open` prints it instead) — the page starts hosting by itself via its `#gnhost` fragment, and the other player just clicks the join link. `--quiet` prints only the join link; `--json` adds `game_join`/`game_host`. One session per link: re-run for a rematch.
+
+**LAN or internet.** `-g` follows the share's scope. Default (Tailscale Funnel) makes the join link a public HTTPS URL *and* lets the game connect across the internet: tshare serves the ICE config at a token-gated `__ice` endpoint (default public STUN, plus any `--turn`/`--turn-user`/`--turn-pass` you pass for symmetric-NAT relay), and the game page fetches it. `-l -g` keeps everything on the LAN — `__ice` returns `[]`, so no public STUN is contacted and nothing leaves your network. Either way the offer/answer never touch a game server; only the two browsers exchange them via the share.
 
 Funnel caveat (same as any subpath host): the site lives under `https://<host>.ts.net/<token>/`, so **use relative asset paths** (`href="style.css"`, `src="js/app.js"`) — they resolve correctly. Root-absolute paths (`/style.css`) escape the mount and 404; if your generator emits those, set its base URL to the share path and pair with `--name` for a stable prefix. Always share the link **with its trailing slash**.
 
@@ -170,7 +215,7 @@ Nice defaults (each individually disableable): the link is **copied to your clip
 | `-n, --max` / `--once` | stop after N / 1 completed downloads |
 | `-u, --upload [dir]` | inbox mode (default `./tshare-inbox`) |
 | `-i, --blackhole` | write-only sink: uploads read + counted + notified, **bytes discarded** (nothing on disk) |
-| `--allow-upload` | folder share also accepts uploads |
+| `--allow-upload` | folder share also accepts uploads (also works with `--site`: pages run *and* `__upload` accepts POSTs — e.g. in-page signalling like GIGA-NET/1-L) |
 | `--max-rate` | throttle served bandwidth, e.g. `2M` = ~2 MB/s (default: off) |
 | `--min-free` | refuse uploads when free disk space drops below this (default **32G**; `0` = off) |
 | `--abuse-contact` | show a small-font takedown/abuse line on public share pages (email/URL auto-linked) |
