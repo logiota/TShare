@@ -77,6 +77,7 @@ USAGE
   tshare ls [--json]                  list active shares
   tshare rm <id>... | --all           stop share(s), remove funnel mount
   tshare panic                        kill ALL shares NOW & wipe every token/state
+  tshare template save/ls/rm          manage reusable flag presets (templates)
   tshare resume                       restart shares saved with --persist
   tshare decrypt [-p pw] <f.enc>...   decrypt files received by an --encrypt inbox
   tshare doctor                       check tailscale / funnel / tools
@@ -122,6 +123,9 @@ SECURITY FLAGS
       --require-identity  funnel: require a Tailscale login (blocks anon public)
       --encrypt           encrypt received uploads at rest (AES-256-GCM)
       --abuse-contact <s> show a small-font takedown/abuse line on public pages
+      --legal             show a minimal copyright + removal-request line in the
+                          banner (opt-in; US law mandates no banner for a personal
+                          self-hosted share — this is a courtesy notice, not legal advice)
       --token-len <n>     secret token length, default 16 (~95 bits)
       --name <slug>       vanity path instead of random token (weaker secrecy!)
 
@@ -169,10 +173,12 @@ FOLDER ENGINE
                           and folders without an index get a browsable listing.
                           Scripts run (no sandbox); expiry defaults to never.
                           Pair with --name for a stable /<name>/ path
-      --gamelink          host a GIGA-NET/1-L multiplayer game page in one shot:
+  -g, --gamelink          host a GIGA-NET/1-L multiplayer game page in one shot:
                           implies --site --allow-upload, prints + copies a JOIN
                           link for the other player, and auto-opens the page here
-                          in host mode — zero clicks (e.g. GigaSnakes)
+                          in host mode — zero clicks (e.g. GigaSnakes). Over
+                          funnel/tailnet the game hole-punches via STUN (add
+                          --turn for symmetric NAT); -l keeps it LAN-only
   -l, --local             no tailscale: plain HTTP on your LAN (testing/offline)
       --lan-https         --local: serve HTTPS with a self-signed cert
       --no-lan            funnel/serve only — don't also expose on the LAN
@@ -181,6 +187,7 @@ FOLDER ENGINE
       --watch             watch a shared folder; announce new files as they land
       --persist           remember this share so 'tshare resume' restarts it
       --profile <name>    use a [name] section from ~/.config/tshare/config
+      --template <name>   apply a saved template (== a profile; see: tshare template)
       --no-config         ignore the config file
       --inline            display in browser instead of forcing download
   -Y, --yt-dlp            force treating the argument as a yt-dlp URL
@@ -316,6 +323,7 @@ type config struct {
 
 	// abuse / legal
 	AbuseContact string // small-font takedown/abuse contact shown on public share pages ("" = hidden)
+	Legal        bool   // show a minimal copyright + DMCA-takedown line in the banner (opt-in)
 
 	// media
 	Transcode bool // pre-transcode incompatible video to MP4 (ffmpeg)
@@ -371,6 +379,7 @@ func registerFlags(fs *flag.FlagSet, c *config) {
 	fs.BoolVar(&c.Site, "site", c.Site, "")
 	fs.BoolVar(&c.Site, "web", c.Site, "")
 	fs.BoolVar(&c.GameLink, "gamelink", c.GameLink, "")
+	fs.BoolVar(&c.GameLink, "g", c.GameLink, "")
 	fs.BoolVar(&c.Local, "l", c.Local, "")
 	fs.BoolVar(&c.Local, "local", c.Local, "")
 	fs.BoolVar(&c.LAN, "lan", c.LAN, "")
@@ -426,6 +435,7 @@ func registerFlags(fs *flag.FlagSet, c *config) {
 	fs.StringVar(&c.TURNUser, "turn-user", c.TURNUser, "")
 	fs.StringVar(&c.TURNPass, "turn-pass", c.TURNPass, "")
 	fs.StringVar(&c.AbuseContact, "abuse-contact", c.AbuseContact, "")
+	fs.BoolVar(&c.Legal, "legal", c.Legal, "")
 	fs.BoolVar(&c.Transcode, "transcode", c.Transcode, "")
 	fs.BoolVar(&c.Hevc, "hevc", c.Hevc, "")
 	fs.BoolVar(&c.H265, "265", c.H265, "")
@@ -440,6 +450,7 @@ func registerFlags(fs *flag.FlagSet, c *config) {
 	fs.StringVar(&c.CopypartyArgs, "copyparty-args", c.CopypartyArgs, "")
 	fs.BoolVar(&c.LanHTTPS, "lan-https", c.LanHTTPS, "")
 	fs.StringVar(&c.Profile, "profile", c.Profile, "")
+	fs.StringVar(&c.Profile, "template", c.Profile, "") // --template = apply a saved preset
 	fs.BoolVar(&c.NoConf, "no-config", c.NoConf, "")
 	fs.BoolVar(&c.Watch, "watch", c.Watch, "")
 	fs.BoolVar(&c.Persist, "persist", c.Persist, "")
@@ -637,6 +648,9 @@ func main() {
 			return
 		case "room":
 			cmdRoom(args[1:])
+			return
+		case "template", "templates":
+			cmdTemplate(args[1:])
 			return
 		case "info":
 			cmdInfo(args[1:])
@@ -1878,6 +1892,12 @@ func (s *share) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	if s.mode == "site" {
 		if s.upDir != "" && (rel == "__upload" || strings.HasSuffix(rel, "/__upload")) {
 			s.handleUpload(rec, r, strings.TrimSuffix(strings.TrimSuffix(rel, "__upload"), "/"))
+			return
+		}
+		// --gamelink: hand the GIGA-NET/1-L page its ICE config so a funnel/tailnet
+		// game can hole-punch across networks (STUN/TURN); -l stays pure LAN.
+		if s.gameSid != "" && (rel == "__ice" || strings.HasSuffix(rel, "/__ice")) {
+			s.handleGameIce(rec, r)
 			return
 		}
 		if r.Method != http.MethodGet && r.Method != http.MethodHead {
@@ -5413,6 +5433,28 @@ func (s *share) senderReq(r *http.Request) bool {
 		subtle.ConstantTimeCompare([]byte(r.URL.Query().Get("k")), []byte(s.senderKey)) == 1
 }
 
+// handleGameIce serves the RTCPeerConnection iceServers config to a GIGA-NET/1-L
+// game page (same-origin, token/password-gated like everything else). Over
+// funnel/tailnet it returns the STUN/TURN config so peers on different networks
+// can hole-punch; in --local mode it returns [] so LAN play stays pure and
+// instant (host candidates only — nothing reaches a public STUN server).
+func (s *share) handleGameIce(w *respRec, r *http.Request) {
+	if r.Method != http.MethodGet && r.Method != http.MethodHead {
+		http.Error(w, "405 method not allowed", http.StatusMethodNotAllowed)
+		return
+	}
+	body := "[]"
+	if !s.cfg.Local {
+		body = string(s.iceJSON())
+	}
+	w.Header().Set("Content-Type", "application/json; charset=utf-8")
+	w.Header().Set("Cache-Control", "no-store")
+	if r.Method == http.MethodHead {
+		return
+	}
+	io.WriteString(w, body)
+}
+
 // iceJSON builds the RTCPeerConnection iceServers config from --stun/--turn.
 func (s *share) iceJSON() template.JS {
 	type entry struct {
@@ -6460,6 +6502,9 @@ func applyConfig(c *config, args []string) {
 		return
 	}
 	profile := argValue(args, "--profile")
+	if profile == "" {
+		profile = argValue(args, "--template") // templates are named presets (== profiles)
+	}
 	cfgArgs := loadConfigArgs(configPath(), profile)
 	if len(cfgArgs) > 0 {
 		fs := flag.NewFlagSet("config", flag.ContinueOnError)
@@ -6531,6 +6576,135 @@ func loadConfigArgs(path, profile string) []string {
 		}
 	}
 	return out
+}
+
+// cmdTemplate manages share templates — named presets of flags stored as
+// config sections (#25). Templates ARE config profiles; this just lets you
+// save/list/remove them from the CLI instead of hand-editing the config, and
+// apply one with `tshare --template <name> <path>`.
+func cmdTemplate(args []string) {
+	sub := ""
+	if len(args) > 0 {
+		sub = args[0]
+	}
+	switch sub {
+	case "save", "set":
+		if len(args) < 2 || strings.HasPrefix(args[1], "-") {
+			log.Fatal("usage: tshare template save <name> <flags…>   e.g. tshare template save client -p pw -e 7d --site")
+		}
+		name := args[1]
+		if !validSlug(name) || name == "default" || name == "policy" {
+			log.Fatalf("template name %q must be a simple slug (not 'default'/'policy')", name)
+		}
+		c := &config{}
+		fs := flag.NewFlagSet("template", flag.ContinueOnError)
+		registerFlags(fs, c)
+		if err := fs.Parse(args[2:]); err != nil {
+			log.Fatalf("tshare: %v", err)
+		}
+		var lines []string
+		fs.Visit(func(f *flag.Flag) {
+			if strings.HasPrefix(f.Name, "__") || f.Name == "template" || f.Name == "profile" {
+				return
+			}
+			switch v := f.Value.String(); v {
+			case "true":
+				lines = append(lines, f.Name)
+			case "false", "0", "":
+				// off / empty → nothing to store
+			default:
+				lines = append(lines, f.Name+" = "+v)
+			}
+		})
+		if len(lines) == 0 {
+			log.Fatal("nothing to save — pass the flags this template should set")
+		}
+		sort.Strings(lines)
+		if err := upsertConfigSection(name, lines); err != nil {
+			log.Fatalf("tshare: %v", err)
+		}
+		fmt.Printf("  ✓ saved template [%s] → %s\n", name, configPath())
+		fmt.Printf("  use it:  tshare --template %s <path>\n", name)
+	case "ls", "list":
+		names := configSections()
+		if len(names) == 0 {
+			fmt.Println("no templates yet — save one: tshare template save client -p pw -e 7d")
+			return
+		}
+		fmt.Println("  templates (tshare --template <name> …):")
+		for _, n := range names {
+			fmt.Printf("    %s\n", n)
+		}
+	case "rm", "remove", "delete":
+		if len(args) < 2 {
+			log.Fatal("usage: tshare template rm <name>")
+		}
+		if err := upsertConfigSection(args[1], nil); err != nil {
+			log.Fatalf("tshare: %v", err)
+		}
+		fmt.Printf("  ✓ removed template [%s]\n", args[1])
+	default:
+		fmt.Println("usage: tshare template save <name> <flags…>   save the flags as a reusable preset")
+		fmt.Println("       tshare template ls                     list saved templates")
+		fmt.Println("       tshare template rm <name>              delete one")
+		fmt.Println("apply: tshare --template <name> <path>        (a template is a config profile)")
+	}
+}
+
+// configSections lists the [named] sections in the config file, excluding the
+// special [default] and [policy] blocks.
+func configSections() []string {
+	b, err := os.ReadFile(configPath())
+	if err != nil {
+		return nil
+	}
+	re := regexp.MustCompile(`(?m)^\[([^\]]+)\]\s*$`)
+	var out []string
+	for _, m := range re.FindAllStringSubmatch(string(b), -1) {
+		s := strings.TrimSpace(m[1])
+		if s != "default" && s != "policy" {
+			out = append(out, s)
+		}
+	}
+	sort.Strings(out)
+	return out
+}
+
+// upsertConfigSection replaces the [name] block with the given lines (creating
+// the file/section if needed); nil lines removes the section entirely.
+func upsertConfigSection(name string, lines []string) error {
+	path := configPath()
+	if path == "" {
+		return errors.New("no config path")
+	}
+	existing, _ := os.ReadFile(path)
+	text := string(existing)
+	var block string
+	if lines != nil {
+		block = "[" + name + "]\n" + strings.Join(lines, "\n") + "\n"
+	}
+	secRe := regexp.MustCompile(`(?m)^\[` + regexp.QuoteMeta(name) + `\]\s*$`)
+	if loc := secRe.FindStringIndex(text); loc != nil {
+		rest := text[loc[1]:]
+		end := len(text)
+		if n := regexp.MustCompile(`(?m)^\[`).FindStringIndex(rest); n != nil {
+			end = loc[1] + n[0]
+		}
+		text = text[:loc[0]] + block + text[end:]
+	} else if lines != nil {
+		if text == "" {
+			text = "# tshare config (see config.example)\n"
+		} else if !strings.HasSuffix(text, "\n") {
+			text += "\n"
+		}
+		text += "\n" + block
+	} else {
+		return nil // asked to remove a section that isn't there
+	}
+	if err := os.MkdirAll(filepath.Dir(path), 0o700); err != nil {
+		return err
+	}
+	return os.WriteFile(path, []byte(text), 0o600)
 }
 
 // policy is optional, config-file-only org governance (#186). It lives in a
@@ -6757,21 +6931,38 @@ func (s *share) replExtend(spec string) {
 	fmt.Fprintf(os.Stderr, "  ⚙ %s\n", note)
 }
 
-// abuseHTML returns the small-font takedown/abuse line for public share pages,
-// or "" when no --abuse-contact is configured. The minimum needed for a public
-// host to display a report/takedown path; kept deliberately unobtrusive.
+// abuseHTML returns the small-font notice for share pages, or "" when neither
+// --abuse-contact nor --legal is set. Two opt-in flavours:
+//   --abuse-contact  →  "Report abuse / request takedown: <contact>"
+//   --legal          →  a minimal copyright + DMCA-§512 removal line
+// Note: US law mandates NO specific banner for a self-hosted personal share;
+// --legal is the closest honest "bare minimum" (a visible infringement/removal
+// path), not a legal guarantee. Kept deliberately unobtrusive.
 func (s *share) abuseHTML() template.HTML {
-	c := strings.TrimSpace(s.cfg.AbuseContact)
-	if c == "" {
+	contact := strings.TrimSpace(s.cfg.AbuseContact)
+	if contact == "" && !s.cfg.Legal {
 		return ""
 	}
-	inner := template.HTMLEscapeString(c)
-	if strings.Contains(c, "@") && !strings.Contains(c, " ") {
-		inner = `<a href="mailto:` + inner + `">` + inner + `</a>`
-	} else if strings.HasPrefix(c, "http://") || strings.HasPrefix(c, "https://") {
-		inner = `<a href="` + inner + `" rel="nofollow noreferrer">` + inner + `</a>`
+	linkOf := func(c string) string {
+		e := template.HTMLEscapeString(c)
+		switch {
+		case strings.Contains(c, "@") && !strings.Contains(c, " "):
+			return `<a href="mailto:` + e + `">` + e + `</a>`
+		case strings.HasPrefix(c, "http://") || strings.HasPrefix(c, "https://"):
+			return `<a href="` + e + `" rel="nofollow noreferrer">` + e + `</a>`
+		default:
+			return e
+		}
 	}
-	return template.HTML(`<div class="abuse">Report abuse / request takedown: ` + inner + `</div>`)
+	if s.cfg.Legal {
+		who := "the operator of this link"
+		if contact != "" {
+			who = linkOf(contact)
+		}
+		return template.HTML(`<div class="abuse">© Shared content remains the property of its ` +
+			`respective owners. Report infringement or request removal: ` + who + `</div>`)
+	}
+	return template.HTML(`<div class="abuse">Report abuse / request takedown: ` + linkOf(contact) + `</div>`)
 }
 
 func (s *share) expiresLabel() string {
