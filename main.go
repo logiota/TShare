@@ -169,6 +169,10 @@ FOLDER ENGINE
                           and folders without an index get a browsable listing.
                           Scripts run (no sandbox); expiry defaults to never.
                           Pair with --name for a stable /<name>/ path
+      --gamelink          host a GIGA-NET/1-L multiplayer game page in one shot:
+                          implies --site --allow-upload, prints + copies a JOIN
+                          link for the other player, and auto-opens the page here
+                          in host mode — zero clicks (e.g. GigaSnakes)
   -l, --local             no tailscale: plain HTTP on your LAN (testing/offline)
       --lan-https         --local: serve HTTPS with a self-signed cert
       --no-lan            funnel/serve only — don't also expose on the LAN
@@ -252,6 +256,7 @@ type config struct {
 	AllowUpload bool
 	Zip         bool
 	Site        bool // serve a folder as a live static website (index.html)
+	GameLink    bool // --gamelink: --site --allow-upload + pre-minted GIGA-NET/1-L host/join links (one-command game hosting)
 	Local       bool
 	LAN         bool // also serve directly on the LAN (default on)
 	NoLAN       bool // disable LAN serving (loopback only)
@@ -365,6 +370,7 @@ func registerFlags(fs *flag.FlagSet, c *config) {
 	fs.BoolVar(&c.Zip, "zip", c.Zip, "")
 	fs.BoolVar(&c.Site, "site", c.Site, "")
 	fs.BoolVar(&c.Site, "web", c.Site, "")
+	fs.BoolVar(&c.GameLink, "gamelink", c.GameLink, "")
 	fs.BoolVar(&c.Local, "l", c.Local, "")
 	fs.BoolVar(&c.Local, "local", c.Local, "")
 	fs.BoolVar(&c.LAN, "lan", c.LAN, "")
@@ -696,6 +702,7 @@ type share struct {
 	mode      string // "file" | "dir" | "multi" | "inbox" | "site"
 	roots     []rootEnt
 	siteIndex string // default document for a "site" share (index.html)
+	gameSid   string // --gamelink: pre-minted GIGA-NET/1-L session id baked into the printed links
 	upDir     string // where uploads land
 	baseURL   string // https://host[:p]/<token>  (funnel/tailnet)
 	lanURL    string // http://<lan-ip>:<port>/<token>  (direct LAN, if enabled)
@@ -809,6 +816,15 @@ func runShare(c *config) error {
 	// links default to a 15-day lifetime so forgotten public links don't
 	// live forever; any explicit -e (including "never") overrides, and a
 	// running share can be changed later: tshare set <id> -e <dur|never>.
+	// --gamelink is sugar: a --site --allow-upload share of the game page, plus
+	// a pre-minted GIGA-NET/1-L session — the join link is printed/copied and
+	// this machine auto-opens the page in host mode (#gnhost), so starting a
+	// multiplayer game is one command and zero clicks.
+	if c.GameLink {
+		c.Site = true
+		c.AllowUpload = true
+	}
+
 	// Websites are long-term by nature, so --site defaults to never.
 	if !c.ExpiresSet && c.Expires == 0 && !c.Site {
 		c.Expires = 15 * 24 * time.Hour
@@ -863,6 +879,12 @@ func runShare(c *config) error {
 		s.mode = "site"
 		s.siteIndex = index
 		s.roots = []rootEnt{{Name: filepath.Base(root), Abs: root, IsDir: true}}
+		if c.AllowUpload { // --site --allow-upload: pages run as a site AND __upload works (e.g. GIGA-NET/1-L game signalling)
+			s.upDir = root
+		}
+		if c.GameLink {
+			s.gameSid = randSid(8)
+		}
 		if !c.Quiet {
 			fmt.Fprintf(os.Stderr, "  🌐 serving site root %s (index: %s)\n", root, index)
 		}
@@ -1318,6 +1340,18 @@ func runShare(c *config) error {
 	// announce
 	s.announce(port)
 
+	// --gamelink: open this machine's browser straight into host mode — the page
+	// creates the WebRTC offer itself (#gnhost), so hosting needs zero clicks.
+	if s.gameSid != "" && !c.daemonChild {
+		_, hostURL := s.gameLinks()
+		if c.NoOpen {
+			fmt.Fprintf(os.Stderr, "  🎮 open this on the host machine: %s\n", hostURL)
+		} else {
+			fmt.Fprintf(os.Stderr, "  🎮 host page opened — send the join link (already on your clipboard)\n")
+			openBrowser(hostURL)
+		}
+	}
+
 	// --p2p: open the local sender tab (it streams the file into DataChannels).
 	if s.senderKey != "" {
 		sendURL := fmt.Sprintf("http://127.0.0.1:%d/%s/__p2p/send?k=%s", port, s.token, s.senderKey)
@@ -1463,9 +1497,24 @@ func randToken(n int) string {
 	return string(b)
 }
 
+// randSid mints a GIGA-NET/1-L session id — lowercase alphanumeric only, since
+// that's the charset the game pages accept in #gn=/#gnhost= fragments.
+func randSid(n int) string {
+	const cs = "0123456789abcdefghijklmnopqrstuvwxyz"
+	b := make([]byte, n)
+	if _, err := rand.Read(b); err != nil {
+		panic(err)
+	}
+	for i := range b {
+		b[i] = cs[int(b[i])%len(cs)]
+	}
+	return string(b)
+}
+
 func (s *share) announce(port int) {
 	c := s.cfg
 	link := s.prettyURL()
+	gameJoin, gameHost := s.gameLinks()
 	if c.JSON {
 		meta := map[string]any{
 			"id": s.id, "url": link, "base": s.baseURL + "/", "mode": s.mode,
@@ -1473,13 +1522,21 @@ func (s *share) announce(port int) {
 			"tailnet_only": c.Tailnet, "local": c.Local,
 			"max_downloads": c.MaxDL, "pid": os.Getpid(),
 		}
+		if gameJoin != "" {
+			meta["game_join"] = gameJoin
+			meta["game_host"] = gameHost
+		}
 		if t := s.getExpires(); !t.IsZero() {
 			meta["expires_at"] = t.Format(time.RFC3339)
 		}
 		j, _ := json.MarshalIndent(meta, "", "  ")
 		fmt.Println(string(j))
 	} else if c.Quiet {
-		fmt.Println(link)
+		if gameJoin != "" { // the join link is the artifact you want to pipe/send
+			fmt.Println(gameJoin)
+		} else {
+			fmt.Println(link)
+		}
 	} else {
 		scope := "public + tailnet (funnel)"
 		if c.Tailnet {
@@ -1512,6 +1569,10 @@ func (s *share) announce(port int) {
 		if s.lanURL != "" {
 			fmt.Printf("  lan        %s   (same network, faster, no internet)\n", s.lanLink())
 		}
+		if gameJoin != "" {
+			fmt.Printf("  🎮 join    %s   ← send THIS to the other player\n", gameJoin)
+			fmt.Printf("  🎮 host    %s   (opens here automatically)\n", gameHost)
+		}
 		fmt.Printf("  curl       %s\n", s.curlHint())
 		fmt.Printf("  scope      %-28s id        %s\n", scope, s.id)
 		fmt.Printf("  password   %-28s expires   %s\n", pw, exp)
@@ -1524,7 +1585,11 @@ func (s *share) announce(port int) {
 		fmt.Println()
 	}
 	if !c.daemonChild { // daemon child logs to a file; parent handles extras
-		linkExtras(c, link)
+		if gameJoin != "" {
+			linkExtras(c, gameJoin) // for a game share, the JOIN link is what gets copied/QR'd
+		} else {
+			linkExtras(c, link)
+		}
 	}
 }
 
@@ -1591,6 +1656,17 @@ func (s *share) prettyURL() string {
 		return s.baseURL + "/" + url.PathEscape(s.roots[0].Name)
 	}
 	return s.baseURL + "/"
+}
+
+// gameLinks returns the GIGA-NET/1-L join/host URLs for a --gamelink share.
+// The game page is the site's default document, so the bare share URL renders
+// it; the fragment stays client-side and never appears in any server log.
+func (s *share) gameLinks() (join, host string) {
+	if s.gameSid == "" {
+		return "", ""
+	}
+	base := s.prettyURL()
+	return base + "#gn=" + s.gameSid, base + "#gnhost=" + s.gameSid
 }
 
 // lanLink is the direct-LAN equivalent of prettyURL (plain HTTP, token in path).
@@ -1797,8 +1873,13 @@ func (s *share) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	}
 
 	// #site: serve the folder as a live website (index.html routing, real
-	// content-types, scripts allowed). Owns all routing — no upload/zip.
+	// content-types, scripts allowed). Owns all routing — no zip; __upload only
+	// when --allow-upload opted in (e.g. GIGA-NET/1-L game signalling).
 	if s.mode == "site" {
+		if s.upDir != "" && (rel == "__upload" || strings.HasSuffix(rel, "/__upload")) {
+			s.handleUpload(rec, r, strings.TrimSuffix(strings.TrimSuffix(rel, "__upload"), "/"))
+			return
+		}
 		if r.Method != http.MethodGet && r.Method != http.MethodHead {
 			http.Error(rec, "405 method not allowed", http.StatusMethodNotAllowed)
 			return

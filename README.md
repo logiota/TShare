@@ -27,6 +27,8 @@ tshare --room standup                  # video room on your local MiroTalk (auto
 tshare --call                          # the link IS a built-in 1:1 video call
 tshare --p2p big.iso                   # ⚡ direct browser-to-browser transfer + fallback
 tshare --allow-upload -p pw ~/proj     # collaboration: browse + upload, password-gated
+tshare -l --gamelink game.html         # 🎮 host a GIGA-NET/1-L multiplayer game: auto-opens
+                                       #    as host, join link printed + on your clipboard
 tshare a.pdf b.png notes/              # multiple items → combined listing
 tshare -t plan.md                      # tailnet-only (tailscale serve, not public)
 tshare --max-rate 2M report.iso        # throttle served bandwidth to ~2 MB/s
@@ -139,7 +141,12 @@ tshare --site ~/blog                 # serve the folder as a website
 tshare --site ~/blog/index.html      # same — a lone .html uses its folder as root
 tshare --name blog --site ~/blog     # stable path: https://<host>.ts.net/blog/
 tshare --site -p hunter2 ~/blog      # password-gated site
+tshare --site --allow-upload ~/app   # site whose pages can ALSO POST files to __upload
 ```
+
+`--site --allow-upload` keeps the pages running as a live site *and* enables the `__upload` endpoint (uploads land in the site root). That lets an in-page app use the share as its own tiny data channel — e.g. the Giga games' [GIGA-NET/1-L automatic multiplayer links](../GigaSnake/WEBRTC-MULTIPLAYER.md), where WebRTC offer/answer files ride the share instead of being copy-pasted.
+
+`--gamelink <game.html>` goes one step further and makes game hosting a **single command**: it implies `--site --allow-upload`, pre-mints a GIGA-NET/1-L session id, prints a 🎮 **join** link (also copied to your clipboard, and the QR if enabled) and a 🎮 **host** link, then auto-opens the host link here (`--no-open` prints it instead) — the page starts hosting by itself via its `#gnhost` fragment, and the other player just clicks the join link. `--quiet` prints only the join link; `--json` adds `game_join`/`game_host`. One session per link: re-run for a rematch.
 
 Funnel caveat (same as any subpath host): the site lives under `https://<host>.ts.net/<token>/`, so **use relative asset paths** (`href="style.css"`, `src="js/app.js"`) — they resolve correctly. Root-absolute paths (`/style.css`) escape the mount and 404; if your generator emits those, set its base URL to the share path and pair with `--name` for a stable prefix. Always share the link **with its trailing slash**.
 
@@ -205,7 +212,7 @@ Nice defaults (each individually disableable): the link is **copied to your clip
 | `-n, --max` / `--once` | stop after N / 1 completed downloads |
 | `-u, --upload [dir]` | inbox mode (default `./tshare-inbox`) |
 | `-i, --blackhole` | write-only sink: uploads read + counted + notified, **bytes discarded** (nothing on disk) |
-| `--allow-upload` | folder share also accepts uploads |
+| `--allow-upload` | folder share also accepts uploads (also works with `--site`: pages run *and* `__upload` accepts POSTs — e.g. in-page signalling like GIGA-NET/1-L) |
 | `--max-rate` | throttle served bandwidth, e.g. `2M` = ~2 MB/s (default: off) |
 | `--min-free` | refuse uploads when free disk space drops below this (default **32G**; `0` = off) |
 | `--abuse-contact` | show a small-font takedown/abuse line on public share pages (email/URL auto-linked) |
