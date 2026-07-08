@@ -32,6 +32,9 @@ import (
 	"flag"
 	"fmt"
 	"html/template"
+	"image"
+	"image/color"
+	"image/png"
 	"io"
 	"io/fs"
 	"log"
@@ -68,6 +71,8 @@ USAGE
   tshare -                            share stdin (pipe)
   tshare -u [dir]                     inbox: link where others UPLOAD to you
   tshare -i                           blackhole inbox: accept & count uploads, keep nothing
+  tshare --hub [dir]                  homescreen-style 2-way remote: upload + grab URLs + browse
+  tshare --rar --p2p big.mkv          split into 1.4 GB RAR volumes → per-part ⚡ P2P
   tshare --room [name]                video-room link (local MiroTalk, auto-started)
   tshare room install                 one-time: install MiroTalk locally from GitHub
   tshare --call                       the link IS a 1:1 video call (built-in WebRTC)
@@ -147,15 +152,27 @@ MODES
       --mirotalk-dir/-method/-port   where/how the local install runs
       --call              the secret link IS a built-in 1:1 WebRTC video call —
                           no MiroTalk needed. Two participants, mute/cam/leave.
-      --p2p               single-file share also offers ⚡ DIRECT browser-to-
+      --p2p               file OR folder share also offers ⚡ DIRECT browser-to-
                           browser transfer (WebRTC DataChannel): bytes skip the
                           funnel relay entirely when STUN hole-punch succeeds
                           (most NATs, many CGNATs) — much faster for big files.
                           A local sender tab auto-opens (keep it open); the
                           normal HTTPS download stays as one-click fallback.
+                          A folder share gives one ⚡ row per file (see --rar).
+      --rar               split the file/folder into RAR volumes first, then
+                          share the parts (needs rar on PATH). Chunking, not
+                          compression (-m0). Pairs with --p2p so each part fits
+                          an iPhone's ~1.5 GB in-memory receive.
+      --rar-size <sz>     volume size (default 1400M)
       --stun <urls>       ICE STUN servers (comma list; sane public defaults)
       --turn <url>        optional TURN relay (+ --turn-user/--turn-pass) for a
                           guaranteed direct-ish path when hole-punch fails
+      --hub [dir]         a homescreen-style 2-way remote (dir default ./tshare-
+                          hub): upload files to the host, paste a URL for the
+                          host to GRAB (yt-dlp/site or direct file), browse/
+                          download/delete the folder, shared note. Add-to-Home-
+                          Screen (manifest + icon) makes it app-like on iOS.
+                          Grabs of private/loopback addresses are refused (SSRF).
       --allow-upload      folder share also accepts uploads (collaboration)
 
 FOLDER ENGINE
@@ -313,8 +330,17 @@ type config struct {
 	MirotalkMethod string // how the local instance runs: npm | docker (auto-detected if "")
 	MirotalkPort   int    // local MiroTalk port (default 3000)
 
+	// hub (--hub): homescreen-style 2-way remote page — upload, grab URLs,
+	// browse/manage the hub folder, from a phone or any browser
+	Hub bool
+
+	// --rar: split the share into RAR volumes before serving (transfer
+	// chunking — e.g. so each part fits an iPhone's in-memory P2P receive)
+	Rar     bool
+	RarSize string // volume size (default 1400M — under the 1.5 GB iOS cap)
+
 	// browser WebRTC (P2P direct transfer + built-in call)
-	P2P      bool   // --p2p: single-file share also offers a direct DataChannel transfer
+	P2P      bool   // --p2p: share also offers a direct DataChannel transfer
 	Call     bool   // --call: built-in 1:1 WebRTC video call page (no MiroTalk needed)
 	STUN     string // comma-separated STUN urls for ICE (NAT/CGNAT hole-punch)
 	TURN     string // optional TURN url (guaranteed relay when hole-punch fails)
@@ -429,7 +455,11 @@ func registerFlags(fs *flag.FlagSet, c *config) {
 	fs.StringVar(&c.MirotalkMethod, "mirotalk-method", c.MirotalkMethod, "")
 	fs.IntVar(&c.MirotalkPort, "mirotalk-port", c.MirotalkPort, "")
 	fs.BoolVar(&c.P2P, "p2p", c.P2P, "")
+	fs.BoolVar(&c.P2P, "p2pi", c.P2P, "") // common typo/alias
 	fs.BoolVar(&c.Call, "call", c.Call, "")
+	fs.BoolVar(&c.Hub, "hub", c.Hub, "")
+	fs.BoolVar(&c.Rar, "rar", c.Rar, "")
+	fs.StringVar(&c.RarSize, "rar-size", c.RarSize, "")
 	fs.StringVar(&c.STUN, "stun", c.STUN, "")
 	fs.StringVar(&c.TURN, "turn", c.TURN, "")
 	fs.StringVar(&c.TURNUser, "turn-user", c.TURNUser, "")
@@ -674,6 +704,7 @@ func main() {
 	}
 
 	c := &config{TokenLen: 16, HTTPSPort: 443, MaxUpload: "5G", MinFree: "32G", CQ: 50,
+		RarSize:      "1400M",
 		MirotalkPort: 3000,
 		STUN:         "stun:stun.l.google.com:19302,stun:stun.cloudflare.com:3478",
 		Copy:         true, LAN: true, Password: os.Getenv("TSHARE_PASSWORD")}
@@ -772,6 +803,7 @@ type share struct {
 
 	senderKey string  // --p2p: secret that authenticates the local sender tab
 	hub       *rtcHub // --p2p / --call: in-memory WebRTC signaling relay
+	jobs      *jobHub // --hub: web-grab job registry
 }
 
 func (s *share) getPassword() string {
@@ -839,8 +871,8 @@ func runShare(c *config) error {
 		c.AllowUpload = true
 	}
 
-	// Websites are long-term by nature, so --site defaults to never.
-	if !c.ExpiresSet && c.Expires == 0 && !c.Site {
+	// Websites and the hub are long-term by nature, so they default to never.
+	if !c.ExpiresSet && c.Expires == 0 && !c.Site && !c.Hub {
 		c.Expires = 15 * 24 * time.Hour
 	}
 
@@ -874,7 +906,7 @@ func runShare(c *config) error {
 	}
 
 	// resolve targets
-	oneInput := !c.Upload && !c.Blackhole && !c.Room && !c.Call && len(c.Paths) == 1
+	oneInput := !c.Upload && !c.Blackhole && !c.Room && !c.Call && !c.Hub && len(c.Paths) == 1
 	// -s, or a localhost URL ("automatically if it is not a website"), means
 	// reverse-proxy a running server rather than download it.
 	serverMode := oneInput && looksLikeURL(c.Paths[0]) && (c.Server || isLocalServerURL(c.Paths[0]))
@@ -983,6 +1015,27 @@ func runShare(c *config) error {
 		s.tmpRoot = p
 		s.tmpFile = p
 		s.roots = []rootEnt{{Name: name, Abs: p, IsDir: false, Size: fi.Size()}}
+	case c.Hub:
+		// --hub: a homescreen-style 2-way remote. One folder is both an inbox
+		// (upload from any phone) and a drop target for web grabs (paste a URL,
+		// the host fetches it), plus a browsable/deletable file list. Add-to-
+		// Home-Screen turns the token link into an app-like control panel.
+		dir := "tshare-hub"
+		if len(c.Paths) == 1 {
+			dir = c.Paths[0]
+		} else if len(c.Paths) > 1 {
+			return errors.New("--hub takes at most one directory")
+		}
+		abs, err := filepath.Abs(dir)
+		if err != nil {
+			return err
+		}
+		if err := os.MkdirAll(abs, 0o755); err != nil {
+			return err
+		}
+		s.mode, s.upDir = "hub", abs
+		s.jobs = newJobHub(abs)
+		s.roots = []rootEnt{{Name: filepath.Base(abs), Abs: abs, IsDir: true}}
 	case c.Call:
 		// --call: the secret link IS a 1:1 WebRTC video call. tshare hosts the
 		// page + signaling; media flows peer-to-peer. No MiroTalk needed.
@@ -1107,11 +1160,40 @@ func runShare(c *config) error {
 	if c.Zip && s.mode == "file" {
 		c.Zip = false // zipping one file is pointless; serve as-is
 	}
-	// --p2p: enable the direct WebRTC transfer path for a single-file share.
-	// A local browser tab is the sender, so it needs a foreground share.
+	// --rar: split the payload into RAR volumes and share the volume folder
+	// instead — transfer chunking, not compression (-m0). The default 1400M
+	// volume fits an iPhone's ~1.5 GB in-memory P2P receive, so a huge file
+	// becomes parts a phone can actually take. Needs `rar` on PATH.
+	if c.Rar {
+		if s.mode != "file" && s.mode != "dir" || s.grow != nil || s.ytPend != nil {
+			return errors.New("--rar works with a local file or folder share (fully downloaded)")
+		}
+		if s.tmpDir != "" {
+			return errors.New("--rar doesn't combine with shares that already stage a temp folder (e.g. --playlist)")
+		}
+		if _, err := exec.LookPath("rar"); err != nil { // fail fast even in the daemonizing parent
+			return errors.New("rar not found — install it first (brew install rar) to use --rar")
+		}
+		// Only the process that actually serves splits. Under -b the daemonizing
+		// parent skips it (the re-exec'd child does the real split with the same
+		// id → same dir), so a big file isn't split twice.
+		if !c.Background || c.daemonChild {
+			dir, err := rarSplit(c, s.roots[0], s.id)
+			if err != nil {
+				return err
+			}
+			s.mode = "dir"
+			s.tmpDir = dir // volumes are temporary — removed when the share stops
+			s.upDir = ""
+			s.roots = []rootEnt{{Name: s.roots[0].Name + " (rar volumes)", Abs: dir, IsDir: true}}
+		}
+	}
+	// --p2p: enable the direct WebRTC transfer path. A local browser tab is
+	// the sender, so it needs a foreground share. Folder shares get a per-file
+	// transfer list (each RAR volume rides its own DataChannel).
 	if c.P2P {
-		if s.mode != "file" {
-			return errors.New("--p2p works with a single-file share")
+		if s.mode != "file" && s.mode != "dir" {
+			return errors.New("--p2p works with a single file or a folder share (e.g. --rar volumes)")
 		}
 		if c.Background {
 			return errors.New("--p2p needs a foreground share — a local sender tab must stay open (-b won't have one)")
@@ -1651,6 +1733,8 @@ func (s *share) describe() string {
 		return "video room → " + s.roomURL
 	case "call":
 		return "video call (built-in 1:1, WebRTC P2P)"
+	case "hub":
+		return fmt.Sprintf("hub (2-way remote) → %s", s.upDir)
 	case "inbox":
 		return fmt.Sprintf("inbox → %s%s", s.upDir, cp)
 	case "multi":
@@ -1712,6 +1796,8 @@ func (s *share) curlHint() string {
 		return "open " + s.baseURL + "/   (video room: " + s.roomName + ")"
 	case "call":
 		return "open " + s.baseURL + "/   (send this link to ONE other person)"
+	case "hub":
+		return "open " + s.baseURL + "/   (upload · grab URLs · browse — Add to Home Screen)"
 	case "inbox":
 		return "curl " + auth + "-F f=@file.txt " + s.baseURL + "/__upload"
 	default:
@@ -1920,6 +2006,21 @@ func (s *share) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
+	// --hub control endpoints (some are POST → route before the GET-only guard).
+	// __upload/__zip above already work for the hub; everything else here.
+	if s.mode == "hub" {
+		switch rel {
+		case "", "__grab", "__jobs", "__list", "__rm", "__note",
+			"manifest.webmanifest", "apple-touch-icon.png", "icon.png":
+			ub := s.baseURL
+			if !proxied && s.lanURL != "" {
+				ub = s.lanURL
+			}
+			s.handleHub(rec, r, rel, ub)
+			return
+		}
+	}
+
 	if r.Method != http.MethodGet && r.Method != http.MethodHead {
 		http.Error(rec, "405 method not allowed", http.StatusMethodNotAllowed)
 		return
@@ -1955,6 +2056,14 @@ func (s *share) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 			return
 		}
 		s.renderInbox(rec, urlBase)
+	case "hub":
+		// root + endpoints handled above; here rel is a filename in the hub dir
+		abs, isDir, ok := s.resolve(rel)
+		if !ok || isDir {
+			http.NotFound(rec, r)
+			return
+		}
+		s.serveFile(rec, r, abs, path.Base("/"+rel))
 	case "file":
 		// --p2p: browser navigations get the direct-transfer page (P2P attempt
 		// + standard-download fallback); ?dl=1 / ?raw=1 / curl get bytes as ever.
@@ -1966,6 +2075,14 @@ func (s *share) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		}
 		s.serveFile(rec, r, s.roots[0].Abs, s.roots[0].Name)
 	case "dir", "multi":
+		// --p2p folder share (e.g. --rar volumes): the root becomes the
+		// per-file direct-transfer page; every file stays reachable directly.
+		if s.senderKey != "" && rel == "" && r.Method == http.MethodGet &&
+			r.URL.Query().Get("dl") != "1" && r.URL.Query().Get("raw") != "1" &&
+			strings.Contains(r.Header.Get("Accept"), "text/html") {
+			s.renderP2PRecv(rec)
+			return
+		}
 		if rel == "" && s.cfg.Zip {
 			s.handleZip(rec, r, "")
 			return
@@ -2942,73 +3059,87 @@ var roomTmpl = template.Must(template.New("room").Parse(`<!doctype html>
 </script>
 </body></html>`))
 
-// p2pRecvTmpl is the --p2p transfer page a visitor sees: try a direct WebRTC
-// DataChannel first (fast path, bytes never ride the funnel relay), with the
-// standard HTTPS download always one click away as fallback.
+// p2pRecvTmpl is the --p2p transfer page a visitor sees: one row per file
+// (a single file, or every RAR volume of a --rar share), each with a direct
+// WebRTC DataChannel path (fast — bytes never ride the funnel relay) and the
+// standard HTTPS download one click away as fallback.
 var p2pRecvTmpl = template.Must(template.New("p2precv").Parse(`<!doctype html>
 <html><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1">
-<meta name="robots" content="noindex,nofollow"><title>{{.Name}}</title>
+<meta name="robots" content="noindex,nofollow"><title>{{.Title}}</title>
 <style>` + pageCSS + `
-.xfer { text-align:center; padding:20px 0; }
-.xfer .big { font-size:44px; }
-.fn { font-family:ui-monospace,SFMono-Regular,Menlo,monospace; background:var(--card); border:1px solid var(--line); border-radius:8px; padding:4px 10px; display:inline-block; margin:10px 0 4px; }
-.sz { color:var(--mut); font-size:13px; margin-bottom:18px; }
-.prog { width:min(420px,92%); height:10px; background:var(--card); border:1px solid var(--line); border-radius:6px; margin:14px auto 6px; overflow:hidden; display:none; }
+.xfer { text-align:center; padding:14px 0 4px; }
+.xfer .big { font-size:40px; }
+.stat { color:var(--mut); font-size:13px; min-height:20px; text-align:center; margin:8px 0 14px; }
+.frow { border:1px solid var(--line); border-radius:12px; background:var(--card); padding:12px 14px; margin:10px 0; }
+.frow .nm { font-family:ui-monospace,SFMono-Regular,Menlo,monospace; font-size:14px; word-break:break-all; }
+.frow .meta { color:var(--mut); font-size:12px; margin:2px 0 8px; }
+.frow .acts { display:flex; gap:8px; flex-wrap:wrap; align-items:center; }
+.frow .btn { font-size:13px; padding:8px 14px; }
+.prog { flex:1 1 140px; height:8px; background:var(--bg); border:1px solid var(--line); border-radius:5px; overflow:hidden; display:none; }
 .prog i { display:block; height:100%; width:0%; background:var(--acc); transition:width .15s; }
-.stat { color:var(--mut); font-size:13px; min-height:20px; }
-.btn.big2 { font-size:15px; padding:11px 22px; margin:6px; display:inline-block; }
+.fstat { color:var(--mut); font-size:12px; margin-top:6px; min-height:16px; }
+.hint { color:var(--mut); font-size:12px; text-align:center; margin-top:14px; }
 </style></head>
 <body>
-<div class="xfer">
- <div class="big">⚡</div>
- <h1>Direct transfer</h1>
- <div class="fn">{{.Name}}</div>
- <div class="sz">{{.SizeH}}</div>
- <button class="btn big2" id="p2pbtn">⚡ Direct P2P download</button>
- <a class="btn sec big2" href="?dl=1">standard download</a>
- <div class="prog" id="prog"><i id="bar"></i></div>
- <div class="stat" id="stat">checking for the sender…</div>
- <div class="foot">P2P goes browser-to-browser (fastest); standard rides the share host · link is private</div>{{.Abuse}}
-</div>
+<div class="xfer"><div class="big">⚡</div><h1>Direct transfer</h1></div>
+<div class="stat" id="stat">checking for the sender…</div>
+<div id="rows"></div>
+{{if .Multi}}<div class="hint">multi-part archive: download <b>every</b> part into one folder, then open
+part1 to extract (unrar / 7-Zip / iZip on iOS) · <a href="__zip">⬇ all parts as one .zip (standard)</a></div>{{end}}
+<div class="foot" style="text-align:center">⚡ goes browser-to-browser (fastest); standard rides the share host · link is private</div>{{.Abuse}}
 <script>
-var ICE = {{.Ice}}, SIZE = {{.Size}}, NAME = {{.Name}};
-var stat=document.getElementById('stat'), bar=document.getElementById('bar'),
-    prog=document.getElementById('prog'), btn=document.getElementById('p2pbtn');
+var ICE = {{.Ice}}, FILES = {{.Files}};
+var stat=document.getElementById('stat'), rowsEl=document.getElementById('rows');
+var online=false, transfers=0;
 function say(t){ stat.textContent=t; }
 function sleep(ms){ return new Promise(function(r){ setTimeout(r,ms); }); }
 function rand(){ var a=new Uint8Array(12); crypto.getRandomValues(a);
   return Array.from(a,function(b){return b.toString(16).padStart(2,'0');}).join(''); }
+function fmt(n){ if(n<1048576) return (n/1024).toFixed(0)+' KB';
+  if(n<1073741824) return (n/1048576).toFixed(1)+' MB'; return (n/1073741824).toFixed(2)+' GB'; }
 async function post(ep,body){ return fetch('__rtc/'+ep,{method:'POST',
   headers:{'Content-Type':'application/json'},body:body?JSON.stringify(body):'{}'}); }
-var started = false;                                       // stop presence UI once a transfer runs
+FILES.forEach(function(f){
+  var row=document.createElement('div'); row.className='frow';
+  row.innerHTML='<div class="nm"></div><div class="meta"></div>'+
+    '<div class="acts"><button class="btn p2pbtn" disabled>⚡ Direct P2P</button>'+
+    '<a class="btn sec" href="'+encodeURIComponent(f.n)+'?dl=1">standard</a>'+
+    '<div class="prog"><i></i></div></div><div class="fstat"></div>';
+  row.querySelector('.nm').textContent=f.n;
+  row.querySelector('.meta').textContent=fmt(f.s);
+  rowsEl.appendChild(row);
+  row.querySelector('.p2pbtn').onclick=function(){ startP2P(f, row); };
+});
 (function watchPresence(){
   fetch('__rtc/presence').then(function(r){return r.json();}).then(function(j){
-    if (started) return;
-    btn.disabled = !j.online;
-    say(j.online ? 'sender online — ready for direct P2P' :
-      'sender tab not responding — retrying… (or use the standard download)');
-  }).catch(function(){}).then(function(){
-    if (!started) setTimeout(watchPresence, 4000);
-  });
+    online = !!j.online;
+    document.querySelectorAll('.p2pbtn').forEach(function(b){
+      if(!b.dataset.busy) b.disabled = !online;
+    });
+    if (!transfers) say(online ? 'sender online — ready for direct P2P' :
+      'sender tab not responding — retrying… (or use the standard downloads)');
+  }).catch(function(){}).then(function(){ setTimeout(watchPresence, 4000); });
 })();
-btn.onclick = async function(){
-  btn.disabled = true; started = true;
+async function startP2P(f, row){
+  var btn=row.querySelector('.p2pbtn'), bar=row.querySelector('.prog i'),
+      prog=row.querySelector('.prog'), fstat=row.querySelector('.fstat');
+  btn.disabled=true; btn.dataset.busy='1'; transfers++;
   var writer=null, parts=null;
   try{
     if (window.showSaveFilePicker) {                       // stream to disk
-      var h = await showSaveFilePicker({suggestedName:NAME});
+      var h = await showSaveFilePicker({suggestedName:f.n});
       writer = await h.createWritable();
     } else {
-      if (SIZE > 1500000000) { say('file too big for in-memory receive here — use standard download'); return; }
+      if (f.s > 1500000000) { fstat.textContent='too big for in-memory receive here — use standard (or --rar smaller parts)'; btn.disabled=false; delete btn.dataset.busy; transfers--; return; }
       parts = [];
     }
-  }catch(e){ btn.disabled=false; started=false; return; }  // picker cancelled
+  }catch(e){ btn.disabled=false; delete btn.dataset.busy; transfers--; return; } // picker cancelled
   var sid = rand(), got = 0, t0 = Date.now(), connected = false, done = false;
   var pc = new RTCPeerConnection({iceServers:ICE});
   pc.onicecandidate = function(e){ if(e.candidate) post('msg?sid='+sid+'&from=b',{t:'cand',c:e.candidate}); };
   pc.ondatachannel = function(e){
     var dc = e.channel; dc.binaryType='arraybuffer'; connected = true;
-    prog.style.display='block'; say('connected — receiving…');
+    prog.style.display='block'; fstat.textContent='connected — receiving…';
     dc.onmessage = async function(ev){
       if (typeof ev.data === 'string') {
         var m = JSON.parse(ev.data);
@@ -3016,25 +3147,26 @@ btn.onclick = async function(){
           done = true;
           if (writer) await writer.close();
           else { var blob=new Blob(parts); var a=document.createElement('a');
-                 a.href=URL.createObjectURL(blob); a.download=NAME; a.click(); }
+                 a.href=URL.createObjectURL(blob); a.download=f.n; a.click(); }
           post('msg?sid='+sid+'&from=b',{t:'ack'});
           post('done?sid='+sid);
-          bar.style.width='100%'; say('✓ done — '+fmt(got)+' in '+((Date.now()-t0)/1000).toFixed(1)+'s');
-          dc.close(); pc.close();
+          bar.style.width='100%';
+          fstat.textContent='✓ done — '+fmt(got)+' in '+((Date.now()-t0)/1000).toFixed(1)+'s';
+          transfers--; dc.close(); pc.close();
         }
         return;
       }
       got += ev.data.byteLength;
       if (writer) await writer.write(ev.data); else parts.push(ev.data);
-      var pct = SIZE>0 ? Math.min(100, got*100/SIZE) : 0;
+      var pct = f.s>0 ? Math.min(100, got*100/f.s) : 0;
       bar.style.width = pct+'%';
       var mbps = got/1048576/((Date.now()-t0)/1000);
-      say(fmt(got)+' / '+fmt(SIZE)+'  ·  '+mbps.toFixed(1)+' MB/s');
+      fstat.textContent = fmt(got)+' / '+fmt(f.s)+'  ·  '+mbps.toFixed(1)+' MB/s';
     };
   };
-  await post('hello?sid='+sid);
-  say('waiting for direct connection…');
-  setTimeout(function(){ if(!connected && !done){ say('no direct path (hard NAT both sides?) — use the standard download'); btn.disabled=false; } }, 20000);
+  await post('hello?sid='+sid+'&f='+encodeURIComponent(f.n));
+  fstat.textContent='waiting for direct connection…';
+  setTimeout(function(){ if(!connected && !done){ fstat.textContent='no direct path (hard NAT both sides?) — use the standard download'; btn.disabled=false; delete btn.dataset.busy; transfers--; } }, 20000);
   while (!done) {                                          // signaling poll
     var r = await fetch('__rtc/msg?sid='+sid+'&as=b&wait=1');
     if (r.status === 204) continue;
@@ -3048,9 +3180,7 @@ btn.onclick = async function(){
       try { await pc.addIceCandidate(m.c); } catch(e){}
     }
   }
-};
-function fmt(n){ if(n<1048576) return (n/1024).toFixed(0)+' KB';
-  if(n<1073741824) return (n/1048576).toFixed(1)+' MB'; return (n/1073741824).toFixed(2)+' GB'; }
+}
 </script>
 </body></html>`))
 
@@ -3101,7 +3231,7 @@ document.addEventListener('visibilitychange', beat);       // instant beat on ta
       if (r.status === 204) continue;
       if (!r.ok) { await sleep(1500); continue; }
       var j = await r.json();
-      if (j.sid) serve(j.sid);
+      if (j.sid) serve(j.sid, j.file || NAME);
     }catch(e){                                             // network hiccup / share gone
       fails++;
       if (fails > 20) { health.textContent = '✕ share unreachable — was it stopped? (Ctrl-C in the terminal ends P2P)'; health.style.color = '#c33'; return; }
@@ -3110,9 +3240,10 @@ document.addEventListener('visibilitychange', beat);       // instant beat on ta
     }
   }
 })();
-async function serve(sid){
+async function serve(sid, fname){
   active++;
-  var li = document.createElement('li'); li.textContent = sid.slice(0,8)+' — connecting…';
+  var tag = fname.slice(0,24)+' · '+sid.slice(0,6);
+  var li = document.createElement('li'); li.textContent = tag+' — connecting…';
   list.appendChild(li);
   var pc = new RTCPeerConnection({iceServers:ICE});
   var dc = pc.createDataChannel('file', {ordered:true});
@@ -3122,8 +3253,8 @@ async function serve(sid){
   dc.onopen = async function(){
     try{
       t0 = Date.now();
-      dc.send(JSON.stringify({t:'meta',name:NAME}));
-      var resp = await fetch('../' + encodeURIComponent(NAME) + '?raw=1' + KA);
+      dc.send(JSON.stringify({t:'meta',name:fname}));
+      var resp = await fetch('../' + encodeURIComponent(fname) + '?raw=1' + KA);
       var reader = resp.body.getReader();
       for(;;){
         var rr = await reader.read();
@@ -3137,12 +3268,12 @@ async function serve(sid){
           sent += Math.min(CHUNK, buf.byteLength-off);
         }
         var mbps = sent/1048576/((Date.now()-t0)/1000);
-        li.textContent = sid.slice(0,8)+' — '+(sent/1048576).toFixed(1)+' MB · '+mbps.toFixed(1)+' MB/s';
+        li.textContent = tag+' — '+(sent/1048576).toFixed(1)+' MB · '+mbps.toFixed(1)+' MB/s';
       }
       while (dc.bufferedAmount > 0) { await sleep(100); }
       dc.send(JSON.stringify({t:'eof'}));
-      li.textContent = sid.slice(0,8)+' — ✓ sent '+(sent/1048576).toFixed(1)+' MB';
-    }catch(e){ li.textContent = sid.slice(0,8)+' — ✕ send failed: '+(e && e.message || e); }
+      li.textContent = tag+' — ✓ sent '+(sent/1048576).toFixed(1)+' MB';
+    }catch(e){ li.textContent = tag+' — ✕ send failed: '+(e && e.message || e); }
     finished = true;
   };
   try{
@@ -3158,7 +3289,7 @@ async function serve(sid){
       else if (m.t === 'cand') { try { await pc.addIceCandidate(m.c); } catch(e){} }
       else if (m.t === 'ack') break;
     }
-  }catch(e){ li.textContent = sid.slice(0,8)+' — ✕ '+(e && e.message || 'failed'); }
+  }catch(e){ li.textContent = tag+' — ✕ '+(e && e.message || 'failed'); }
   setTimeout(function(){ pc.close(); }, 3000);
   active--;
 }
@@ -3255,6 +3386,176 @@ async function post(body,role){ return fetch('__rtc/msg?sid='+SID+'&from='+role,
     }
   }
 })();
+</script>
+</body></html>`))
+
+// hubTmpl is the --hub control panel: a homescreen-style (Add-to-Home-Screen,
+// standalone) 2-way remote — upload files to the host, paste a URL for the host
+// to grab (web), browse/download/delete the folder (local), and a scratch note.
+var hubTmpl = template.Must(template.New("hub").Parse(`<!doctype html>
+<html><head><meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1,viewport-fit=cover">
+<meta name="robots" content="noindex,nofollow"><title>{{.Title}} · hub</title>
+<link rel="manifest" href="manifest.webmanifest">
+<link rel="apple-touch-icon" href="apple-touch-icon.png">
+<meta name="apple-mobile-web-app-capable" content="yes">
+<meta name="apple-mobile-web-app-status-bar-style" content="black-translucent">
+<meta name="apple-mobile-web-app-title" content="hub">
+<meta name="theme-color" content="#4f63ff">
+<style>` + pageCSS + `
+body{max-width:640px;padding-top:max(20px,env(safe-area-inset-top))}
+.apphead{display:flex;align-items:center;gap:12px;margin-bottom:16px}
+.apphead .ic{width:44px;height:44px;border-radius:11px;background:var(--acc);display:flex;align-items:center;justify-content:center;color:#fff;font-size:22px;flex:0 0 auto}
+.apphead h1{font-size:19px;margin:0}
+.apphead .sub{color:var(--mut);font-size:12px}
+.tiles{display:grid;grid-template-columns:1fr 1fr;gap:12px;margin-bottom:18px}
+.tile{border:1px solid var(--line);border-radius:14px;background:var(--card);padding:16px;cursor:pointer;text-align:center;user-select:none}
+.tile:active{transform:scale(.98)}
+.tile .em{font-size:26px}
+.tile .lb{font-size:13px;margin-top:6px;font-weight:600}
+.panel{border:1px solid var(--line);border-radius:14px;background:var(--card);padding:16px;margin-bottom:16px;display:none}
+.panel.on{display:block}
+.panel h2{font-size:14px;margin:0 0 10px}
+.row{display:flex;gap:8px}
+input[type=url],input[type=text],textarea{width:100%;padding:11px 12px;border:1px solid var(--line);border-radius:10px;background:var(--bg);color:var(--fg);font:inherit;font-size:15px}
+textarea{min-height:90px;resize:vertical}
+.drop{border:2px dashed var(--line);border-radius:12px;padding:26px;text-align:center;color:var(--mut)}
+.drop.on{border-color:var(--acc);color:var(--acc)}
+ul.files{list-style:none;padding:0;margin:10px 0 0}
+ul.files li{display:flex;align-items:center;gap:8px;padding:9px 4px;border-bottom:1px solid var(--line);font-size:14px}
+ul.files li .nm{flex:1;min-width:0;overflow:hidden;text-overflow:ellipsis;white-space:nowrap}
+ul.files li .sz{color:var(--mut);font-size:12px;white-space:nowrap}
+ul.files a,ul.files button.x{color:var(--acc);text-decoration:none;background:none;border:none;cursor:pointer;font-size:16px;padding:2px 6px}
+.jobs{margin-top:12px}
+.job{font-size:12px;color:var(--mut);padding:6px 0;border-top:1px solid var(--line)}
+.jbar{height:6px;background:var(--bg);border:1px solid var(--line);border-radius:4px;overflow:hidden;margin-top:4px}
+.jbar i{display:block;height:100%;width:0;background:var(--acc);transition:width .2s}
+.muted{color:var(--mut);font-size:12px}
+</style></head>
+<body data-base="{{.Base}}">
+<div class="apphead"><div class="ic">⬍</div><div><h1>{{.Title}}</h1><div class="sub">tshare hub · your private 2-way drop</div></div></div>
+
+<div class="tiles">
+ <div class="tile" data-panel="up"><div class="em">📤</div><div class="lb">Send files</div></div>
+ <div class="tile" data-panel="grab"><div class="em">🌐</div><div class="lb">Grab a URL</div></div>
+ <div class="tile" data-panel="files"><div class="em">📁</div><div class="lb">Files</div></div>
+ <div class="tile" data-panel="note"><div class="em">📝</div><div class="lb">Note</div></div>
+</div>
+
+<div class="panel" id="p-up"><h2>📤 Send files to the host</h2>
+ <div class="drop" id="drop">tap to choose, or drop files here</div>
+ <input type="file" id="file" multiple style="display:none">
+ <div class="muted" id="upstat" style="margin-top:8px"></div>
+</div>
+
+<div class="panel" id="p-grab"><h2>🌐 Grab from the web {{if not .YtDlp}}<span class="muted">(direct links only — install yt-dlp for sites/videos)</span>{{end}}</h2>
+ <div class="row"><input type="url" id="grabin" placeholder="https://… (page, video, or file)" autocomplete="off">
+ <button class="btn" id="grabbtn">Grab</button></div>
+ <div class="jobs" id="jobs"></div>
+</div>
+
+<div class="panel" id="p-files"><h2>📁 On the host <button class="btn sec" id="refresh" style="float:right;font-size:12px;padding:4px 10px">refresh</button></h2>
+ <ul class="files" id="files"></ul>
+</div>
+
+<div class="panel" id="p-note"><h2>📝 Shared note</h2>
+ <textarea id="note" placeholder="type anything — saved on the host, visible to anyone with this link"></textarea>
+ <div class="muted" id="notestat" style="margin-top:6px"></div>
+</div>
+
+<div class="foot">private link — don't repost it · Add to Home Screen for an app-like remote</div>{{.Abuse}}
+<script>
+var B = document.body.dataset.base;
+function api(p){ return B + p; }
+document.querySelectorAll('.tile').forEach(function(t){
+ t.onclick=function(){
+  var id=t.dataset.panel, p=document.getElementById('p-'+id);
+  var open=p.classList.contains('on');
+  document.querySelectorAll('.panel').forEach(function(x){x.classList.remove('on');});
+  if(!open){ p.classList.add('on'); if(id==='files') loadFiles(); if(id==='note') loadNote(); }
+ };
+});
+function fmt(n){ if(n<1024)return n+' B'; if(n<1048576)return (n/1024).toFixed(0)+' KB';
+ if(n<1073741824)return (n/1048576).toFixed(1)+' MB'; return (n/1073741824).toFixed(2)+' GB'; }
+
+/* ---- upload ---- */
+var drop=document.getElementById('drop'), fileIn=document.getElementById('file'), upstat=document.getElementById('upstat');
+drop.onclick=function(){ fileIn.click(); };
+fileIn.onchange=function(){ send(fileIn.files); };
+['dragover','dragenter'].forEach(function(e){ drop.addEventListener(e,function(ev){ev.preventDefault();drop.classList.add('on');}); });
+['dragleave','drop'].forEach(function(e){ drop.addEventListener(e,function(ev){ev.preventDefault();drop.classList.remove('on');}); });
+drop.addEventListener('drop',function(ev){ if(ev.dataTransfer.files.length) send(ev.dataTransfer.files); });
+function send(files){
+ if(!files.length) return;
+ var fd=new FormData(); for(var i=0;i<files.length;i++) fd.append('f',files[i]);
+ var xhr=new XMLHttpRequest(); xhr.open('POST', api('__upload'));
+ xhr.upload.onprogress=function(e){ if(e.lengthComputable) upstat.textContent='uploading… '+Math.round(e.loaded*100/e.total)+'%'; };
+ xhr.onload=function(){ upstat.textContent = xhr.status<300 ? '✓ sent '+files.length+' file(s)' : '✕ upload failed'; loadFiles(); };
+ xhr.onerror=function(){ upstat.textContent='✕ upload failed'; };
+ xhr.send(fd);
+}
+
+/* ---- grab ---- */
+var grabin=document.getElementById('grabin'), grabbtn=document.getElementById('grabbtn'), jobsEl=document.getElementById('jobs');
+grabbtn.onclick=doGrab;
+grabin.addEventListener('keydown',function(e){ if(e.key==='Enter') doGrab(); });
+function doGrab(){
+ var u=grabin.value.trim(); if(!u) return;
+ var fd=new FormData(); fd.append('url',u);
+ fetch(api('__grab'),{method:'POST',body:fd}).then(function(r){
+  if(!r.ok) return r.text().then(function(t){ throw new Error(t); });
+  return r.json();
+ }).then(function(){ grabin.value=''; pollJobs(); }).catch(function(e){ alert('grab: '+e.message); });
+}
+function pollJobs(){
+ fetch(api('__jobs')).then(function(r){return r.json();}).then(function(js){
+  jobsEl.innerHTML='';
+  var anyRunning=false;
+  js.forEach(function(j){
+   if(j.status==='running') anyRunning=true;
+   var d=document.createElement('div'); d.className='job';
+   var head = (j.status==='done'?'✓ ':j.status==='error'?'✕ ':'⏳ ')+ (j.name||j.url);
+   if(j.status==='error') head += ' — '+j.err;
+   else if(j.status==='done') head += ' · '+fmt(j.size);
+   d.textContent=head;
+   if(j.status==='running'){ var b=document.createElement('div'); b.className='jbar';
+     b.innerHTML='<i style="width:'+(j.pct||0)+'%"></i>'; d.appendChild(b); }
+   jobsEl.appendChild(d);
+  });
+  if(anyRunning){ loadFiles(); setTimeout(pollJobs,1200); }
+  else loadFiles();
+ }).catch(function(){});
+}
+
+/* ---- files ---- */
+var filesEl=document.getElementById('files');
+document.getElementById('refresh').onclick=loadFiles;
+function loadFiles(){
+ fetch(api('__list')).then(function(r){return r.json();}).then(function(fs){
+  filesEl.innerHTML='';
+  if(!fs.length){ filesEl.innerHTML='<li class="muted">empty — send a file or grab a URL</li>'; return; }
+  fs.forEach(function(f){
+   var li=document.createElement('li');
+   var a=document.createElement('a'); a.href=api(encodeURIComponent(f.name))+'?dl=1'; a.textContent='⬇'; a.title='download';
+   var nm=document.createElement('span'); nm.className='nm'; nm.textContent=f.name;
+   var sz=document.createElement('span'); sz.className='sz'; sz.textContent=f.sizeh;
+   var x=document.createElement('button'); x.className='x'; x.textContent='🗑'; x.title='delete';
+   x.onclick=function(){ if(!confirm('Delete '+f.name+'?')) return;
+     var fd=new FormData(); fd.append('name',f.name);
+     fetch(api('__rm'),{method:'POST',body:fd}).then(function(){ loadFiles(); }); };
+   li.appendChild(nm); li.appendChild(sz); li.appendChild(a); li.appendChild(x);
+   filesEl.appendChild(li);
+  });
+ }).catch(function(){});
+}
+
+/* ---- note ---- */
+var noteEl=document.getElementById('note'), noteStat=document.getElementById('notestat'), noteT;
+function loadNote(){ fetch(api('__note')).then(function(r){return r.json();}).then(function(j){ noteEl.value=j.note||''; }); }
+noteEl.addEventListener('input',function(){ noteStat.textContent='saving…'; clearTimeout(noteT); noteT=setTimeout(function(){
+  var fd=new FormData(); fd.append('note',noteEl.value);
+  fetch(api('__note'),{method:'POST',body:fd}).then(function(){ noteStat.textContent='✓ saved'; });
+},600); });
 </script>
 </body></html>`))
 
@@ -3463,9 +3764,19 @@ func (s *share) renderP2PRecv(w *respRec) {
 		return
 	}
 	w.Header().Set("Content-Type", "text/html; charset=utf-8")
+	files := s.p2pFiles()
+	type fj struct {
+		N string `json:"n"`
+		S int64  `json:"s"`
+	}
+	list := make([]fj, 0, len(files))
+	for _, f := range files {
+		list = append(list, fj{f.Name, f.Size})
+	}
+	b, _ := json.Marshal(list)
 	data := map[string]any{
-		"Name": s.roots[0].Name, "Size": s.roots[0].Size,
-		"SizeH": humanSize(s.roots[0].Size), "Ice": s.iceJSON(), "Abuse": s.abuseHTML(),
+		"Title": s.roots[0].Name, "Files": template.JS(b), "Multi": len(files) > 1,
+		"Ice": s.iceJSON(), "Abuse": s.abuseHTML(),
 	}
 	if err := p2pRecvTmpl.Execute(w, data); err != nil && !s.cfg.Quiet {
 		log.Printf("template: %v", err)
@@ -3478,8 +3789,16 @@ func (s *share) renderP2PSend(w *respRec, r *http.Request) {
 		return
 	}
 	w.Header().Set("Content-Type", "text/html; charset=utf-8")
+	sizeH := humanSize(s.roots[0].Size)
+	if files := s.p2pFiles(); len(files) > 1 {
+		var total int64
+		for _, f := range files {
+			total += f.Size
+		}
+		sizeH = fmt.Sprintf("%d parts · %s", len(files), humanSize(total))
+	}
 	data := map[string]any{
-		"Name": s.roots[0].Name, "SizeH": humanSize(s.roots[0].Size), "Ice": s.iceJSON(),
+		"Name": s.roots[0].Name, "SizeH": sizeH, "Ice": s.iceJSON(),
 	}
 	if err := p2pSendTmpl.Execute(w, data); err != nil && !s.cfg.Quiet {
 		log.Printf("template: %v", err)
@@ -3495,6 +3814,90 @@ func (s *share) renderCall(w *respRec) {
 	if err := callTmpl.Execute(w, data); err != nil && !s.cfg.Quiet {
 		log.Printf("template: %v", err)
 	}
+}
+
+func (s *share) renderHub(w *respRec, urlBase string) {
+	if w.status != 0 {
+		return
+	}
+	w.Header().Set("Content-Type", "text/html; charset=utf-8")
+	_, ytErr := ytBin()
+	data := map[string]any{
+		"Title": s.roots[0].Name, "Abuse": s.abuseHTML(),
+		"YtDlp": ytErr == nil, "Base": urlBase + "/",
+	}
+	if err := hubTmpl.Execute(w, data); err != nil && !s.cfg.Quiet {
+		log.Printf("template: %v", err)
+	}
+}
+
+func (s *share) serveHubManifest(w *respRec, urlBase string) {
+	name := template.JSEscapeString(s.roots[0].Name)
+	w.Header().Set("Content-Type", "application/manifest+json")
+	fmt.Fprintf(w, `{"name":"tshare hub — %s","short_name":"hub","start_url":"%s/","scope":"%s/","display":"standalone","background_color":"#101018","theme_color":"#4f63ff","icons":[{"src":"apple-touch-icon.png","sizes":"180x180","type":"image/png"},{"src":"icon.png","sizes":"512x512","type":"image/png"}]}`,
+		name, urlBase, urlBase)
+}
+
+// hubIconPNG is the generated app icon (accent tile + white up/down arrows),
+// built once. Pure stdlib image/png — no asset files, no font needed.
+var hubIconPNG = sync.OnceValue(func() []byte {
+	const sz = 512
+	img := image.NewRGBA(image.Rect(0, 0, sz, sz))
+	acc := color.RGBA{0x4f, 0x63, 0xff, 0xff}
+	white := color.RGBA{0xff, 0xff, 0xff, 0xff}
+	rad := 96 // rounded corners
+	inCorner := func(x, y int) bool {
+		cx, cy := x, y
+		if x >= sz-rad {
+			cx = sz - rad
+		} else if x >= rad {
+			return true
+		}
+		if y >= sz-rad {
+			cy = sz - rad
+		} else if y >= rad {
+			return true
+		}
+		dx, dy := x-cx, y-cy
+		return dx*dx+dy*dy <= rad*rad
+	}
+	for y := 0; y < sz; y++ {
+		for x := 0; x < sz; x++ {
+			if inCorner(x, y) {
+				img.Set(x, y, acc)
+			}
+		}
+	}
+	// two chevrons: up (top) + down (bottom), drawn as thick diagonal strokes
+	plot := func(x, y int) {
+		for dy := -14; dy <= 14; dy++ {
+			for dx := -14; dx <= 14; dx++ {
+				if dx*dx+dy*dy <= 196 && x+dx >= 0 && x+dx < sz && y+dy >= 0 && y+dy < sz {
+					img.Set(x+dx, y+dy, white)
+				}
+			}
+		}
+	}
+	stroke := func(x0, y0, x1, y1 int) {
+		steps := 220
+		for i := 0; i <= steps; i++ {
+			t := float64(i) / float64(steps)
+			plot(int(float64(x0)+t*float64(x1-x0)), int(float64(y0)+t*float64(y1-y0)))
+		}
+	}
+	stroke(150, 210, 256, 120) // up chevron ╱
+	stroke(256, 120, 362, 210) // ╲
+	stroke(150, 300, 256, 392) // down chevron ╲
+	stroke(256, 392, 362, 300) // ╱
+	var buf bytes.Buffer
+	png.Encode(&buf, img)
+	return buf.Bytes()
+})
+
+func serveHubIcon(w *respRec) {
+	w.Header().Set("Content-Type", "image/png")
+	w.Header().Set("Cache-Control", "public, max-age=86400")
+	w.Write(hubIconPNG())
 }
 
 // ---------------------------------------------------------------------------
@@ -4753,6 +5156,9 @@ func (s *share) useCopyparty() bool {
 	if s.blackhole { // sentinel upDir, no real folder — must stay native/discard
 		return false
 	}
+	if s.senderKey != "" { // --p2p folder: our transfer page + __rtc endpoints
+		return false
+	}
 	if s.encKey != nil { // native inbox does the at-rest encryption
 		return false
 	}
@@ -5277,7 +5683,7 @@ func appendConfigKeys(kv map[string]string) error {
 type rtcHub struct {
 	mu         sync.Mutex
 	sessions   map[string]*rtcSess
-	pending     []string      // receiver sids waiting for the sender tab
+	pending     []rtcPend     // receivers waiting for the sender tab (sid + wanted file)
 	pendCh      chan struct{} // signaled when pending grows
 	senderSeen  time.Time     // --p2p sender-tab heartbeat
 	senderPolls int           // open sender long-polls (a connected poll = alive)
@@ -5380,10 +5786,15 @@ func (h *rtcHub) take(ctx context.Context, sid, as string, wait bool) []byte {
 	}
 }
 
-// announce / next: receivers announce their sid; the sender tab pops them.
-func (h *rtcHub) announce(sid string) {
+// rtcPend is a receiver waiting for the sender tab: its session id and which
+// file it wants (multi-file --p2p shares, e.g. RAR volumes).
+type rtcPend struct{ sid, file string }
+
+// announce / next: receivers announce their sid (+wanted file); the sender
+// tab pops them.
+func (h *rtcHub) announce(sid, file string) {
 	h.mu.Lock()
-	h.pending = append(h.pending, sid)
+	h.pending = append(h.pending, rtcPend{sid, file})
 	h.sessLocked(sid)
 	h.mu.Unlock()
 	select {
@@ -5392,26 +5803,26 @@ func (h *rtcHub) announce(sid string) {
 	}
 }
 
-func (h *rtcHub) next(ctx context.Context, wait bool) string {
+func (h *rtcHub) next(ctx context.Context, wait bool) (string, string) {
 	deadline := time.After(25 * time.Second)
 	for {
 		h.mu.Lock()
 		if len(h.pending) > 0 {
-			sid := h.pending[0]
+			p := h.pending[0]
 			h.pending = h.pending[1:]
 			h.mu.Unlock()
-			return sid
+			return p.sid, p.file
 		}
 		h.mu.Unlock()
 		if !wait {
-			return ""
+			return "", ""
 		}
 		select {
 		case <-h.pendCh:
 		case <-deadline:
-			return ""
+			return "", ""
 		case <-ctx.Done():
-			return ""
+			return "", ""
 		}
 	}
 }
@@ -5449,6 +5860,473 @@ func (h *rtcHub) senderOnline() bool {
 	h.mu.Lock()
 	defer h.mu.Unlock()
 	return h.senderPolls > 0 || time.Since(h.senderSeen) < 60*time.Second
+}
+
+// rarSplit packs root into RAR volumes of --rar-size bytes under
+// ~/.tshare/rar/<id>/ and returns that folder. Volume size is passed in
+// explicit bytes (-v<N>b) so it means the same thing on every rar version.
+// -m0 stores without compression: the point is chunking, not shrinking.
+func rarSplit(c *config, root rootEnt, id string) (string, error) {
+	bin, err := exec.LookPath("rar")
+	if err != nil {
+		return "", errors.New("rar not found — install it first (brew install rar) to use --rar")
+	}
+	volBytes, err := parseSize(c.RarSize)
+	if err != nil || volBytes < 1<<20 {
+		return "", errors.New("--rar-size needs a size ≥ 1M, e.g. 1400M")
+	}
+	dir := filepath.Join(filepath.Dir(stateDir()), "rar", id)
+	if err := os.MkdirAll(dir, 0o700); err != nil {
+		return "", err
+	}
+	stem := strings.TrimSuffix(root.Name, filepath.Ext(root.Name))
+	if stem = sanitizeName(stem); stem == "" {
+		stem = "archive"
+	}
+	fmt.Fprintf(os.Stderr, "  ▶ rar: splitting %s into %s volumes (store mode)…\n", root.Name, c.RarSize)
+	args := []string{"a", fmt.Sprintf("-v%db", volBytes), "-ep1", "-r", "-m0", "-y",
+		filepath.Join(dir, stem+".rar"), root.Abs}
+	cmd := exec.Command(bin, args...)
+	cmd.Stdout, cmd.Stderr = os.Stderr, os.Stderr
+	if err := cmd.Run(); err != nil {
+		os.RemoveAll(dir)
+		return "", fmt.Errorf("rar failed: %w", err)
+	}
+	des, err := os.ReadDir(dir)
+	if err != nil || len(des) == 0 {
+		os.RemoveAll(dir)
+		return "", errors.New("rar produced no volumes")
+	}
+	fmt.Fprintf(os.Stderr, "  ✓ %d volume(s) — receivers extract with unrar / 7-Zip / iZip (open part1)\n", len(des))
+	return dir, nil
+}
+
+// p2pFiles lists what a --p2p share offers: the single file, or the flat
+// regular files of a folder share (RAR volumes), sorted by name.
+func (s *share) p2pFiles() []rootEnt {
+	if s.mode == "file" {
+		return []rootEnt{s.roots[0]}
+	}
+	des, err := os.ReadDir(s.roots[0].Abs)
+	if err != nil {
+		return nil
+	}
+	var out []rootEnt
+	for _, de := range des {
+		if de.IsDir() || strings.HasPrefix(de.Name(), ".") {
+			continue
+		}
+		if fi, err := de.Info(); err == nil {
+			out = append(out, rootEnt{Name: de.Name(), Abs: filepath.Join(s.roots[0].Abs, de.Name()), Size: fi.Size()})
+		}
+	}
+	sort.Slice(out, func(i, j int) bool { return out[i].Name < out[j].Name })
+	return out
+}
+
+// ---------------------------------------------------------------------------
+// --hub: web-grab jobs (paste a URL → the host downloads it into the hub folder)
+
+type jobHub struct {
+	dir  string
+	mu   sync.Mutex
+	jobs map[string]*hubJob
+	ord  []string // newest-first job ids
+	note string
+}
+
+type hubJob struct {
+	ID      string    `json:"id"`
+	URL     string    `json:"url"`
+	Name    string    `json:"name"`
+	Pct     float64   `json:"pct"`
+	Status  string    `json:"status"` // running | done | error
+	Err     string    `json:"err,omitempty"`
+	Size    int64     `json:"size"`
+	Started time.Time `json:"started"`
+}
+
+func newJobHub(dir string) *jobHub { return &jobHub{dir: dir, jobs: map[string]*hubJob{}} }
+
+func (h *jobHub) add(url string) *hubJob {
+	h.mu.Lock()
+	defer h.mu.Unlock()
+	j := &hubJob{ID: randToken(6), URL: url, Name: "resolving…", Status: "running", Started: time.Now()}
+	h.jobs[j.ID] = j
+	h.ord = append([]string{j.ID}, h.ord...)
+	if len(h.ord) > 50 { // cap history
+		old := h.ord[50:]
+		h.ord = h.ord[:50]
+		for _, id := range old {
+			delete(h.jobs, id)
+		}
+	}
+	return j
+}
+
+func (h *jobHub) update(id string, fn func(*hubJob)) {
+	h.mu.Lock()
+	defer h.mu.Unlock()
+	if j := h.jobs[id]; j != nil {
+		fn(j)
+	}
+}
+
+func (h *jobHub) list() []hubJob {
+	h.mu.Lock()
+	defer h.mu.Unlock()
+	out := make([]hubJob, 0, len(h.ord))
+	for _, id := range h.ord {
+		if j := h.jobs[id]; j != nil {
+			out = append(out, *j)
+		}
+	}
+	return out
+}
+
+// blockedIP reports whether an IP is one a web-grab must never reach:
+// loopback, private, link-local (incl. the 169.254.169.254 cloud-metadata
+// endpoint), or unspecified.
+func blockedIP(ip net.IP) bool {
+	return ip == nil || ip.IsLoopback() || ip.IsPrivate() ||
+		ip.IsLinkLocalUnicast() || ip.IsLinkLocalMulticast() || ip.IsUnspecified()
+}
+
+// privateHost is the friendly pre-check: resolve the URL host and refuse if any
+// address is internal. It is only advisory — DNS can rebind and redirects can
+// retarget between this check and the connection — so the authoritative guard
+// is grabClient's socket-level Control (which validates the ACTUAL connected IP
+// on every hop) plus its redirect re-check.
+func privateHost(u *url.URL) bool {
+	ips, err := net.LookupIP(u.Hostname())
+	if err != nil {
+		return true // can't resolve → refuse rather than risk it
+	}
+	for _, ip := range ips {
+		if blockedIP(ip) {
+			return true
+		}
+	}
+	return false
+}
+
+// grabClient fetches web-grabs with SSRF closed at two layers that between them
+// defeat redirect-to-internal AND DNS rebinding:
+//   - DialContext.Control validates the real IP the socket is about to connect
+//     to (runs for the original host and every redirect hop / candidate IP).
+//   - CheckRedirect re-runs the host check on each redirect target and caps hops.
+var grabClient = &http.Client{
+	Transport: &http.Transport{
+		Proxy: http.ProxyFromEnvironment,
+		DialContext: (&net.Dialer{
+			Timeout:   20 * time.Second,
+			KeepAlive: 30 * time.Second,
+			Control: func(network, address string, _ syscall.RawConn) error {
+				host, _, err := net.SplitHostPort(address)
+				if err != nil {
+					return err
+				}
+				if blockedIP(net.ParseIP(host)) {
+					return fmt.Errorf("refusing to connect to internal address %s", host)
+				}
+				return nil
+			},
+		}).DialContext,
+		TLSHandshakeTimeout:   15 * time.Second,
+		ResponseHeaderTimeout: 30 * time.Second,
+	},
+	CheckRedirect: func(req *http.Request, via []*http.Request) error {
+		if len(via) >= 8 {
+			return errors.New("too many redirects")
+		}
+		if privateHost(req.URL) {
+			return errors.New("refusing redirect to an internal address")
+		}
+		return nil
+	},
+}
+
+var directFileExtRe = regexp.MustCompile(`(?i)\.(zip|rar|7z|tar|gz|tgz|bz2|xz|iso|dmg|pkg|exe|apk|bin|pdf|epub|mobi|jpe?g|png|gif|webp|svg|txt|csv|json|xml|docx?|xlsx?|pptx?|mp3|m4a|flac|wav)$`)
+
+// startGrab launches a web-grab in the background: yt-dlp for site/video URLs
+// (falling back to a plain fetch), or a direct HTTP download for file URLs.
+func (s *share) startGrab(rawURL string) (*hubJob, error) {
+	u, err := url.Parse(strings.TrimSpace(rawURL))
+	if err != nil || (u.Scheme != "http" && u.Scheme != "https") || u.Host == "" {
+		return nil, errors.New("enter a full http(s):// URL")
+	}
+	j := s.jobs.add(rawURL)
+	go func() {
+		var derr error
+		// SSRF pre-check up front so it covers BOTH the yt-dlp and fetch paths
+		// (yt-dlp does its own networking, so this initial-host check is the only
+		// guard we can put in front of it; the fetch path is additionally guarded
+		// at the socket level by grabClient against redirects/DNS-rebinding).
+		if privateHost(u) {
+			derr = errors.New("refusing to fetch a private/loopback/link-local address")
+		} else {
+			ytUsable := false
+			if _, e := ytBin(); e == nil {
+				ytUsable = true
+			}
+			// A URL that ends in a known file extension → direct fetch. Otherwise
+			// prefer yt-dlp (it resolves sites/videos), falling back to a fetch.
+			if directFileExtRe.MatchString(u.Path) || !ytUsable {
+				derr = s.grabFetch(j, u)
+			} else {
+				if derr = s.grabYt(j, rawURL); derr != nil {
+					derr = s.grabFetch(j, u) // yt-dlp couldn't → try a plain download
+				}
+			}
+		}
+		newest := s.newestHubFile(j.Started)
+		finalName := ""
+		s.jobs.update(j.ID, func(x *hubJob) {
+			if derr != nil {
+				x.Status, x.Err = "error", derr.Error()
+			} else {
+				x.Status, x.Pct = "done", 100
+				if (x.Name == "resolving…" || x.Name == "") && newest != "" {
+					x.Name = newest // yt-dlp output parse missed it → use the file that landed
+				}
+			}
+			finalName = x.Name
+		})
+		if derr == nil && !s.cfg.NoNotify {
+			go notify("tshare hub", "grabbed "+finalName)
+		}
+	}()
+	return j, nil
+}
+
+// newestHubFile returns the name of the most-recently-modified regular file in
+// the hub folder that was touched at/after since — the reliable way to name a
+// yt-dlp grab whose console output we couldn't parse.
+func (s *share) newestHubFile(since time.Time) string {
+	des, err := os.ReadDir(s.jobs.dir)
+	if err != nil {
+		return ""
+	}
+	name, best := "", time.Time{}
+	for _, de := range des {
+		if de.IsDir() || strings.HasPrefix(de.Name(), ".") {
+			continue
+		}
+		if fi, err := de.Info(); err == nil && !fi.ModTime().Before(since.Add(-time.Second)) && fi.ModTime().After(best) {
+			name, best = de.Name(), fi.ModTime()
+		}
+	}
+	return name
+}
+
+// grabFetch downloads a file URL straight into the hub folder, size-streamed
+// with live progress. SSRF is closed by grabClient at the socket level (real
+// connected IP validated on every hop) plus a redirect re-check — so redirects
+// to internal hosts and DNS rebinding are both refused, not just the initial URL.
+func (s *share) grabFetch(j *hubJob, u *url.URL) error {
+	req, err := http.NewRequest(http.MethodGet, u.String(), nil)
+	if err != nil {
+		return err
+	}
+	req.Header.Set("User-Agent", "tshare/"+version)
+	resp, err := grabClient.Do(req)
+	if err != nil {
+		return err
+	}
+	defer resp.Body.Close()
+	if resp.StatusCode != http.StatusOK {
+		return fmt.Errorf("HTTP %s", resp.Status)
+	}
+	name := sanitizeName(fetchName(resp, u.String()))
+	if name == "" {
+		name = "download-" + j.ID
+	}
+	dst, fname, err := createUnique(s.jobs.dir, name)
+	if err != nil {
+		return err
+	}
+	s.jobs.update(j.ID, func(x *hubJob) { x.Name = fname })
+	total := resp.ContentLength
+	pw := &progWriter{total: total, onPct: func(p float64, n int64) {
+		s.jobs.update(j.ID, func(x *hubJob) { x.Pct, x.Size = p, n })
+	}}
+	_, err = io.Copy(io.MultiWriter(dst, pw), resp.Body)
+	dst.Close()
+	if err != nil {
+		os.Remove(filepath.Join(s.jobs.dir, fname))
+		return err
+	}
+	return nil
+}
+
+// grabYt runs yt-dlp into the hub folder, reusing ytArgs, and drives the job's
+// percent from its --newline progress.
+func (s *share) grabYt(j *hubJob, rawURL string) error {
+	bin, err := ytBin()
+	if err != nil {
+		return err
+	}
+	yc := &config{Paths: []string{rawURL}} // default smart MP4 selection
+	// force --newline and DROP --no-progress so yt-dlp emits the per-line
+	// percentage we parse to drive the job's progress bar.
+	args := append([]string{"--newline"}, dropArg(ytArgs(yc, s.jobs.dir), "--no-progress")...)
+	cmd := exec.Command(bin, args...)
+	pr, pw := io.Pipe()
+	cmd.Stdout, cmd.Stderr, cmd.Stdin = pw, pw, nil
+	go func() {
+		sc := bufio.NewScanner(pr)
+		sc.Buffer(make([]byte, 64<<10), 1<<20)
+		for sc.Scan() {
+			line := sc.Text()
+			if m := ytPctRe.FindStringSubmatch(line); m != nil {
+				if p, e := strconv.ParseFloat(m[1], 64); e == nil {
+					s.jobs.update(j.ID, func(x *hubJob) {
+						if p > x.Pct {
+							x.Pct = p
+						}
+					})
+				}
+			}
+			if m := ytDestRe.FindStringSubmatch(line); m != nil {
+				dest := m[1]
+				if dest == "" {
+					dest = m[2] // the "Merging formats into" alternative
+				}
+				if dest != "" {
+					n := filepath.Base(strings.TrimSpace(dest))
+					s.jobs.update(j.ID, func(x *hubJob) { x.Name = n })
+				}
+			}
+		}
+	}()
+	runErr := cmd.Run()
+	pw.Close()
+	if runErr != nil {
+		return fmt.Errorf("yt-dlp failed")
+	}
+	return nil
+}
+
+var ytDestRe = regexp.MustCompile(`Destination: (.+)$|Merging formats into "(.+)"`)
+
+// progWriter tracks copy progress and reports percent (throttled by the caller
+// via a simple last-percent gate).
+type progWriter struct {
+	total   int64
+	written int64
+	last    float64
+	onPct   func(pct float64, n int64)
+}
+
+func (p *progWriter) Write(b []byte) (int, error) {
+	n := len(b)
+	p.written += int64(n)
+	pct := 0.0
+	if p.total > 0 {
+		pct = float64(p.written) * 100 / float64(p.total)
+	}
+	if pct-p.last >= 1 || p.total <= 0 {
+		p.last = pct
+		p.onPct(pct, p.written)
+	}
+	return n, nil
+}
+
+// handleHub serves the --hub control endpoints (all behind the token/password
+// gate). Files land in / are served from the hub folder.
+func (s *share) handleHub(w *respRec, r *http.Request, rel string, urlBase string) {
+	switch {
+	case rel == "" && r.Method == http.MethodGet:
+		s.renderHub(w, urlBase)
+	case rel == "__grab" && r.Method == http.MethodPost:
+		if err := r.ParseForm(); err != nil {
+			http.Error(w, "bad form", http.StatusBadRequest)
+			return
+		}
+		j, err := s.startGrab(r.FormValue("url"))
+		if err != nil {
+			http.Error(w, err.Error(), http.StatusBadRequest)
+			return
+		}
+		// snapshot the job under the lock — the grab goroutine mutates *j
+		// concurrently (all its writes are lock-held), so read it the same way.
+		s.jobs.mu.Lock()
+		snap := *j
+		s.jobs.mu.Unlock()
+		w.Header().Set("Content-Type", "application/json")
+		b, _ := json.Marshal(snap)
+		w.Write(b)
+	case rel == "__jobs" && r.Method == http.MethodGet:
+		w.Header().Set("Content-Type", "application/json")
+		b, _ := json.Marshal(s.jobs.list())
+		w.Write(b)
+	case rel == "__list" && r.Method == http.MethodGet:
+		w.Header().Set("Content-Type", "application/json")
+		b, _ := json.Marshal(s.hubFiles())
+		w.Write(b)
+	case rel == "__rm" && r.Method == http.MethodPost:
+		name := sanitizeName(r.FormValue("name"))
+		if name == "" || strings.ContainsAny(r.FormValue("name"), "/\\") {
+			http.Error(w, "bad name", http.StatusBadRequest)
+			return
+		}
+		if err := os.Remove(filepath.Join(s.jobs.dir, name)); err != nil {
+			http.Error(w, "not found", http.StatusNotFound)
+			return
+		}
+		w.Header().Set("Content-Type", "application/json")
+		w.Write([]byte(`{"ok":true}`))
+	case rel == "__note":
+		if r.Method == http.MethodPost {
+			s.jobs.mu.Lock()
+			s.jobs.note = r.FormValue("note")
+			if len(s.jobs.note) > 20000 {
+				s.jobs.note = s.jobs.note[:20000]
+			}
+			s.jobs.mu.Unlock()
+		}
+		s.jobs.mu.Lock()
+		note := s.jobs.note
+		s.jobs.mu.Unlock()
+		w.Header().Set("Content-Type", "application/json")
+		b, _ := json.Marshal(map[string]string{"note": note})
+		w.Write(b)
+	case rel == "manifest.webmanifest":
+		s.serveHubManifest(w, urlBase)
+	case rel == "apple-touch-icon.png" || rel == "icon.png":
+		serveHubIcon(w)
+	default:
+		http.NotFound(w, r)
+	}
+}
+
+// hubFiles lists the regular files in the hub folder (name/size/mtime), newest
+// first — the "local" side of the 2-way remote.
+func (s *share) hubFiles() []map[string]any {
+	des, err := os.ReadDir(s.jobs.dir)
+	if err != nil {
+		return []map[string]any{}
+	}
+	type fe struct {
+		name string
+		size int64
+		mod  time.Time
+	}
+	var fs []fe
+	for _, de := range des {
+		if de.IsDir() || strings.HasPrefix(de.Name(), ".") {
+			continue
+		}
+		if fi, err := de.Info(); err == nil {
+			fs = append(fs, fe{de.Name(), fi.Size(), fi.ModTime()})
+		}
+	}
+	sort.Slice(fs, func(i, j int) bool { return fs[i].mod.After(fs[j].mod) })
+	out := make([]map[string]any, 0, len(fs))
+	for _, f := range fs {
+		out = append(out, map[string]any{"name": f.name, "size": f.size, "sizeh": humanSize(f.size), "mod": f.mod.Unix()})
+	}
+	return out
 }
 
 // senderReq: the auto-opened local sender tab authenticates with a per-share
@@ -5562,7 +6440,27 @@ func (s *share) handleRTC(w *respRec, r *http.Request, ep string) {
 			http.Error(w, "bad sid", http.StatusBadRequest)
 			return
 		}
-		s.hub.announce(sid)
+		// wanted file (multi-file shares): must be a flat, sane name that this
+		// share actually offers — never a path.
+		file := q.Get("f")
+		if file != "" {
+			if file != sanitizeName(file) || strings.ContainsAny(file, "/\\") {
+				http.Error(w, "bad file", http.StatusBadRequest)
+				return
+			}
+			ok := false
+			for _, f := range s.p2pFiles() {
+				if f.Name == file {
+					ok = true
+					break
+				}
+			}
+			if !ok {
+				http.Error(w, "unknown file", http.StatusNotFound)
+				return
+			}
+		}
+		s.hub.announce(sid, file)
 		jsonOK(map[string]any{"ok": true})
 	case ep == "next":
 		if !s.senderReq(r) {
@@ -5575,13 +6473,13 @@ func (s *share) handleRTC(w *respRec, r *http.Request, ep string) {
 		s.hub.mu.Lock()
 		s.hub.senderPolls++
 		s.hub.mu.Unlock()
-		sid := s.hub.next(r.Context(), q.Get("wait") == "1")
+		sid, file := s.hub.next(r.Context(), q.Get("wait") == "1")
 		s.hub.mu.Lock()
 		s.hub.senderPolls--
 		s.hub.mu.Unlock()
 		s.hub.senderBeat()
 		if sid != "" {
-			jsonOK(map[string]any{"sid": sid})
+			jsonOK(map[string]any{"sid": sid, "file": file})
 			return
 		}
 		w.WriteHeader(http.StatusNoContent)
