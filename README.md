@@ -26,6 +26,8 @@ tshare -i                              # blackhole inbox: count uploads, keep no
 tshare --room standup                  # video room on your local MiroTalk (auto-started)
 tshare --call                          # the link IS a built-in 1:1 video call
 tshare --p2p big.iso                   # ⚡ direct browser-to-browser transfer + fallback
+tshare --rar --p2p movie.mkv           # split into 1.4 GB RAR volumes → per-part ⚡ P2P (iPhone-sized)
+tshare --hub                           # 📱 homescreen-style 2-way remote (upload · grab URLs · browse)
 tshare --allow-upload -p pw ~/proj     # collaboration: browse + upload, password-gated
 tshare -g game.html                    # 🎮 host a GIGA-NET/1-L multiplayer game over the internet:
                                        #    auto-opens as host, join link printed + on your clipboard
@@ -132,6 +134,28 @@ tshare --call                   # the link IS a 1:1 video call — no MiroTalk, 
 How it works (the Go binary stays stdlib-only): tshare hosts the pages and a tiny token-gated signaling relay; all WebRTC runs in browsers. The **sender side is a local tab** that auto-opens (`--no-open` prints its URL instead) and must stay open — it streams the file from loopback into per-receiver DataChannels with backpressure, shows live per-transfer speed, and heartbeats presence so receiver pages can tell whether ⚡ is available. Receivers stream to disk via the File System Access API (Chromium; other browsers assemble in memory, capped at 1.5 GB). Completed P2P transfers count toward `-n`/`--once`; P2P bytes don't count toward `--max-bytes` (they never ride the funnel). Direct connections need UDP hole-punch — when both ends sit behind symmetric NAT/hard CGNAT it fails cleanly and the page says to use the standard download; configure `--turn` for a guaranteed relay path.
 
 `--call` serves a minimal 1:1 call page (camera/mic, mute, cam toggle, leave) using the same signaling — perfect for "jump on a quick call" without installing anything. Two participants max; the secret link is the room. Needs HTTPS for camera/mic, which funnel/serve provide.
+
+### Big files to a phone: `--rar` volumes
+
+`--p2p` also works on a **folder**, giving one ⚡ row per file. Combine it with `--rar` to make a huge file *receivable on an iPhone*: `--rar` splits the file (or folder) into RAR volumes with `rar` (chunking, not compression — `-m0`), and the share becomes those parts. The default `--rar-size 1400M` is deliberate — it sits just under the ~1.5 GB an iOS browser can hold in memory for a P2P receive, so each part comes down cleanly; the receiver saves every part into one folder and opens part 1 to extract (unrar / 7-Zip / iZip).
+
+```sh
+tshare --rar --p2p movie.mkv               # → movie.part1.rar … each with its own ⚡ transfer
+tshare --rar --rar-size 700M -p pw big.iso # CD-sized parts, password-gated
+```
+
+Needs `rar` on PATH (`brew install rar` on macOS — approve it once in System Settings › Privacy & Security, since rarlab's binary is unsigned; `apt install rar` on Debian/Ubuntu). The receiver page also offers *all parts as one .zip* via the standard download as a fallback.
+
+## Hub — a homescreen 2-way remote (`--hub`)
+
+`--hub` turns a secret link into a phone-friendly **control panel** for one folder — the easiest way to move things on and off your machine from an iPhone or any other computer:
+
+```sh
+tshare --hub                 # serves ./tshare-hub as the control panel
+tshare --hub ~/Drop -p pw    # any folder, password-gated
+```
+
+The page has four tiles: **📤 Send files** (upload from the phone straight to the host), **🌐 Grab a URL** (paste any link — the host downloads it with yt-dlp for sites/videos or a direct fetch for file URLs, with live progress), **📁 Files** (browse, download, or delete what's in the folder), and **📝 Note** (a shared scratch note). It ships a web-app manifest and a generated icon, so **Add to Home Screen** on iOS gives you a standalone, app-like remote. Everything sits behind the same token + `-p` password; expiry defaults to never (it's a standing remote). Web-grabs of private/loopback/link-local addresses are refused (SSRF guard) — it's meant to pull from the public web, not your LAN. Uploads honor `--min-free`; grabs land in the hub folder and appear immediately in the file list.
 
 ## Static websites over Funnel (v1.8)
 
