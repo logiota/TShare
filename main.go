@@ -1333,6 +1333,20 @@ func runShare(c *config) error {
 		} else {
 			s.baseURL = fmt.Sprintf("https://%s:%d/%s", host, c.HTTPSPort, s.token)
 		}
+		// Warn if this "public" funnel link won't actually resolve on the public
+		// internet (Tailscale hasn't published the *.ts.net DNS record) — else the
+		// user hands out a link that only works inside their tailnet. Async so it
+		// never delays the share coming up; the tip points at doctor for the fix.
+		if !c.Tailnet && !c.Quiet {
+			go func(h string) {
+				if !resolvesPublicly(h) {
+					fmt.Fprintf(os.Stderr, "  ⚠ %s has no PUBLIC DNS record — this link works on your tailnet\n", h)
+					fmt.Fprintln(os.Stderr, "     but NOT the public internet (Funnel DNS isn't published). Fix:")
+					fmt.Fprintln(os.Stderr, "       tailscale funnel reset && tailscale up   (then re-run · see: tshare doctor)")
+					fmt.Fprintln(os.Stderr, "     …or use -t for an intentionally tailnet-only link.")
+				}
+			}(host)
+		}
 		// extra direct-LAN URL (plain HTTP, token required for direct hits)
 		if lanOn {
 			if ip := lanIP(); ip != "127.0.0.1" {
@@ -3928,6 +3942,25 @@ func tsBin(c *config) (string, error) {
 	return "", errors.New("tailscale CLI not found (install Tailscale, or pass --tailscale-bin)")
 }
 
+// resolvesPublicly reports whether host has a public A/AAAA record, asking a
+// public resolver directly (not the local one, which on a tailnet answers for
+// *.ts.net via MagicDNS and would give a false positive). This is exactly what
+// an off-tailnet visitor's resolver would return for a Funnel link.
+func resolvesPublicly(host string) bool {
+	for _, ns := range []string{"1.1.1.1:53", "8.8.8.8:53"} {
+		r := &net.Resolver{PreferGo: true, Dial: func(ctx context.Context, _, _ string) (net.Conn, error) {
+			return (&net.Dialer{Timeout: 3 * time.Second}).DialContext(ctx, "udp", ns)
+		}}
+		ctx, cancel := context.WithTimeout(context.Background(), 4*time.Second)
+		ips, err := r.LookupHost(ctx, host)
+		cancel()
+		if err == nil && len(ips) > 0 {
+			return true
+		}
+	}
+	return false
+}
+
 func tsStatus(c *config) (*tsInfo, error) {
 	bin, err := tsBin(c)
 	if err != nil {
@@ -4448,6 +4481,23 @@ func cmdDoctor() {
 	} else {
 		fmt.Printf("no\n    %s\n    → enable the funnel attribute: https://tailscale.com/kb/1223/funnel\n",
 			strings.TrimSpace(string(out)))
+	}
+
+	// A funnel link is only truly public if the *.ts.net name resolves on the
+	// PUBLIC internet. Funnel can report "on" (cert + attribute present) while
+	// Tailscale hasn't published the DNS record — then links work on the tailnet
+	// but 404/NXDOMAIN for everyone else. Check it against a public resolver.
+	if info != nil {
+		if dns := strings.TrimSuffix(info.Self.DNSName, "."); dns != "" {
+			pub := resolvesPublicly(dns)
+			fmt.Printf("  %s funnel DNS resolves publicly: %v\n", okm(pub), pub)
+			if !pub {
+				fmt.Printf("    ⚠ %s has no public DNS record — Funnel links work on your tailnet\n", dns)
+				fmt.Println("      but NOT the public internet. Re-publish it, then re-create shares:")
+				fmt.Println("        tailscale funnel reset && tailscale up")
+				fmt.Println("      and confirm HTTPS + Funnel are enabled: https://tailscale.com/kb/1223/funnel")
+			}
+		}
 	}
 
 	yb, yerr := ytBin()
