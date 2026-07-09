@@ -90,6 +90,42 @@ curl -u :pw -F f=@notes.txt https://…/<token>/__upload        # send a file
 curl -o all.zip https://…/<token>/__zip                       # folder as zip
 ```
 
+## One-stop hosting: run & expose any local server
+
+Beyond proxying an already-running server (`-s`), tshare can **launch** a server and expose it — one command from "a folder with code" to "a public HTTPS link", with the token/password/expiry gate in front:
+
+```sh
+tshare run -- npm start                      # run any command; its port is auto-detected
+tshare run --port 8000 -- python3 -m http.server 8000
+tshare host ~/myapp                          # auto-detect the stack in a folder and host it
+tshare host ~/site --tmux -p pw              # …in tmux, password-gated
+```
+
+`tshare host` sniffs the folder — `package.json` → node (`npm start` or `server.js`), `compose.yml` → `docker compose up`, `app.py`/`manage.py` → python, `index.php` → PHP's built-in server, `index.html` → a static `--site`. The upstream **port is auto-detected** (tshare watches which port the process opens, via `lsof`) so you rarely pass `--port`; a `--port` that's already taken is reported as a conflict. tshare **bundles no runtimes** — if `node`/`python`/`docker` is missing it just tells you the `brew install` to run. Under the hood this is the same managed-server engine `--room` (MiroTalk) uses, so it inherits health-checks, WebSocket pass-through, and clean shutdown.
+
+### Watch them in tmux (`--tmux`)
+
+`--tmux` launches each managed server (`run`/`host`/`--room`) as a window of one shared **`tshare`** tmux session — foreground in its pane, attachable, with a crash left visible (`remain-on-exit`) and output teed to a log:
+
+```sh
+tshare host ~/api --tmux        # → window 'host-api' in session 'tshare'
+tshare tmux                     # list the servers in one view + the attach hint
+tmux attach -t tshare           # watch/control them all
+```
+
+### Keep them running: LaunchAgent / brew service
+
+`tshare agent install` writes a macOS **LaunchAgent** that runs `tshare resume` at every login (restarting shares you saved with `--persist`), and loads it via `launchctl`:
+
+```sh
+tshare agent install                 # run `tshare resume` at login
+tshare agent install -- --hub ~/Drop -p pw   # bake a specific share in (KeepAlive-restarted)
+tshare agent install --print         # just emit the plist (don't load it)
+tshare agent status / uninstall
+```
+
+It's shaped like what Homebrew generates, so once tshare is installed from a tap the same thing is available as `brew services start tshare` (see the `service` block in `Formula/tshare.rb`). On Linux, `tshare agent` points you at the equivalent `systemd --user` one-liner.
+
 ## Share a running server (v1.10)
 
 `-s` / `--server` reverse-proxies an already-running local server over the funnel — dev servers, notebooks, any `http://localhost:PORT`. A localhost URL is auto-detected as a server (so it's proxied, not downloaded by yt-dlp). tshare's token/password/expiry/limits sit in front; the upstream's `Host` header is rewritten so dev-server host checks pass, and WebSockets/HMR pass through.

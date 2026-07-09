@@ -27,6 +27,18 @@ class Tshare < Formula
     system "go", "build", *std_go_args(ldflags: "-s -w"), "."
   end
 
+  # `brew services start tshare` restarts every share saved with --persist at
+  # login (same as `tshare resume`, and the same thing `tshare agent install`
+  # sets up as a plain LaunchAgent). run_type :immediate = run once at load/boot.
+  service do
+    run [opt_bin/"tshare", "resume"]
+    run_type :immediate
+    keep_alive false
+    log_path var/"log/tshare.log"
+    error_log_path var/"log/tshare.log"
+    environment_variables PATH: std_service_path_env
+  end
+
   test do
     assert_match "tshare v#{version}", shell_output("#{bin}/tshare version")
   end
