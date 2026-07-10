@@ -417,6 +417,7 @@ type config struct {
 	// internal
 	daemonChild  bool
 	daemonID     string
+	gameSidSeed  string // --__gamesid: reuse this GIGA-NET/1-L session id (daemon child / persist-resume) instead of minting a fresh one, so already-distributed join links keep working
 	daemonTmp    string // temp file the daemon child must delete on exit
 	daemonTmpDir string // temp dir the daemon child must delete on exit
 	encKeyHex    string // passed to bg child so it inherits the inbox key
@@ -528,6 +529,7 @@ func registerFlags(fs *flag.FlagSet, c *config) {
 	fs.BoolVar(&c.NoREPL, "no-repl", c.NoREPL, "")
 	fs.BoolVar(&c.daemonChild, "__daemon", c.daemonChild, "")
 	fs.StringVar(&c.daemonID, "__id", c.daemonID, "")
+	fs.StringVar(&c.gameSidSeed, "__gamesid", c.gameSidSeed, "")
 	fs.StringVar(&c.daemonTmp, "__tmp", c.daemonTmp, "")
 	fs.StringVar(&c.daemonTmpDir, "__tmpdir", c.daemonTmpDir, "")
 	fs.StringVar(&c.encKeyHex, "__enckey", c.encKeyHex, "")
@@ -988,7 +990,11 @@ func runShare(c *config) error {
 			s.upDir = root
 		}
 		if c.GameLink {
-			s.gameSid = randSid(8)
+			if c.gameSidSeed != "" { // daemon child / resumed persist: keep the id already handed out
+				s.gameSid = c.gameSidSeed
+			} else {
+				s.gameSid = randSid(8)
+			}
 		}
 		if !c.Quiet {
 			fmt.Fprintf(os.Stderr, "  🌐 serving site root %s (index: %s)\n", root, index)
@@ -4300,6 +4306,9 @@ func daemonize(s *share) error {
 	}
 	if s.cfg.encKeyHex != "" { // hand the inbox key to the child so it stays stable
 		args = append(args, "--__enckey", s.cfg.encKeyHex)
+	}
+	if s.gameSid != "" { // hand the game session id to the child so its join link matches what we advertise
+		args = append(args, "--__gamesid", s.gameSid)
 	}
 	args = append(args, "--__daemon", "--__id", s.id)
 
@@ -8747,9 +8756,11 @@ func savePersist(s *share) error {
 		return errors.New("can't persist a stdin/stream/downloaded share")
 	}
 	cwd, _ := os.Getwd()
-	// strip daemon-internal flags; keep --persist so a resumed share re-persists
+	// strip daemon-internal flags; keep --persist so a resumed share re-persists.
+	// --__gamesid is stripped here and re-appended below so exactly one (the live
+	// session id) survives — resume then reuses it, keeping distributed join links valid.
 	var args []string
-	skip := map[string]bool{"--__daemon": true, "--__id": true, "--__tmp": true, "--__tmpdir": true, "--__enckey": true}
+	skip := map[string]bool{"--__daemon": true, "--__id": true, "--__tmp": true, "--__tmpdir": true, "--__enckey": true, "--__gamesid": true}
 	for i := 0; i < len(os.Args[1:]); i++ {
 		a := os.Args[1:][i]
 		if skip[a] {
@@ -8759,6 +8770,9 @@ func savePersist(s *share) error {
 			continue
 		}
 		args = append(args, a)
+	}
+	if s.gameSid != "" { // pin the session id so `tshare resume` doesn't re-mint one and orphan links already shared
+		args = append(args, "--__gamesid", s.gameSid)
 	}
 	rec := persistRec{ID: s.id, Args: args, Cwd: cwd, Created: time.Now()}
 	return writeJSON(persistFile(s.id), rec)
