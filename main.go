@@ -79,6 +79,8 @@ USAGE
   tshare --rar --p2p big.mkv          split into 1.4 GB RAR volumes → per-part ⚡ P2P
   tshare --room [name]                video-room link (local MiroTalk, auto-started)
   tshare room install                 one-time: install MiroTalk locally from GitHub
+  tshare kuma                         expose your Uptime Kuma monitor at the funnel root
+  tshare kuma install                 one-time: set up Uptime Kuma (Docker)
   tshare --call                       the link IS a 1:1 video call (built-in WebRTC)
   tshare set <id> [-p pw] [-e dur] [-n N]   change options on a RUNNING share
   tshare extend <id> [dur]            push out expiry (no dur = DOUBLE the time left)
@@ -364,6 +366,11 @@ type config struct {
 	RunName string   // display / tmux window name
 	Tmux    bool     // --tmux: launch managed servers as windows of one 'tshare' tmux session
 
+	// --kuma: reuse/start a persistent Uptime Kuma monitor and expose it at the
+	// funnel root (Uptime Kuma can't run under a subpath). Docker restart=always.
+	Kuma     bool
+	KumaPort int // default 3001
+
 	// --rar: split the share into RAR volumes before serving (transfer
 	// chunking — e.g. so each part fits an iPhone's in-memory P2P receive)
 	Rar     bool
@@ -489,6 +496,8 @@ func registerFlags(fs *flag.FlagSet, c *config) {
 	fs.BoolVar(&c.Call, "call", c.Call, "")
 	fs.BoolVar(&c.Hub, "hub", c.Hub, "")
 	fs.BoolVar(&c.Tmux, "tmux", c.Tmux, "")
+	fs.BoolVar(&c.Kuma, "kuma", c.Kuma, "")
+	fs.IntVar(&c.KumaPort, "kuma-port", c.KumaPort, "")
 	fs.StringVar(&c.RunDir, "dir", c.RunDir, "") // working dir for `tshare run`/`host`
 	fs.BoolVar(&c.Rar, "rar", c.Rar, "")
 	fs.StringVar(&c.RarSize, "rar-size", c.RarSize, "")
@@ -711,6 +720,9 @@ func main() {
 		case "room":
 			cmdRoom(args[1:])
 			return
+		case "kuma", "uptime-kuma":
+			cmdKuma(args[1:])
+			return
 		case "run":
 			cmdRun(args[1:])
 			return
@@ -838,6 +850,8 @@ type share struct {
 	roomName      string    // --room: MiroTalk room id
 	roomURL       string    // --room: full MiroTalk join URL
 	roomLocal     bool      // --room: using the local MiroTalk install
+	kuma          bool      // --kuma: exposing Uptime Kuma at the funnel root
+	kumaURL       string    // the root dashboard URL
 	mtRootMounted bool      // we mounted the funnel/serve ROOT path → unmount on exit
 
 	procs []*serverProc // managed local servers we launched (run/host/room) — stopped on exit
@@ -947,7 +961,7 @@ func runShare(c *config) error {
 	}
 
 	// resolve targets
-	oneInput := !c.Upload && !c.Blackhole && !c.Room && !c.Call && !c.Hub && len(c.RunCmd) == 0 && len(c.Paths) == 1
+	oneInput := !c.Upload && !c.Blackhole && !c.Room && !c.Call && !c.Hub && !c.Kuma && len(c.RunCmd) == 0 && len(c.Paths) == 1
 	// -s, or a localhost URL ("automatically if it is not a website"), means
 	// reverse-proxy a running server rather than download it.
 	serverMode := oneInput && looksLikeURL(c.Paths[0]) && (c.Server || isLocalServerURL(c.Paths[0]))
@@ -1090,6 +1104,21 @@ func runShare(c *config) error {
 		s.mode = "call"
 		s.hub = newRTCHub()
 		s.roots = []rootEnt{{Name: "call", Abs: "webrtc-call", IsDir: false}}
+	case c.Kuma:
+		// --kuma: expose a persistent Uptime Kuma monitor at the funnel root
+		// (it can't run under a subpath). Reuse a running instance or start the
+		// Docker one; started/resolved later so we have the funnel host for the URL.
+		if len(c.Paths) > 0 {
+			return errors.New("--kuma takes no path — it exposes your Uptime Kuma dashboard")
+		}
+		if c.Local {
+			return errors.New("--kuma needs the funnel/serve root (drop -l) so the dashboard is reachable")
+		}
+		if err := kumaPreflight(c); err != nil { // fail before mounting anything
+			return err
+		}
+		s.mode, s.kuma = "kuma", true
+		s.roots = []rootEnt{{Name: "uptime-kuma", Abs: "uptime-kuma", IsDir: false}}
 	case c.Room:
 		// --room: no file at all — serve a token-gated landing page that opens a
 		// MiroTalk video room. The secret link (and any -p/-e) gate who reaches the
@@ -1455,6 +1484,25 @@ func runShare(c *config) error {
 		s.updateState() // re-record: join URL + child pid + root mount now exist
 	}
 
+	// --kuma: make sure Uptime Kuma is up (reuse or start the persistent Docker
+	// container — never killed on exit), then mount it at the funnel/serve ROOT
+	// and point the dashboard URL there. Runs after `defer cleanup()` so a
+	// failure still unmounts.
+	if s.kuma {
+		if err := ensureKuma(s); err != nil {
+			return err
+		}
+		if out, err := tsMount(c, "", c.KumaPort); err != nil {
+			return fmt.Errorf("mounting Uptime Kuma at the %s root failed:\n%s", verb(c), strings.TrimSpace(out))
+		}
+		s.mtRootMounted = true
+		if u, err := url.Parse(s.baseURL); err == nil {
+			s.kumaURL = u.Scheme + "://" + u.Host + "/"
+		}
+		s.roots[0].Abs = s.kumaURL
+		s.updateState()
+	}
+
 	// copyparty folder engine: for single-folder browse/upload shares, hand the
 	// heavy lifting (resumable uploads, dedup, thumbnails, WebDAV) to copyparty
 	// on loopback and reverse-proxy to it — tshare keeps the token gate,
@@ -1778,6 +1826,8 @@ func (s *share) describe() string {
 		return fmt.Sprintf("website %s (index: %s)", s.roots[0].Abs, s.siteIndex)
 	case "room":
 		return "video room → " + s.roomURL
+	case "kuma":
+		return "Uptime Kuma → " + s.kumaURL
 	case "call":
 		return "video call (built-in 1:1, WebRTC P2P)"
 	case "hub":
@@ -1841,6 +1891,8 @@ func (s *share) curlHint() string {
 		return "open " + s.baseURL + "/   (live website)"
 	case "room":
 		return "open " + s.baseURL + "/   (video room: " + s.roomName + ")"
+	case "kuma":
+		return "open " + s.baseURL + "/   (Uptime Kuma dashboard)"
 	case "call":
 		return "open " + s.baseURL + "/   (send this link to ONE other person)"
 	case "hub":
@@ -2091,6 +2143,16 @@ func (s *share) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 			return
 		}
 		s.renderRoom(rec)
+	case "kuma":
+		if rel != "" {
+			http.NotFound(rec, r)
+			return
+		}
+		if r.URL.Query().Get("go") == "1" { // straight to the dashboard
+			http.Redirect(rec, r, s.kumaURL, http.StatusFound)
+			return
+		}
+		s.renderKuma(rec)
 	case "call":
 		if rel != "" {
 			http.NotFound(rec, r)
@@ -3104,6 +3166,27 @@ var roomTmpl = template.Must(template.New("room").Parse(`<!doctype html>
  dn.addEventListener('keydown', function(e){ if(e.key==='Enter'){ upd(); join.click(); } });
 })();
 </script>
+</body></html>`))
+
+// kumaTmpl is the token-gated landing for --kuma: a door to the Uptime Kuma
+// dashboard (served at the funnel root). Uptime Kuma has its own login.
+var kumaTmpl = template.Must(template.New("kuma").Parse(`<!doctype html>
+<html><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1">
+<meta name="robots" content="noindex,nofollow"><title>Uptime Kuma</title>
+<style>` + pageCSS + `
+.room { text-align:center; padding:22px 0; }
+.room .big { font-size:46px; margin-bottom:2px; }
+.room a.go { font-size:16px; padding:12px 26px; display:inline-block; margin-top:8px; }
+.room .sub { color:var(--mut); font-size:13px; margin:10px 0 4px; }
+</style></head>
+<body>
+<div class="room">
+ <div class="big">📊</div>
+ <h1>Uptime Kuma</h1>
+ <div class="sub">your self-hosted status monitor — it keeps running in the background</div>
+ <a class="btn go" id="open" href="{{.URL}}">Open dashboard →</a>
+ <div class="foot">powered by tshare · protected by Uptime Kuma's own login · link is private — don't repost it</div>{{.Abuse}}
+</div>
 </body></html>`))
 
 // p2pRecvTmpl is the --p2p transfer page a visitor sees: one row per file
@@ -5408,6 +5491,179 @@ func (b *bufPool) Put(x []byte) { b.p.Put(x) }
 var proxyBufPool = &bufPool{p: sync.Pool{New: func() any { return make([]byte, 64<<10) }}}
 
 // ---------------------------------------------------------------------------
+// Uptime Kuma (--kuma): reuse/start a persistent Uptime Kuma monitor and expose
+// it at the funnel ROOT (Uptime Kuma is a root-path SPA — it can't be proxied
+// under /<token>/). Docker is the primary, official deploy; a manually-run
+// git+npm instance is reused if already listening. tshare NEVER stops Kuma —
+// it's a standing service (restart=always) — it only mounts/unmounts the root.
+
+const kumaImage = "louislam/uptime-kuma:1"
+const kumaContainer = "uptime-kuma"
+
+// kumaAlive probes the Uptime Kuma port: "kuma" (its page), "other" (port busy
+// with something else), or "" (nothing listening).
+func kumaAlive(port int) string {
+	client := &http.Client{Timeout: 2 * time.Second}
+	resp, err := client.Get(fmt.Sprintf("http://127.0.0.1:%d/", port))
+	if err != nil {
+		return ""
+	}
+	defer resp.Body.Close()
+	body, _ := io.ReadAll(io.LimitReader(resp.Body, 64<<10))
+	// Uptime Kuma serves an app shell with this title / marker.
+	if b := strings.ToLower(string(body)); strings.Contains(b, "uptime kuma") || strings.Contains(b, "uptimekuma") {
+		return "kuma"
+	}
+	return "other"
+}
+
+func kumaContainerState() string { // "running" | "stopped" | "" (absent)
+	if !haveExec("docker") {
+		return ""
+	}
+	out, err := exec.Command("docker", "ps", "-a", "--filter", "name=^/"+kumaContainer+"$",
+		"--format", "{{.State}}").Output()
+	if err != nil {
+		return ""
+	}
+	return strings.TrimSpace(string(out))
+}
+
+// kumaPreflight fails fast (before any funnel mount) if Kuma can't be brought
+// up at all — nothing running and no way to start it.
+func kumaPreflight(c *config) error {
+	switch kumaAlive(c.KumaPort) {
+	case "kuma":
+		return nil
+	case "other":
+		return fmt.Errorf("port %d is serving something that isn't Uptime Kuma — set --kuma-port or stop it", c.KumaPort)
+	}
+	if haveExec("docker") {
+		return nil // we can start the container
+	}
+	return errors.New("Uptime Kuma isn't running and Docker isn't installed.\n" +
+		"      set it up (recommended):  tshare kuma install\n" +
+		"      …or start Uptime Kuma yourself (any way) on :3001 and re-run: tshare kuma")
+}
+
+// ensureKuma makes Uptime Kuma answer on its port, reusing a running instance
+// or starting the persistent Docker container. It does not track the process —
+// Kuma is meant to stay up (restart=always) even after this share stops.
+func ensureKuma(s *share) error {
+	c := s.cfg
+	if kumaAlive(c.KumaPort) == "kuma" {
+		if !c.Quiet {
+			log.Printf("  ▷ reusing Uptime Kuma already running on :%d", c.KumaPort)
+		}
+		return nil
+	}
+	if !haveExec("docker") {
+		return errors.New("Uptime Kuma isn't running — start it, or: tshare kuma install (needs Docker)")
+	}
+	switch kumaContainerState() {
+	case "running":
+		// container up but not answering yet — just wait below
+	case "exited", "created", "paused", "stopped":
+		if out, err := exec.Command("docker", "start", kumaContainer).CombinedOutput(); err != nil {
+			return fmt.Errorf("docker start %s: %s", kumaContainer, strings.TrimSpace(string(out)))
+		}
+		if !c.Quiet {
+			log.Printf("  ▷ started existing Uptime Kuma container")
+		}
+	default: // absent → create a persistent one
+		if !c.Quiet {
+			log.Printf("  ⇣ starting Uptime Kuma (docker %s, persistent) …", kumaImage)
+		}
+		args := []string{"run", "-d", "--restart=always",
+			"-p", fmt.Sprintf("%d:3001", c.KumaPort),
+			"-v", kumaContainer + ":/app/data", "--name", kumaContainer, kumaImage}
+		if out, err := exec.Command("docker", args...).CombinedOutput(); err != nil {
+			return fmt.Errorf("docker run uptime-kuma: %s", strings.TrimSpace(string(out)))
+		}
+	}
+	deadline := time.Now().Add(90 * time.Second) // first boot pulls the image + inits the DB
+	for time.Now().Before(deadline) {
+		if kumaAlive(c.KumaPort) == "kuma" {
+			if !c.Quiet {
+				log.Printf("  ▷ Uptime Kuma up on :%d", c.KumaPort)
+			}
+			return nil
+		}
+		time.Sleep(1 * time.Second)
+	}
+	return fmt.Errorf("Uptime Kuma didn't become healthy on :%d within 90s (docker logs %s)", c.KumaPort, kumaContainer)
+}
+
+// cmdKuma: `tshare kuma [install|status]`, else run+expose (an alias for
+// `tshare --kuma`, accepting the usual share flags).
+func cmdKuma(args []string) {
+	sub := ""
+	if len(args) > 0 {
+		sub = args[0]
+	}
+	switch sub {
+	case "install", "setup":
+		kumaInstall()
+	case "status":
+		kumaStatus()
+	default:
+		c := defaultConfig()
+		applyConfig(c, args)
+		if err := parseArgs(args, c); err != nil {
+			os.Exit(2)
+		}
+		c.Kuma, c.Paths = true, nil
+		if err := runShare(c); err != nil {
+			log.Fatalf("tshare: %v", err)
+		}
+	}
+}
+
+func kumaInstall() {
+	if !haveExec("docker") {
+		fmt.Println("  Uptime Kuma's simplest deploy is Docker — tshare bundles nothing:")
+		fmt.Println("      brew install --cask docker      (then open Docker.app once to start the engine)")
+		fmt.Println("  once Docker is running:  tshare kuma install   (pre-pulls the image)")
+		fmt.Println("  or run Uptime Kuma any other way on :3001 and just:  tshare kuma")
+		return
+	}
+	fmt.Printf("  ⇣ docker pull %s …\n", kumaImage)
+	cmd := exec.Command("docker", "pull", kumaImage)
+	cmd.Stdout, cmd.Stderr = os.Stderr, os.Stderr
+	if err := cmd.Run(); err != nil {
+		log.Fatalf("tshare: docker pull failed: %v", err)
+	}
+	fmt.Println("\n  ✓ ready. start + expose it:  tshare kuma")
+	fmt.Println("  (first run creates a persistent container + volume; set your admin login in the browser)")
+}
+
+func kumaStatus() {
+	fmt.Printf("  docker:     %v\n", haveExec("docker"))
+	if st := kumaContainerState(); st != "" {
+		fmt.Printf("  container:  %s (%s)\n", kumaContainer, st)
+	} else if haveExec("docker") {
+		fmt.Printf("  container:  none (tshare kuma will create one)\n")
+	}
+	state := kumaAlive(3001)
+	if state == "" {
+		state = "not running"
+	}
+	fmt.Printf("  port 3001:  %s\n", state)
+}
+
+func (s *share) renderKuma(w *respRec) {
+	if w.status != 0 {
+		return
+	}
+	w.Header().Set("Content-Type", "text/html; charset=utf-8")
+	data := map[string]any{"URL": s.kumaURL, "Abuse": s.abuseHTML()}
+	if err := kumaTmpl.Execute(w, data); err != nil && !s.cfg.Quiet {
+		log.Printf("template: %v", err)
+	}
+}
+
+
+// ---------------------------------------------------------------------------
 // local MiroTalk engine (--room without --mirotalk-url)
 //
 // One-time setup: `tshare room install` clones github.com/miroslavpejic85/mirotalk
@@ -5528,7 +5784,7 @@ func startLocalMirotalk(s *share) error {
 func defaultConfig() *config {
 	return &config{TokenLen: 16, HTTPSPort: 443, MaxUpload: "5G", MinFree: "32G", CQ: 50,
 		RarSize:      "1400M",
-		MirotalkPort: 3000,
+		MirotalkPort: 3000, KumaPort: 3001,
 		STUN:         "stun:stun.l.google.com:19302,stun:stun.cloudflare.com:3478",
 		Copy:         true, LAN: true, Password: os.Getenv("TSHARE_PASSWORD")}
 }

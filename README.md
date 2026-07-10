@@ -156,6 +156,17 @@ The landing page has a **Join call** button and an optional display-name field; 
 
 `--mirotalk-url https://meet.mycorp.com` still points at a remote self-hosted instance instead; `tshare room status` shows what's installed/running. Caveats: MiroTalk needs the funnel **root** path (it's mounted at `/`, coexisting with token-path shares), and expiry/revocation gates *new* visitors — people already in the room hold the room URL.
 
+## Uptime Kuma monitor (`tshare kuma`)
+
+Expose your [Uptime Kuma](https://github.com/louislam/uptime-kuma) status monitor over the funnel with one command:
+
+```sh
+tshare kuma install    # once: pre-pull the Docker image (or get told how to install Docker)
+tshare kuma            # reuse/start Uptime Kuma and expose it; prints the token-gated link
+```
+
+Uptime Kuma is a **persistent** service, so tshare treats it that way: `tshare kuma` reuses an instance already listening on `:3001`, or starts the official Docker container (`docker run -d --restart=always -v uptime-kuma:/app/data …` — your monitors and history live in the volume) and **leaves it running** when the share stops. It's mounted at the funnel **root** because Uptime Kuma [can't run under a sub-path](https://github.com/louislam/uptime-kuma/wiki/Reverse-Proxy); the `/<token>/` link is a small landing page with an **Open dashboard →** button (`?go=1` jumps straight there). Auth is Uptime Kuma's own login — set the admin account on first run. tshare bundles nothing: no Docker → it points you at `brew install --cask docker`, or run Uptime Kuma however you like on `:3001` and `tshare kuma` will just expose it (use `--kuma-port` if it's elsewhere or `:3001` is taken). `tshare kuma status` shows the container/port state.
+
 ## ⚡ P2P direct transfers (`--p2p`) and built-in calls (`--call`)
 
 `--p2p` on a single-file share adds a **browser-to-browser WebRTC DataChannel** path: the visitor clicks *⚡ Direct P2P download* and the bytes flow straight from your machine to theirs — **skipping the funnel relay entirely** when the STUN hole-punch succeeds (most home NATs and many CGNATs, since Funnel-relayed HTTPS is bandwidth-capped while a direct UDP path runs at line speed). The normal HTTPS download stays one click away as the fallback, so nothing can get *slower* by adding `--p2p`.
