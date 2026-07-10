@@ -80,6 +80,8 @@ Emergency stop: `tshare panic` SIGKILLs **every** running share, tears down all 
 
 Reach: a normal share is reachable three ways at once — the **public internet** (Funnel), your **tailnet** (same `https://<host>.ts.net/<token>` URL, since Funnel is built on Serve), and your **local network** directly at `http://<lan-ip>:<port>/<token>` (printed as the `lan` line — faster, no internet round-trip). The LAN URL is gated by the same secret token; a direct hit without it 404s. Use `-t` for tailnet-only, `--no-lan` to drop the LAN path, or `-l/--local` for LAN-only with no Tailscale at all.
 
+Public-DNS caveat: a Funnel link is only *actually* public if `<host>.ts.net` resolves on the **public internet** — occasionally Tailscale reports Funnel "on" (cert + attribute present) but hasn't published the DNS record, so links silently work on your tailnet and NXDOMAIN for everyone else. tshare now checks this: `tshare doctor` reports "funnel DNS resolves publicly", and a share warns at startup if its link won't resolve off-tailnet. The fix is Tailscale-side — re-publish with `tailscale funnel reset && tailscale up`, and confirm HTTPS + Funnel are on in the admin console.
+
 Media: images, video and audio open in a clean, full-size player page (iOS-friendly — `playsinline`, correct MIME types, byte-range streaming, no quirk-mode mini frame). The raw stream lives at `?raw=1`, `?dl=1` forces download, and folder pages have a ⬇ per row. `--inline` forces in-browser viewing for every type. Non-browser clients (curl, wget) always get the bytes, never the player HTML.
 
 Receiving end needs nothing but a browser or curl:
