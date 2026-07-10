@@ -72,6 +72,10 @@ USAGE
   tshare -u [dir]                     inbox: link where others UPLOAD to you
   tshare -i                           blackhole inbox: accept & count uploads, keep nothing
   tshare --hub [dir]                  homescreen-style 2-way remote: upload + grab URLs + browse
+  tshare run [--port N] -- <cmd…>     launch any server (auto-detect its port) & expose it
+  tshare host [dir]                   auto-detect the stack in a folder & host it (node/py/docker/php/static)
+  tshare tmux                         list servers running in the shared 'tshare' tmux session
+  tshare agent install                run 'tshare resume' at login (macOS LaunchAgent; brew-service-ready)
   tshare --rar --p2p big.mkv          split into 1.4 GB RAR volumes → per-part ⚡ P2P
   tshare --room [name]                video-room link (local MiroTalk, auto-started)
   tshare room install                 one-time: install MiroTalk locally from GitHub
@@ -218,6 +222,24 @@ FOLDER ENGINE
   -s, --server            reverse-proxy a running server URL over the funnel
                           (auto for localhost URLs; rewrites Host, passes
                           WebSockets; use relative asset paths under /<token>/)
+      --tmux              launch managed servers (run/host/room) as windows of one
+                          'tshare' tmux session (attach: tmux attach -t tshare;
+                          list: tshare tmux) instead of piped child processes
+      --dir <path>        working directory for 'tshare run' (else current dir)
+
+ONE-STOP HOSTING (launch a local server and expose it over the funnel)
+  tshare run [flags] -- <command…>   run any command that serves on a port; the
+                          port is AUTO-DETECTED (or pin the upstream with --port),
+                          then reverse-proxied. e.g.
+                            tshare run -- npm start
+                            tshare run --port 8000 -- python3 -m http.server 8000
+  tshare host [dir]       detect the stack in a folder (package.json→node,
+                          compose.yml→docker, app.py/manage.py→python, index.php→php,
+                          index.html→static) and host it. Missing runtime? it
+                          suggests the brew install — tshare bundles nothing.
+  tshare agent install [-- args]   macOS LaunchAgent running 'tshare resume' at
+                          login (or your own command). --print to just emit the
+                          plist. Shaped for 'brew services start tshare' later.
 
 MEDIA TRANSFORMS (need ffmpeg / sips / imagemagick on PATH)
       --transcode         re-encode video to a clean, streamable MP4
@@ -333,6 +355,14 @@ type config struct {
 	// hub (--hub): homescreen-style 2-way remote page — upload, grab URLs,
 	// browse/manage the hub folder, from a phone or any browser
 	Hub bool
+
+	// run/host (managed local server exposed over the funnel): launch a command
+	// that serves on a port, auto-detect the port, reverse-proxy it. `tshare run`
+	// and `tshare host <dir>` populate these; MiroTalk (--room) reuses the engine.
+	RunCmd  []string // command + args to launch (empty = not a run share)
+	RunDir  string   // working directory for the command
+	RunName string   // display / tmux window name
+	Tmux    bool     // --tmux: launch managed servers as windows of one 'tshare' tmux session
 
 	// --rar: split the share into RAR volumes before serving (transfer
 	// chunking — e.g. so each part fits an iPhone's in-memory P2P receive)
@@ -458,6 +488,8 @@ func registerFlags(fs *flag.FlagSet, c *config) {
 	fs.BoolVar(&c.P2P, "p2pi", c.P2P, "") // common typo/alias
 	fs.BoolVar(&c.Call, "call", c.Call, "")
 	fs.BoolVar(&c.Hub, "hub", c.Hub, "")
+	fs.BoolVar(&c.Tmux, "tmux", c.Tmux, "")
+	fs.StringVar(&c.RunDir, "dir", c.RunDir, "") // working dir for `tshare run`/`host`
 	fs.BoolVar(&c.Rar, "rar", c.Rar, "")
 	fs.StringVar(&c.RarSize, "rar-size", c.RarSize, "")
 	fs.StringVar(&c.STUN, "stun", c.STUN, "")
@@ -679,6 +711,18 @@ func main() {
 		case "room":
 			cmdRoom(args[1:])
 			return
+		case "run":
+			cmdRun(args[1:])
+			return
+		case "host":
+			cmdHost(args[1:])
+			return
+		case "agent", "service":
+			cmdAgent(args[1:])
+			return
+		case "tmux":
+			cmdTmux(args[1:])
+			return
 		case "template", "templates":
 			cmdTemplate(args[1:])
 			return
@@ -703,11 +747,7 @@ func main() {
 		}
 	}
 
-	c := &config{TokenLen: 16, HTTPSPort: 443, MaxUpload: "5G", MinFree: "32G", CQ: 50,
-		RarSize:      "1400M",
-		MirotalkPort: 3000,
-		STUN:         "stun:stun.l.google.com:19302,stun:stun.cloudflare.com:3478",
-		Copy:         true, LAN: true, Password: os.Getenv("TSHARE_PASSWORD")}
+	c := defaultConfig()
 	// config file (#71): defaults < config file/profile < CLI flags
 	applyConfig(c, args)
 	if err := parseArgs(args, c); err != nil {
@@ -798,8 +838,9 @@ type share struct {
 	roomName      string    // --room: MiroTalk room id
 	roomURL       string    // --room: full MiroTalk join URL
 	roomLocal     bool      // --room: using the local MiroTalk install
-	mtCmd         *exec.Cmd // local MiroTalk child we spawned (nil if reusing/remote)
 	mtRootMounted bool      // we mounted the funnel/serve ROOT path → unmount on exit
+
+	procs []*serverProc // managed local servers we launched (run/host/room) — stopped on exit
 
 	senderKey string  // --p2p: secret that authenticates the local sender tab
 	hub       *rtcHub // --p2p / --call: in-memory WebRTC signaling relay
@@ -906,13 +947,17 @@ func runShare(c *config) error {
 	}
 
 	// resolve targets
-	oneInput := !c.Upload && !c.Blackhole && !c.Room && !c.Call && !c.Hub && len(c.Paths) == 1
+	oneInput := !c.Upload && !c.Blackhole && !c.Room && !c.Call && !c.Hub && len(c.RunCmd) == 0 && len(c.Paths) == 1
 	// -s, or a localhost URL ("automatically if it is not a website"), means
 	// reverse-proxy a running server rather than download it.
 	serverMode := oneInput && looksLikeURL(c.Paths[0]) && (c.Server || isLocalServerURL(c.Paths[0]))
 	fetchMode := oneInput && c.Fetch && !serverMode && looksLikeURL(c.Paths[0])
 	ytMode := oneInput && !c.Fetch && !serverMode && (c.YtDlp || looksLikeURL(c.Paths[0]))
 	switch {
+	case len(c.RunCmd) > 0:
+		if err := setupRun(c, s); err != nil {
+			return err
+		}
 	case serverMode:
 		if err := setupServer(c, s); err != nil {
 			return err
@@ -1374,7 +1419,9 @@ func runShare(c *config) error {
 		if s.mtRootMounted {
 			tsUnmount(c, "") // root path we mounted for local MiroTalk
 		}
-		stopMirotalk(s)
+		for _, p := range s.procs { // stop every managed server (run/host/room)
+			p.stop()
+		}
 	}
 	defer cleanup()
 
@@ -3991,10 +4038,17 @@ type stateRec struct {
 	Uploads   int64     `json:"uploads"`
 	Created   time.Time `json:"created"`
 	Expires   time.Time `json:"expires,omitempty"`
-	MTPid     int       `json:"mirotalk_pid,omitempty"`   // local MiroTalk child we own
+	Procs     []procRec `json:"procs,omitempty"`          // managed servers we own (run/host/room) → reap on rm/panic
 	RootMount bool      `json:"root_mount,omitempty"`     // we hold the funnel/serve root path
 	GameJoin  string    `json:"game_join,omitempty"`      // --gamelink: the JOIN link (child's live session id)
 	GameHost  string    `json:"game_host,omitempty"`      // --gamelink: the auto-host (#gnhost) link
+}
+
+// procRec is how a managed server is recorded in the share state so another
+// process (tshare rm / panic) can reap it: a process-group pid, or a tmux window.
+type procRec struct {
+	Pid  int    `json:"pid,omitempty"`
+	Tmux string `json:"tmux,omitempty"`
 }
 
 func stateDir() string {
@@ -4011,9 +4065,9 @@ func stateFile(id string) string { return filepath.Join(stateDir(), id+".json") 
 
 func (s *share) stateRec(port int) stateRec {
 	target := s.describe()
-	mtPid := 0
-	if s.mtCmd != nil && s.mtCmd.Process != nil {
-		mtPid = s.mtCmd.Process.Pid
+	var procs []procRec
+	for _, p := range s.procs {
+		procs = append(procs, procRec{Pid: p.pid(), Tmux: p.tmuxWin})
 	}
 	gameJoin, gameHost := s.gameLinks()
 	return stateRec{
@@ -4022,7 +4076,7 @@ func (s *share) stateRec(port int) stateRec {
 		HTTPSPort: s.cfg.HTTPSPort, Port: port, Password: s.getPassword() != "",
 		MaxDL: s.maxDL.Load(), Downloads: s.dl.Load(), Uploads: s.upCount.Load(),
 		Created: s.createdAt, Expires: s.getExpires(),
-		MTPid: mtPid, RootMount: s.mtRootMounted,
+		Procs: procs, RootMount: s.mtRootMounted,
 		GameJoin: gameJoin, GameHost: gameHost,
 	}
 }
@@ -4312,9 +4366,9 @@ func cmdRm(args []string) {
 			}
 		}
 		// belt & braces: remove funnel mount + state even if process is gone;
-		// reap an owned MiroTalk child if the share died without cleanup.
-		if r.MTPid > 0 && !pidAlive(r.PID) && pidAlive(r.MTPid) {
-			syscall.Kill(-r.MTPid, syscall.SIGTERM)
+		// reap owned managed servers (run/host/room) if the share died uncleanly.
+		if !pidAlive(r.PID) {
+			reapProcs(r.Procs, syscall.SIGTERM)
 		}
 		if !r.Local {
 			c := &config{Tailnet: r.Tailnet, HTTPSPort: r.HTTPSPort}
@@ -4331,6 +4385,18 @@ func cmdRm(args []string) {
 	}
 }
 
+// reapProcs stops managed servers recorded in a share's state: kill each
+// process group with sig, or kill the tmux window (which ends its process too).
+func reapProcs(procs []procRec, sig syscall.Signal) {
+	for _, p := range procs {
+		if p.Tmux != "" {
+			exec.Command("tmux", "kill-window", "-t", p.Tmux).Run()
+		} else if p.Pid > 0 && pidAlive(p.Pid) {
+			syscall.Kill(-p.Pid, sig)
+		}
+	}
+}
+
 // cmdPanic is the big red button: kill every share NOW (SIGKILL, no graceful
 // drain), tear down every funnel mount, and wipe all local state — share
 // records, resume/persist records and control sockets — so no token survives.
@@ -4340,11 +4406,9 @@ func cmdPanic() {
 		if pidAlive(r.PID) {
 			syscall.Kill(r.PID, syscall.SIGKILL) // no waiting — this is a panic
 		}
-		// SIGKILL means the share's own cleanup never ran: reap the local
-		// MiroTalk child (whole process group) and the funnel ROOT mount too.
-		if r.MTPid > 0 {
-			syscall.Kill(-r.MTPid, syscall.SIGKILL)
-		}
+		// SIGKILL means the share's own cleanup never ran: reap owned managed
+		// servers (process groups / tmux windows) and the funnel ROOT mount too.
+		reapProcs(r.Procs, syscall.SIGKILL)
 		if !r.Local {
 			tsUnmount(&config{Tailnet: r.Tailnet, HTTPSPort: r.HTTPSPort}, r.Token)
 			if r.RootMount {
@@ -5436,60 +5500,391 @@ func startLocalMirotalk(s *share) error {
 		return nil
 	}
 	method := mirotalkMethod(c, dir)
-	logPath := filepath.Join(filepath.Dir(dir), "mirotalk.log")
-	logf, err := os.Create(logPath)
-	if err != nil {
-		logf = nil
-	}
-	var cmd *exec.Cmd
+	var argv []string
 	if method == "docker" {
-		// foreground `up` (not -d): the compose child is ours, SIGTERM stops the
-		// containers with it — same ownership model as the npm route.
-		cmd = exec.Command("docker", "compose", "up")
+		argv = []string{"docker", "compose", "up"} // foreground up: ours to SIGTERM
 	} else {
-		cmd = exec.Command("npm", "start")
+		argv = []string{"npm", "start"}
 	}
-	cmd.Dir = dir
-	cmd.Env = append(os.Environ(), "NODE_ENV=production", fmt.Sprintf("PORT=%d", c.MirotalkPort))
-	if logf != nil {
-		cmd.Stdout, cmd.Stderr = logf, logf
+	// reuse the shared managed-server engine (tmux/child + health + stop)
+	p, err := s.launchServer("mirotalk-"+s.id, dir, []string{"NODE_ENV=production"}, argv, c.MirotalkPort)
+	if err != nil {
+		return err
 	}
-	cmd.SysProcAttr = &syscall.SysProcAttr{Setpgid: true} // npm/compose spawn children — kill the group
-	if err := cmd.Start(); err != nil {
-		return fmt.Errorf("starting mirotalk (%s): %w", method, err)
-	}
-	s.mtCmd = cmd
-	deadline := time.Now().Add(60 * time.Second)
-	for time.Now().Before(deadline) {
-		if mirotalkAlive(c.MirotalkPort) == "mirotalk" {
-			if !c.Quiet {
-				log.Printf("  ▷ local MiroTalk up on :%d (%s, pid %d, log %s)", c.MirotalkPort, method, cmd.Process.Pid, logPath)
-			}
-			return nil
+	s.procs = append(s.procs, p)
+	if !c.Quiet {
+		where := "log " + p.logPath
+		if p.tmuxWin != "" {
+			where = "tmux attach -t " + tmuxSession + " (window " + p.name + ")"
 		}
-		time.Sleep(500 * time.Millisecond)
+		log.Printf("  ▷ local MiroTalk up on :%d (%s, %s)", c.MirotalkPort, method, where)
 	}
-	stopMirotalk(s)
-	return fmt.Errorf("mirotalk did not become healthy on :%d within 60s — see %s", c.MirotalkPort, logPath)
-}
-
-func stopMirotalk(s *share) {
-	if s.mtCmd == nil || s.mtCmd.Process == nil {
-		return
-	}
-	pid := s.mtCmd.Process.Pid
-	syscall.Kill(-pid, syscall.SIGTERM) // whole process group (npm→node, compose→containers)
-	done := make(chan struct{})
-	go func() { s.mtCmd.Wait(); close(done) }()
-	select {
-	case <-done:
-	case <-time.After(8 * time.Second):
-		syscall.Kill(-pid, syscall.SIGKILL)
-	}
-	s.mtCmd = nil
+	return nil
 }
 
 // cmdRoom implements `tshare room install|status` — the one-time local setup.
+// defaultConfig is the base config (defaults) shared by the top-level share
+// path and the run/host subcommands, so there's one source of truth.
+func defaultConfig() *config {
+	return &config{TokenLen: 16, HTTPSPort: 443, MaxUpload: "5G", MinFree: "32G", CQ: 50,
+		RarSize:      "1400M",
+		MirotalkPort: 3000,
+		STUN:         "stun:stun.l.google.com:19302,stun:stun.cloudflare.com:3478",
+		Copy:         true, LAN: true, Password: os.Getenv("TSHARE_PASSWORD")}
+}
+
+// splitRunArgs separates share flags from the command to run. Everything after
+// a literal "--" is the command; otherwise the first non-flag token and the
+// rest are the command (so `tshare run --port 3000 node app.js` works too).
+func splitRunArgs(args []string) (flags, cmd []string) {
+	for i, a := range args {
+		if a == "--" {
+			return args[:i], args[i+1:]
+		}
+	}
+	// no "--": walk flags, stop at the first bare token that isn't a flag value
+	i := 0
+	for i < len(args) {
+		a := args[i]
+		if !strings.HasPrefix(a, "-") {
+			return args[:i], args[i:]
+		}
+		i++
+		// a known value-taking flag consumes the next token
+		if runValueFlag(a) && i < len(args) && !strings.HasPrefix(args[i], "-") {
+			i++
+		}
+	}
+	return args, nil
+}
+
+func runValueFlag(f string) bool {
+	switch strings.TrimLeft(f, "-") {
+	case "port", "p", "password", "e", "expires", "name", "n", "max", "https-port",
+		"max-rate", "max-bytes", "min-free", "dir", "abuse-contact", "profile", "template":
+		return true
+	}
+	return false
+}
+
+// cmdRun: launch any command that serves on a port and expose it over the funnel.
+//   tshare run --port 3000 -- npm start
+//   tshare run -- python3 -m http.server 8000
+func cmdRun(args []string) {
+	flags, cmd := splitRunArgs(args)
+	c := defaultConfig()
+	applyConfig(c, flags)
+	if err := parseArgs(flags, c); err != nil {
+		os.Exit(2)
+	}
+	if len(cmd) == 0 && len(c.Paths) > 0 { // command landed in positionals
+		cmd, c.Paths = c.Paths, nil
+	}
+	if len(cmd) == 0 {
+		log.Fatal("usage: tshare run [flags] -- <command…>\n" +
+			"  e.g. tshare run --port 3000 -- npm start\n" +
+			"       tshare run -- python3 -m http.server 8000   (port auto-detected)")
+	}
+	c.RunCmd = cmd
+	if err := runShare(c); err != nil {
+		log.Fatalf("tshare: %v", err)
+	}
+}
+
+// detectStack maps a project folder to a start command, best-effort, for the
+// one-stop `tshare host <dir>`. Bundles nothing — if the runtime is missing,
+// launchServer reports a brew-install suggestion.
+func detectStack(dir string) (cmd []string, kind string) {
+	has := func(f string) bool { return fileExists(filepath.Join(dir, f)) }
+	switch {
+	case has("package.json"):
+		// honor an explicit "start" script; else fall back to a common entry
+		if b, err := os.ReadFile(filepath.Join(dir, "package.json")); err == nil &&
+			regexp.MustCompile(`"scripts"\s*:\s*{[^}]*"start"\s*:`).Match(b) {
+			return []string{"npm", "start"}, "node (npm start)"
+		}
+		for _, e := range []string{"server.js", "index.js", "app.js", "main.js"} {
+			if has(e) {
+				return []string{"node", e}, "node (" + e + ")"
+			}
+		}
+		return []string{"npm", "start"}, "node (npm start)"
+	case has("compose.yaml") || has("compose.yml") || has("docker-compose.yml") || has("docker-compose.yaml"):
+		return []string{"docker", "compose", "up"}, "docker compose"
+	case has("app.py"), has("wsgi.py"), has("manage.py"):
+		if has("manage.py") {
+			return []string{"python3", "manage.py", "runserver", "0.0.0.0:8000"}, "django"
+		}
+		return []string{"python3", filepath.Base(firstExisting(dir, "app.py", "wsgi.py"))}, "python"
+	case has("requirements.txt") && has("main.py"):
+		return []string{"python3", "main.py"}, "python"
+	case has("index.php"):
+		return []string{"php", "-S", "0.0.0.0:8080", "-t", "."}, "php"
+	case has("Gemfile") && has("config.ru"):
+		return []string{"bundle", "exec", "rackup", "-o", "0.0.0.0"}, "ruby (rack)"
+	case has("index.html"):
+		return nil, "static" // handled by --site, not a launched server
+	}
+	return nil, ""
+}
+
+func firstExisting(dir string, names ...string) string {
+	for _, n := range names {
+		if fileExists(filepath.Join(dir, n)) {
+			return n
+		}
+	}
+	return names[0]
+}
+
+// cmdHost: the one-stop "just host this folder" — auto-detect the stack and run
+// it (static folders route to --site; everything else to the run engine).
+func cmdHost(args []string) {
+	// a non-flag arg that names an existing directory is the target dir
+	dir := "."
+	var rest []string
+	for _, a := range args {
+		if fi, err := os.Stat(a); !strings.HasPrefix(a, "-") && err == nil && fi.IsDir() {
+			dir = a
+		} else {
+			rest = append(rest, a)
+		}
+	}
+	abs, err := filepath.Abs(dir)
+	if err != nil {
+		log.Fatalf("tshare: %v", err)
+	}
+	cmd, kind := detectStack(abs)
+	if kind == "" {
+		log.Fatalf("tshare host: couldn't detect a stack in %s\n"+
+			"  (looked for package.json / compose.yml / app.py / index.php / index.html)\n"+
+			"  run it explicitly:  tshare run --dir %s -- <start command>", abs, abs)
+	}
+	fmt.Fprintf(os.Stderr, "  ⓘ detected %s in %s\n", kind, abs)
+	c := defaultConfig()
+	applyConfig(c, rest)
+	if err := parseArgs(rest, c); err != nil {
+		os.Exit(2)
+	}
+	c.Paths = nil
+	if kind == "static" { // a plain site — use the existing static engine
+		c.Site = true
+		c.Paths = []string{abs}
+	} else {
+		c.RunCmd = cmd
+		c.RunDir = abs
+		c.RunName = "host-" + sanitizeRoomName(filepath.Base(abs))
+	}
+	if err := runShare(c); err != nil {
+		log.Fatalf("tshare: %v", err)
+	}
+}
+
+// cmdTmux lists the managed servers running in the shared 'tshare' tmux session
+// (the "backgrounded sessions in one square") and how to attach.
+func cmdTmux(args []string) {
+	if !haveExec("tmux") {
+		fmt.Println("tmux not installed (brew install tmux). Servers run as child processes without --tmux.")
+		return
+	}
+	out, err := exec.Command("tmux", "list-windows", "-t", tmuxSession,
+		"-F", "#{window_index}: #{window_name}  [#{pane_current_command}]  #{?window_active,(active),}").CombinedOutput()
+	if err != nil {
+		fmt.Println("no tshare tmux session — start a server with --tmux (e.g. tshare --tmux --room, or tshare run --tmux -- npm start)")
+		return
+	}
+	fmt.Printf("  tmux session %q — attach with:  tmux attach -t %s\n\n", tmuxSession, tmuxSession)
+	fmt.Print(string(out))
+}
+
+
+// ---------------------------------------------------------------------------
+// tshare agent: a macOS LaunchAgent that runs tshare at login (default: `tshare
+// resume`), shaped like what a Homebrew `service` block generates so it can be
+// managed by `brew services` later.
+
+const agentLabel = "com.tshare.agent"
+
+func agentPlistPath() string {
+	home, _ := os.UserHomeDir()
+	return filepath.Join(home, "Library", "LaunchAgents", agentLabel+".plist")
+}
+
+func cmdAgent(args []string) {
+	if runtime.GOOS != "darwin" {
+		fmt.Println("tshare agent is macOS (launchd) only.")
+		fmt.Println("On Linux use a systemd --user unit, e.g.:")
+		fmt.Println("  systemd-run --user --unit tshare --collect $(command -v tshare) resume")
+		return
+	}
+	sub := ""
+	if len(args) > 0 {
+		sub = args[0]
+	}
+	switch sub {
+	case "install", "setup", "":
+		agentInstall(args[1:])
+	case "uninstall", "rm", "remove":
+		agentUninstall()
+	case "status":
+		agentStatus()
+	default:
+		fmt.Println("usage: tshare agent install [-- <tshare args>]   (default: run `tshare resume` at login)")
+		fmt.Println("       tshare agent uninstall")
+		fmt.Println("       tshare agent status")
+	}
+}
+
+func agentInstall(args []string) {
+	print, noLoad, keepAlive, keepSet := false, false, false, false
+	var runArgs []string
+	for i := 0; i < len(args); i++ {
+		switch args[i] {
+		case "--print":
+			print = true
+		case "--no-load":
+			noLoad = true
+		case "--keepalive":
+			keepAlive, keepSet = true, true
+		case "--":
+			runArgs = append(runArgs, args[i+1:]...)
+			i = len(args)
+		default:
+			runArgs = append(runArgs, args[i])
+		}
+	}
+	if len(runArgs) == 0 {
+		runArgs = []string{"resume"} // restart --persist'd shares at login
+	}
+	if !keepSet { // long-running share commands should be restarted; `resume` is one-shot
+		keepAlive = runArgs[0] != "resume"
+	}
+	bin, err := os.Executable()
+	if err != nil || bin == "" {
+		bin, _ = exec.LookPath("tshare")
+	}
+	plist := agentPlist(agentLabel, bin, runArgs, keepAlive)
+	if print {
+		fmt.Print(plist)
+		return
+	}
+	path := agentPlistPath()
+	if err := os.MkdirAll(filepath.Dir(path), 0o755); err != nil {
+		log.Fatalf("tshare: %v", err)
+	}
+	if err := os.WriteFile(path, []byte(plist), 0o644); err != nil {
+		log.Fatalf("tshare: %v", err)
+	}
+	if out, err := exec.Command("plutil", "-lint", path).CombinedOutput(); err != nil {
+		log.Fatalf("tshare: generated plist failed validation: %s", strings.TrimSpace(string(out)))
+	}
+	fmt.Printf("  ✓ wrote %s\n", path)
+	fmt.Printf("    runs at login:  tshare %s   (KeepAlive=%v)\n", strings.Join(runArgs, " "), keepAlive)
+	if noLoad {
+		fmt.Printf("    load it yourself:  launchctl bootstrap gui/%d %s\n", os.Getuid(), path)
+		return
+	}
+	uid := strconv.Itoa(os.Getuid())
+	exec.Command("launchctl", "bootout", "gui/"+uid+"/"+agentLabel).Run() // ignore if not loaded
+	if out, err := exec.Command("launchctl", "bootstrap", "gui/"+uid, path).CombinedOutput(); err != nil {
+		// older macOS fallback
+		if out2, err2 := exec.Command("launchctl", "load", "-w", path).CombinedOutput(); err2 != nil {
+			fmt.Printf("  ⚠ plist written but launchctl load failed:\n    %s\n    %s\n",
+				strings.TrimSpace(string(out)), strings.TrimSpace(string(out2)))
+			return
+		}
+	}
+	fmt.Println("  ✓ loaded into launchd — it will run at every login")
+	fmt.Println("    later, if installed via brew:  brew services start tshare")
+}
+
+func agentUninstall() {
+	path := agentPlistPath()
+	uid := strconv.Itoa(os.Getuid())
+	exec.Command("launchctl", "bootout", "gui/"+uid+"/"+agentLabel).Run()
+	exec.Command("launchctl", "unload", "-w", path).Run() // belt & braces
+	if err := os.Remove(path); err != nil && !os.IsNotExist(err) {
+		log.Fatalf("tshare: %v", err)
+	}
+	fmt.Printf("  ✓ unloaded and removed %s\n", path)
+}
+
+func agentStatus() {
+	path := agentPlistPath()
+	if !fileExists(path) {
+		fmt.Println("no tshare agent installed (tshare agent install)")
+		return
+	}
+	fmt.Printf("  plist:  %s\n", path)
+	uid := strconv.Itoa(os.Getuid())
+	out, err := exec.Command("launchctl", "print", "gui/"+uid+"/"+agentLabel).CombinedOutput()
+	if err != nil {
+		fmt.Println("  state:  written but not loaded (tshare agent install to load)")
+		return
+	}
+	state := "loaded"
+	for _, line := range strings.Split(string(out), "\n") {
+		if strings.Contains(line, "state =") {
+			state = strings.TrimSpace(line)
+			break
+		}
+	}
+	fmt.Printf("  state:  %s\n", state)
+}
+
+func agentPlist(label, bin string, argv []string, keepAlive bool) string {
+	home, _ := os.UserHomeDir()
+	logPath := filepath.Join(home, ".tshare", "logs", "agent.log")
+	os.MkdirAll(filepath.Dir(logPath), 0o755)
+	// login shells get a fuller PATH than launchd's default, so tailscale/node/
+	// tmux resolve — include the common Homebrew + system locations.
+	pathEnv := "/opt/homebrew/bin:/opt/homebrew/sbin:/usr/local/bin:/usr/bin:/bin:/usr/sbin:/sbin"
+	var pa strings.Builder
+	pa.WriteString("\t\t<string>" + xmlEsc(bin) + "</string>\n")
+	for _, a := range argv {
+		pa.WriteString("\t\t<string>" + xmlEsc(a) + "</string>\n")
+	}
+	ka := "<false/>"
+	if keepAlive {
+		ka = "<true/>"
+	}
+	return fmt.Sprintf(`<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+	<key>Label</key>
+	<string>%s</string>
+	<key>ProgramArguments</key>
+	<array>
+%s	</array>
+	<key>RunAtLoad</key>
+	<true/>
+	<key>KeepAlive</key>
+	%s
+	<key>WorkingDirectory</key>
+	<string>%s</string>
+	<key>EnvironmentVariables</key>
+	<dict>
+		<key>PATH</key>
+		<string>%s</string>
+	</dict>
+	<key>StandardOutPath</key>
+	<string>%s</string>
+	<key>StandardErrorPath</key>
+	<string>%s</string>
+	<key>ProcessType</key>
+	<string>Background</string>
+</dict>
+</plist>
+`, xmlEsc(label), pa.String(), ka, xmlEsc(home), xmlEsc(pathEnv), xmlEsc(logPath), xmlEsc(logPath))
+}
+
+func xmlEsc(s string) string {
+	r := strings.NewReplacer("&", "&amp;", "<", "&lt;", ">", "&gt;")
+	return r.Replace(s)
+}
+
+
 func cmdRoom(args []string) {
 	c := &config{MirotalkPort: 3000}
 	applyConfig(c, args)
@@ -6546,22 +6941,267 @@ func hostPort(u *url.URL) string {
 	return u.Hostname() + ":80"
 }
 
-func setupServer(c *config, s *share) error {
-	u, err := url.Parse(c.Paths[0])
-	if err != nil || (u.Scheme != "http" && u.Scheme != "https") || u.Host == "" {
-		return errors.New("-s needs an http(s) URL, e.g. tshare -s http://localhost:8000")
-	}
-	s.mode = "server"
-	s.srvURL = c.Paths[0]
-	s.roots = []rootEnt{{Name: u.Host, Abs: c.Paths[0]}} // placeholder for shared code
-	base := strings.TrimSuffix(u.Path, "/")
+// ---------------------------------------------------------------------------
+// managed servers: launch a local server (in tmux or as a child), wait for its
+// port, and reverse-proxy it over the funnel. Shared by `tshare run`, `tshare
+// host <dir>`, and --room (MiroTalk) so there's one launch/health/stop path.
 
-	s.srvProxy = &httputil.ReverseProxy{
+const tmuxSession = "tshare"
+
+// serverProc is a launched server tshare owns and must stop on share exit.
+type serverProc struct {
+	name    string
+	port    int
+	tmuxWin string    // "tshare:<name>" if launched in tmux; else ""
+	cmd     *exec.Cmd // child process (process group) if not tmux
+	logPath string
+}
+
+func (s *share) haveTmux() bool { return s.cfg.Tmux && haveExec("tmux") }
+
+// launchServer starts argv (in dir, with extra env) and returns once it is
+// listening on a TCP port. wantPort>0 uses that port (passed as $PORT and
+// health-checked); wantPort==0 auto-detects whatever port the process opens.
+func (s *share) launchServer(name, dir string, extraEnv, argv []string, wantPort int) (*serverProc, error) {
+	if len(argv) == 0 {
+		return nil, errors.New("no command to run")
+	}
+	if p, err := exec.LookPath(argv[0]); err == nil {
+		argv[0] = p
+	} else {
+		return nil, fmt.Errorf("%s not found on PATH — install it (e.g. brew install %s)", argv[0], brewSuggest(argv[0]))
+	}
+	if wantPort > 0 && portListening(wantPort) { // conflict: something already owns it
+		return nil, fmt.Errorf("port %d is already in use — free it or pick another (--port)", wantPort)
+	}
+	logDir := filepath.Join(filepath.Dir(stateDir()), "logs")
+	os.MkdirAll(logDir, 0o755)
+	p := &serverProc{name: name, port: wantPort, logPath: filepath.Join(logDir, "srv-"+name+".log")}
+	env := append([]string{}, extraEnv...)
+	if wantPort > 0 {
+		env = append(env, fmt.Sprintf("PORT=%d", wantPort))
+	}
+
+	if s.haveTmux() {
+		if err := tmuxLaunch(name, dir, env, argv, p.logPath); err != nil {
+			return nil, err
+		}
+		p.tmuxWin = tmuxSession + ":" + name
+	} else {
+		cmd := exec.Command(argv[0], argv[1:]...)
+		cmd.Dir = dir
+		cmd.Env = append(os.Environ(), env...)
+		if f, err := os.Create(p.logPath); err == nil {
+			cmd.Stdout, cmd.Stderr = f, f
+		}
+		cmd.SysProcAttr = &syscall.SysProcAttr{Setpgid: true} // spawns children → kill the group
+		if err := cmd.Start(); err != nil {
+			return nil, fmt.Errorf("starting %s: %w", name, err)
+		}
+		p.cmd = cmd
+	}
+
+	deadline := time.Now().Add(60 * time.Second)
+	for time.Now().Before(deadline) {
+		if wantPort > 0 {
+			if portListening(wantPort) {
+				return p, nil
+			}
+		} else if port := s.detectPort(p); port > 0 {
+			p.port = port
+			return p, nil
+		}
+		time.Sleep(400 * time.Millisecond)
+	}
+	p.stop()
+	return nil, fmt.Errorf("%s did not open a port within 60s — see %s", name, p.logPath)
+}
+
+func (p *serverProc) pid() int {
+	if p.cmd != nil && p.cmd.Process != nil {
+		return p.cmd.Process.Pid
+	}
+	return 0
+}
+
+func (p *serverProc) stop() {
+	if p == nil {
+		return
+	}
+	if p.tmuxWin != "" {
+		exec.Command("tmux", "kill-window", "-t", p.tmuxWin).Run()
+		return
+	}
+	if p.cmd != nil && p.cmd.Process != nil {
+		pid := p.cmd.Process.Pid
+		syscall.Kill(-pid, syscall.SIGTERM) // whole group (npm→node, compose→containers)
+		done := make(chan struct{})
+		go func() { p.cmd.Wait(); close(done) }()
+		select {
+		case <-done:
+		case <-time.After(8 * time.Second):
+			syscall.Kill(-pid, syscall.SIGKILL)
+		}
+	}
+}
+
+// detectPort finds a TCP port a process in this server's tree is listening on.
+func (s *share) detectPort(p *serverProc) int {
+	var pids []int
+	if p.cmd != nil && p.cmd.Process != nil {
+		pids = pgroupPids(p.cmd.Process.Pid)
+	} else if p.tmuxWin != "" {
+		if root := tmuxPanePid(p.tmuxWin); root > 0 {
+			pids = append([]int{root}, descendantPids(root, 0)...)
+		}
+	}
+	return listeningPortOf(pids)
+}
+
+func portListening(port int) bool {
+	c, err := net.DialTimeout("tcp", fmt.Sprintf("127.0.0.1:%d", port), 500*time.Millisecond)
+	if err != nil {
+		return false
+	}
+	c.Close()
+	return true
+}
+
+var lsofListenRe = regexp.MustCompile(`:(\d+) \(LISTEN\)`)
+
+// listeningPortOf returns the first TCP port any of pids is LISTENing on (lsof).
+func listeningPortOf(pids []int) int {
+	if len(pids) == 0 || !haveExec("lsof") {
+		return 0
+	}
+	out, err := exec.Command("lsof", "-nP", "-iTCP", "-sTCP:LISTEN", "-a", "-p", joinInts(pids, ",")).Output()
+	if err != nil {
+		return 0
+	}
+	for _, line := range strings.Split(string(out), "\n") {
+		if m := lsofListenRe.FindStringSubmatch(line); m != nil {
+			if n, _ := strconv.Atoi(m[1]); n > 0 {
+				return n
+			}
+		}
+	}
+	return 0
+}
+
+func pgroupPids(pgid int) []int {
+	out, _ := exec.Command("pgrep", "-g", strconv.Itoa(pgid)).Output()
+	return parsePids(out)
+}
+
+func descendantPids(pid, depth int) []int {
+	if depth > 6 {
+		return nil
+	}
+	out, _ := exec.Command("pgrep", "-P", strconv.Itoa(pid)).Output()
+	kids := parsePids(out)
+	all := append([]int{}, kids...)
+	for _, k := range kids {
+		all = append(all, descendantPids(k, depth+1)...)
+	}
+	return all
+}
+
+func tmuxPanePid(win string) int {
+	out, err := exec.Command("tmux", "list-panes", "-t", win, "-F", "#{pane_pid}").Output()
+	if err != nil {
+		return 0
+	}
+	if p := parsePids(out); len(p) > 0 {
+		return p[0]
+	}
+	return 0
+}
+
+func parsePids(b []byte) []int {
+	var out []int
+	for _, f := range strings.Fields(string(b)) {
+		if n, err := strconv.Atoi(f); err == nil {
+			out = append(out, n)
+		}
+	}
+	return out
+}
+
+func joinInts(xs []int, sep string) string {
+	var b strings.Builder
+	for i, x := range xs {
+		if i > 0 {
+			b.WriteString(sep)
+		}
+		b.WriteString(strconv.Itoa(x))
+	}
+	return b.String()
+}
+
+// tmuxLaunch runs argv (with env) as a window of the shared 'tshare' session,
+// creating the session if needed. The pane stays after the process exits
+// (remain-on-exit) so a crash is inspectable, and output is teed to logPath.
+func tmuxLaunch(name, dir string, env, argv []string, logPath string) error {
+	shellCmd := tmuxShellCmd(env, argv)
+	var cmd *exec.Cmd
+	if exec.Command("tmux", "has-session", "-t", tmuxSession).Run() == nil {
+		cmd = exec.Command("tmux", "new-window", "-t", tmuxSession, "-n", name, "-c", dir, shellCmd)
+	} else {
+		cmd = exec.Command("tmux", "new-session", "-d", "-s", tmuxSession, "-n", name, "-c", dir, shellCmd)
+	}
+	if out, err := cmd.CombinedOutput(); err != nil {
+		return fmt.Errorf("tmux: %s", strings.TrimSpace(string(out)))
+	}
+	win := tmuxSession + ":" + name
+	exec.Command("tmux", "set-option", "-t", win, "remain-on-exit", "on").Run()
+	exec.Command("tmux", "pipe-pane", "-t", win, "-o", "cat >> "+shQuote(logPath)).Run()
+	return nil
+}
+
+func tmuxShellCmd(env, argv []string) string {
+	parts := []string{"exec", "env"}
+	for _, e := range env {
+		parts = append(parts, shQuote(e))
+	}
+	for _, a := range argv {
+		parts = append(parts, shQuote(a))
+	}
+	return strings.Join(parts, " ")
+}
+
+func shQuote(s string) string { return "'" + strings.ReplaceAll(s, "'", `'\''`) + "'" }
+
+// brewSuggest maps a missing command to its usual Homebrew formula (best-effort;
+// tshare bundles nothing — it just suggests the install).
+func brewSuggest(cmd string) string {
+	switch filepath.Base(cmd) {
+	case "node", "npm", "npx":
+		return "node"
+	case "python", "python3", "pip", "pip3":
+		return "python"
+	case "php":
+		return "php"
+	case "ruby", "gem", "bundle":
+		return "ruby"
+	case "docker":
+		return "docker (Docker Desktop)"
+	case "caddy":
+		return "caddy"
+	default:
+		return filepath.Base(cmd)
+	}
+}
+
+
+// newHostProxy builds the reverse proxy tshare puts in front of an upstream
+// server (shared by -s and `tshare run`/`host`). Presents the upstream's own
+// Host so dev-server host checks pass; WebSockets/HMR upgrade through as usual.
+func newHostProxy(u *url.URL, c *config) *httputil.ReverseProxy {
+	base := strings.TrimSuffix(u.Path, "/")
+	return &httputil.ReverseProxy{
 		Director: func(req *http.Request) {
 			req.URL.Scheme = u.Scheme
 			req.URL.Host = u.Host
-			// Present the upstream's own host so dev servers' host-check
-			// (webpack/vite "Invalid Host header") accepts the request.
 			req.Host = u.Host
 			if base != "" {
 				req.URL.Path = base + req.URL.Path
@@ -6573,9 +7213,20 @@ func setupServer(c *config, s *share) error {
 			if !c.Quiet {
 				log.Printf("  upstream error: %v", e)
 			}
-			http.Error(w, "502 upstream not reachable — is your server running at "+s.srvURL+" ?", http.StatusBadGateway)
+			http.Error(w, "502 upstream not reachable", http.StatusBadGateway)
 		},
 	}
+}
+
+func setupServer(c *config, s *share) error {
+	u, err := url.Parse(c.Paths[0])
+	if err != nil || (u.Scheme != "http" && u.Scheme != "https") || u.Host == "" {
+		return errors.New("-s needs an http(s) URL, e.g. tshare -s http://localhost:8000")
+	}
+	s.mode = "server"
+	s.srvURL = c.Paths[0]
+	s.roots = []rootEnt{{Name: u.Host, Abs: c.Paths[0]}} // placeholder for shared code
+	s.srvProxy = newHostProxy(u, c)
 	// best-effort: warn (don't fail) if nothing is listening yet
 	d := net.Dialer{Timeout: 800 * time.Millisecond}
 	if conn, derr := d.Dial("tcp", hostPort(u)); derr == nil {
@@ -6585,6 +7236,45 @@ func setupServer(c *config, s *share) error {
 	}
 	if !c.Quiet {
 		log.Printf("  ▷ reverse-proxying %s", s.srvURL)
+	}
+	return nil
+}
+
+// setupRun launches a command that serves on a port (auto-detected unless
+// --port), then reverse-proxies it over the funnel — the generic `tshare run`
+// / `host` engine. Reuses the managed-server launcher and the -s proxy.
+func setupRun(c *config, s *share) error {
+	dir := c.RunDir
+	if dir == "" {
+		dir, _ = os.Getwd()
+	}
+	name := c.RunName
+	if name == "" {
+		name = "run-" + s.id
+	}
+	// In run mode --port is the UPSTREAM (node) port; tshare's own backend
+	// listener must NOT reuse it, so free c.Port for auto-pick after capturing.
+	wantPort := c.Port
+	c.Port = 0
+	if !c.Quiet {
+		how := "as a child process"
+		if s.haveTmux() {
+			how = "in tmux (attach: tmux attach -t " + tmuxSession + ")"
+		}
+		log.Printf("  ▶ launching %s %s …", strings.Join(c.RunCmd, " "), how)
+	}
+	p, err := s.launchServer(name, dir, nil, c.RunCmd, wantPort)
+	if err != nil {
+		return err
+	}
+	s.procs = append(s.procs, p)
+	s.mode = "server"
+	s.srvURL = fmt.Sprintf("http://127.0.0.1:%d", p.port)
+	u, _ := url.Parse(s.srvURL)
+	s.srvProxy = newHostProxy(u, c)
+	s.roots = []rootEnt{{Name: name, Abs: s.srvURL}}
+	if !c.Quiet {
+		log.Printf("  ▷ %s listening on :%d — proxied over the funnel", name, p.port)
 	}
 	return nil
 }
