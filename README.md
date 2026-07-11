@@ -148,8 +148,8 @@ Same subpath caveat as `--site`: the app is served under `/<token>/`, so **relat
 
 ```sh
 tshare room install        # once: clones MiroTalk from GitHub into ~/.tshare/mirotalk,
-                           # copies its .env/config templates, installs deps (npm or
-                           # docker), and records the location in your tshare config
+                           # copies its .env/config templates, installs deps (npm ci),
+                           # natively — no Docker
 tshare --room standup      # every time after: tshare starts MiroTalk (if it isn't
                            # already running), health-checks it, exposes it at your
                            # funnel ROOT, and prints the token-gated room link
@@ -157,18 +157,18 @@ tshare --room standup      # every time after: tshare starts MiroTalk (if it isn
 
 The landing page has a **Join call** button and an optional display-name field; your `-p` password, `-e` expiry and the unguessable token decide **who reaches the join button**. The join URL is the documented `…/join?room=<name>` form. Room ids are random and unguessable unless you name one (`Team Sync` → `Team-Sync`). `?go=1` on the share link skips the landing page and 302s straight into the call. When the share stops, the MiroTalk it started stops with it (a MiroTalk you started yourself is reused and left alone); `tshare panic` reaps it too. Media never touches the server — MiroTalk P2P is mesh WebRTC, so the local instance only carries **signaling**; tshare runs it with `NODE_ENV=production`.
 
-`--mirotalk-url https://meet.mycorp.com` still points at a remote self-hosted instance instead; `tshare room status` shows what's installed/running. Caveats: MiroTalk needs the funnel **root** path (it's mounted at `/`, coexisting with token-path shares), and expiry/revocation gates *new* visitors — people already in the room hold the room URL.
+`--mirotalk-url https://meet.mycorp.com` still points at a remote self-hosted instance instead; `tshare room status` shows what's installed/running. It runs natively (git clone + `npm ci`, then `npm start`) — no Docker. Caveats: MiroTalk needs the funnel **root** path (it's mounted at `/`, coexisting with token-path shares), and expiry/revocation gates *new* visitors — people already in the room hold the room URL.
 
 ## Uptime Kuma monitor (`tshare kuma`)
 
 Expose your [Uptime Kuma](https://github.com/louislam/uptime-kuma) status monitor over the funnel with one command:
 
 ```sh
-tshare kuma install    # once: pre-pull the Docker image (or get told how to install Docker)
-tshare kuma            # reuse/start Uptime Kuma and expose it; prints the token-gated link
+tshare kuma install    # once: install Uptime Kuma natively (git clone + npm run setup)
+tshare kuma            # start Uptime Kuma and expose it (auto-stops with the share)
 ```
 
-Uptime Kuma is a **persistent** service, so tshare treats it that way: `tshare kuma` reuses an instance already listening on `:3001`, or starts the official Docker container (`docker run -d --restart=always -v uptime-kuma:/app/data …` — your monitors and history live in the volume) and **leaves it running** when the share stops. It's mounted at the funnel **root** because Uptime Kuma [can't run under a sub-path](https://github.com/louislam/uptime-kuma/wiki/Reverse-Proxy); the `/<token>/` link is a small landing page with an **Open dashboard →** button (`?go=1` jumps straight there). Auth is Uptime Kuma's own login — set the admin account on first run. tshare bundles nothing: no Docker → it points you at `brew install --cask docker`, or run Uptime Kuma however you like on `:3001` and `tshare kuma` will just expose it (use `--kuma-port` if it's elsewhere or `:3001` is taken). `tshare kuma status` shows the container/port state.
+`tshare kuma install` clones Uptime Kuma into `~/.tshare/kuma` and runs its native setup (`npm run setup` — needs `node`/`npm`; tshare bundles nothing and points you at `brew install node` if missing). `tshare kuma` then reuses an instance already listening on `:3001`, or starts the native one on demand and **stops it with the share** — the same managed engine `--room` (MiroTalk) uses. Monitors and history persist in `~/.tshare/kuma/data`. It's mounted at the funnel **root** because Uptime Kuma [can't run under a sub-path](https://github.com/louislam/uptime-kuma/wiki/Reverse-Proxy); the `/<token>/` link is a small landing page with an **Open dashboard →** button (`?go=1` jumps straight there). Auth is Uptime Kuma's own login — set the admin account on first run. `--kuma-port` if `:3001` is taken; `tshare kuma status` shows install/port state.
 
 ## ⚡ P2P direct transfers (`--p2p`) and built-in calls (`--call`)
 
