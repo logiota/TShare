@@ -353,7 +353,7 @@ type config struct {
 	MirotalkURL    string // remote instance base URL ("" = use/spawn the local install)
 	MirotalkDir    string // local MiroTalk checkout (default ~/.tshare/mirotalk)
 	MirotalkMethod string // how the local instance runs: npm | docker (auto-detected if "")
-	MirotalkPort   int    // local MiroTalk port (default 3000)
+	MirotalkPort   int    // local MiroTalk port (default 7701)
 
 	// hub (--hub): homescreen-style 2-way remote page — upload, grab URLs,
 	// browse/manage the hub folder, from a phone or any browser
@@ -374,7 +374,7 @@ type config struct {
 	// --kuma: reuse/start a persistent Uptime Kuma monitor and expose it at the
 	// funnel root (Uptime Kuma can't run under a subpath). Native, auto start/stop.
 	Kuma     bool
-	KumaPort int // default 3001
+	KumaPort int // default 7702
 
 	// --rar: split the share into RAR volumes before serving (transfer
 	// chunking — e.g. so each part fits an iPhone's in-memory P2P receive)
@@ -5657,7 +5657,7 @@ type nodeApp struct {
 
 var mirotalkApp = &nodeApp{
 	key: "mirotalk", name: "MiroTalk", repo: "https://github.com/miroslavpejic85/mirotalk",
-	health: "mirotalk", port: 3000, run: []string{"npm", "start"}, env: []string{"NODE_ENV=production"},
+	health: "mirotalk", port: 7701, run: []string{"npm", "start"}, env: []string{"NODE_ENV=production"},
 	templates: [][2]string{{".env.template", ".env"}, {"app/src/config.template.js", "app/src/config.js"}},
 	setup:     [][]string{{"npm", "ci", "--omit=dev"}},
 	flag:      "--room", sub: "room",
@@ -5665,7 +5665,7 @@ var mirotalkApp = &nodeApp{
 
 var kumaApp = &nodeApp{
 	key: "kuma", name: "Uptime Kuma", repo: "https://github.com/louislam/uptime-kuma",
-	health: "uptime kuma", port: 3001, run: []string{"node", "server/server.js"}, env: []string{"NODE_ENV=production"},
+	health: "uptime kuma", port: 7702, run: []string{"node", "server/server.js"}, env: []string{"NODE_ENV=production"},
 	setup: [][]string{{"npm", "run", "setup"}}, // installs deps + downloads the prebuilt dist
 	flag:  "kuma", sub: "kuma",
 }
@@ -6010,7 +6010,7 @@ func haveExec(name string) bool { _, err := exec.LookPath(name); return err == n
 func defaultConfig() *config {
 	return &config{TokenLen: 16, HTTPSPort: 443, MaxUpload: "5G", MinFree: "32G", CQ: 50,
 		RarSize:      "1400M",
-		MirotalkPort: 3000, KumaPort: 3001,
+		MirotalkPort: 7701, KumaPort: 7702,
 		STUN:         "stun:stun.l.google.com:19302,stun:stun.cloudflare.com:3478",
 		Copy:         true, LAN: true, Password: os.Getenv("TSHARE_PASSWORD")}
 }
