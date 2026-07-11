@@ -81,7 +81,7 @@ USAGE
   tshare room install                 one-time: install MiroTalk locally from GitHub
   tshare dash                         iOS-home-screen webui of all your shares (auto-password)
   tshare kuma                         expose your Uptime Kuma monitor at the funnel root
-  tshare kuma install                 one-time: set up Uptime Kuma (Docker)
+  tshare kuma install                 one-time: install Uptime Kuma natively (git + npm)
   tshare --call                       the link IS a 1:1 video call (built-in WebRTC)
   tshare set <id> [-p pw] [-e dur] [-n N]   change options on a RUNNING share
   tshare extend <id> [dur]            push out expiry (no dur = DOUBLE the time left)
@@ -372,7 +372,7 @@ type config struct {
 	Tmux    bool     // --tmux: launch managed servers as windows of one 'tshare' tmux session
 
 	// --kuma: reuse/start a persistent Uptime Kuma monitor and expose it at the
-	// funnel root (Uptime Kuma can't run under a subpath). Docker restart=always.
+	// funnel root (Uptime Kuma can't run under a subpath). Native, auto start/stop.
 	Kuma     bool
 	KumaPort int // default 3001
 
@@ -840,6 +840,8 @@ type share struct {
 	probeMu   sync.Mutex
 	lastProbe time.Time
 	probeHeld int
+	reportMu   sync.Mutex // ⚑ report button: throttle owner notifications
+	lastReport time.Time
 
 	maxBytes   int64        // #13: stop after this many bytes served (0 = ∞)
 	bytesServed atomic.Int64 // cumulative response bytes for the byte cap
@@ -1135,16 +1137,16 @@ func runShare(c *config) error {
 		s.mode = "dashboard"
 		s.roots = []rootEnt{{Name: "dashboard", Abs: "dashboard", IsDir: false}}
 	case c.Kuma:
-		// --kuma: expose a persistent Uptime Kuma monitor at the funnel root
-		// (it can't run under a subpath). Reuse a running instance or start the
-		// Docker one; started/resolved later so we have the funnel host for the URL.
+		// --kuma: expose Uptime Kuma at the funnel root (it can't run under a
+		// subpath). Reuse a running instance or start the native install on demand;
+		// resolved later so we have the funnel host for the dashboard URL.
 		if len(c.Paths) > 0 {
 			return errors.New("--kuma takes no path — it exposes your Uptime Kuma dashboard")
 		}
 		if c.Local {
 			return errors.New("--kuma needs the funnel/serve root (drop -l) so the dashboard is reachable")
 		}
-		if err := kumaPreflight(c); err != nil { // fail before mounting anything
+		if err := kumaApp.preflight(c); err != nil { // fail before mounting anything
 			return err
 		}
 		s.mode, s.kuma = "kuma", true
@@ -1180,7 +1182,7 @@ func runShare(c *config) error {
 		default:
 			// local instance: resolved/started later (needs the funnel host for the
 			// join URL). Verify it's locatable now so the error comes before mounting.
-			if _, _, err := mirotalkLocal(c); err != nil {
+			if err := mirotalkApp.preflight(c); err != nil {
 				return err
 			}
 			s.roomLocal = true
@@ -1502,7 +1504,7 @@ func runShare(c *config) error {
 	// it at the funnel/serve ROOT path, and point the join URL at that origin.
 	// Runs after `defer cleanup()` so a failure can't leak the child process.
 	if s.roomLocal {
-		if err := startLocalMirotalk(s); err != nil {
+		if err := mirotalkApp.start(s); err != nil {
 			return err
 		}
 		if c.Local {
@@ -1528,12 +1530,11 @@ func runShare(c *config) error {
 		s.updateState() // re-record: join URL + child pid + root mount now exist
 	}
 
-	// --kuma: make sure Uptime Kuma is up (reuse or start the persistent Docker
-	// container — never killed on exit), then mount it at the funnel/serve ROOT
-	// and point the dashboard URL there. Runs after `defer cleanup()` so a
-	// failure still unmounts.
+	// --kuma: make sure Uptime Kuma is up (reuse a running one or start the
+	// native install — auto-stopped with the share), then mount it at the
+	// funnel/serve ROOT and point the dashboard URL there.
 	if s.kuma {
-		if err := ensureKuma(s); err != nil {
+		if err := kumaApp.start(s); err != nil {
 			return err
 		}
 		if out, err := tsMount(c, "", c.KumaPort); err != nil {
@@ -2150,6 +2151,10 @@ func (s *share) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	}
 	if rel == "__zip" || strings.HasSuffix(rel, "/__zip") {
 		s.handleZip(rec, r, strings.TrimSuffix(strings.TrimSuffix(rel, "__zip"), "/"))
+		return
+	}
+	if rel == "__report" || strings.HasSuffix(rel, "/__report") {
+		s.handleReport(rec, r, who)
 		return
 	}
 
@@ -2806,6 +2811,46 @@ func (s *share) probeAlert(who, method, path string, status int) {
 		msg += fmt.Sprintf(" (+%d more in 10s)", held-1)
 	}
 	go notify("tshare — invalid access attempt", msg)
+}
+
+// handleReport is the always-available abuse channel behind the ⚑ report button
+// on share pages — the minimal "report" affordance a public host is expected to
+// offer. It needs zero config: it notifies the share's owner and shows the
+// reporter a short confirmation, surfacing any --abuse-contact for escalation.
+func (s *share) handleReport(w *respRec, r *http.Request, who string) {
+	label := s.token
+	if len(s.roots) > 0 && s.roots[0].Name != "" {
+		label = s.roots[0].Name
+	}
+	s.reportAlert(who, label)
+	w.Header().Set("Content-Type", "text/html; charset=utf-8")
+	extra := ""
+	if c := strings.TrimSpace(s.cfg.AbuseContact); c != "" {
+		extra = `<p style="color:#8888">To escalate, contact: ` + contactLink(c) + `</p>`
+	}
+	fmt.Fprintf(w, `<!doctype html><html><head><meta charset="utf-8">`+
+		`<meta name="viewport" content="width=device-width,initial-scale=1">`+
+		`<meta name="robots" content="noindex,nofollow"><title>reported</title>`+
+		`<style>:root{color-scheme:dark light}body{font:15px/1.6 -apple-system,BlinkMacSystemFont,'Segoe UI',Roboto,sans-serif;`+
+		`max-width:460px;margin:0 auto;padding:52px 22px;text-align:center}a{color:#4f63ff}</style></head><body>`+
+		`<h1 style="font-size:18px">⚑ Thank you</h1>`+
+		`<p>This content has been reported to the person hosting this link.</p>%s</body></html>`, extra)
+}
+
+// reportAlert notifies the owner that a viewer used the ⚑ report button,
+// throttled (like probeAlert) so the button can't be used to notification-bomb.
+func (s *share) reportAlert(who, label string) {
+	if s.cfg.NoNotify {
+		return
+	}
+	s.reportMu.Lock()
+	if time.Since(s.lastReport) < 10*time.Second {
+		s.reportMu.Unlock()
+		return
+	}
+	s.lastReport = time.Now()
+	s.reportMu.Unlock()
+	go notify("tshare — content reported ⚑", fmt.Sprintf("a viewer reported %q (from %s)", label, who))
 }
 
 // ---------------------------------------------------------------------------
@@ -3768,6 +3813,7 @@ audio{width:min(680px,92vw)}
  padding:12px 14px calc(12px + env(safe-area-inset-bottom));border-top:1px solid #23232f;background:#101018}
 .bar .nm{color:#9a9aac;max-width:60vw;overflow:hidden;text-overflow:ellipsis;white-space:nowrap}
 .bar a{color:#7d8cff;text-decoration:none;font-weight:600}
+.bar a.rep{color:#6a6a7c;font-weight:400;font-size:12px}
 .abuse{color:#6a6a7c;font-size:11px;text-align:center;padding:0 12px calc(10px + env(safe-area-inset-bottom));opacity:.8}
 .abuse a{color:inherit}
 </style></head>
@@ -3788,7 +3834,7 @@ audio{width:min(680px,92vw)}
  <img src="?raw=1" alt="{{.Name}}">
 {{end}}
 </div>
-<div class="bar"><span class="nm">{{.Name}}</span><a href="?dl=1">⬇ download</a></div>
+<div class="bar"><span class="nm">{{.Name}}</span><a href="?dl=1">⬇ download</a><a class="rep" href="__report">⚑ report</a></div>
 {{.Abuse}}
 </body></html>`))
 
@@ -5594,118 +5640,194 @@ var proxyBufPool = &bufPool{p: sync.Pool{New: func() any { return make([]byte, 6
 // git+npm instance is reused if already listening. tshare NEVER stops Kuma —
 // it's a standing service (restart=always) — it only mounts/unmounts the root.
 
-const kumaImage = "louislam/uptime-kuma:1"
-const kumaContainer = "uptime-kuma"
+// ---------------------------------------------------------------------------
+// native Node apps: --room (MiroTalk) and --kuma (Uptime Kuma). Both are
+// installed from GitHub (git clone + npm) and run NATIVELY through the shared
+// managed-server engine, so they start on demand and shut down with the share.
+// Each is exposed at the funnel ROOT (they're root-path SPAs). No Docker.
 
-// kumaAlive probes the Uptime Kuma port: "kuma" (its page), "other" (port busy
-// with something else), or "" (nothing listening).
-func kumaAlive(port int) string {
-	client := &http.Client{Timeout: 2 * time.Second}
-	resp, err := client.Get(fmt.Sprintf("http://127.0.0.1:%d/", port))
+type nodeApp struct {
+	key, name, repo, health string
+	port                    int
+	run, env                []string
+	templates               [][2]string // src→dst copied post-clone (never clobbered)
+	setup                   [][]string  // post-clone install steps, run in the checkout
+	flag, sub               string      // how you invoke it (start flag, install subcommand)
+}
+
+var mirotalkApp = &nodeApp{
+	key: "mirotalk", name: "MiroTalk", repo: "https://github.com/miroslavpejic85/mirotalk",
+	health: "mirotalk", port: 3000, run: []string{"npm", "start"}, env: []string{"NODE_ENV=production"},
+	templates: [][2]string{{".env.template", ".env"}, {"app/src/config.template.js", "app/src/config.js"}},
+	setup:     [][]string{{"npm", "ci", "--omit=dev"}},
+	flag:      "--room", sub: "room",
+}
+
+var kumaApp = &nodeApp{
+	key: "kuma", name: "Uptime Kuma", repo: "https://github.com/louislam/uptime-kuma",
+	health: "uptime kuma", port: 3001, run: []string{"node", "server/server.js"}, env: []string{"NODE_ENV=production"},
+	setup: [][]string{{"npm", "run", "setup"}}, // installs deps + downloads the prebuilt dist
+	flag:  "kuma", sub: "kuma",
+}
+
+func (a *nodeApp) dir(c *config) string {
+	if a.key == "mirotalk" && c != nil && c.MirotalkDir != "" {
+		return c.MirotalkDir
+	}
+	home, err := os.UserHomeDir()
+	if err != nil {
+		home = os.TempDir()
+	}
+	return filepath.Join(home, ".tshare", a.key)
+}
+
+func (a *nodeApp) portOf(c *config) int {
+	if a.key == "mirotalk" && c.MirotalkPort > 0 {
+		return c.MirotalkPort
+	}
+	if a.key == "kuma" && c.KumaPort > 0 {
+		return c.KumaPort
+	}
+	return a.port
+}
+
+func (a *nodeApp) installed(c *config) bool { return fileExists(filepath.Join(a.dir(c), "package.json")) }
+
+// alive classifies :port — "app" (it), "other" (busy with something else), "" (free).
+func (a *nodeApp) alive(port int) string {
+	resp, err := (&http.Client{Timeout: 2 * time.Second}).Get(fmt.Sprintf("http://127.0.0.1:%d/", port))
 	if err != nil {
 		return ""
 	}
 	defer resp.Body.Close()
 	body, _ := io.ReadAll(io.LimitReader(resp.Body, 64<<10))
-	// Uptime Kuma serves an app shell with this title / marker.
-	if b := strings.ToLower(string(body)); strings.Contains(b, "uptime kuma") || strings.Contains(b, "uptimekuma") {
-		return "kuma"
+	if strings.Contains(strings.ToLower(string(body)), a.health) {
+		return "app"
 	}
 	return "other"
 }
 
-func kumaContainerState() string { // "running" | "stopped" | "" (absent)
-	if !haveExec("docker") {
-		return ""
-	}
-	out, err := exec.Command("docker", "ps", "-a", "--filter", "name=^/"+kumaContainer+"$",
-		"--format", "{{.State}}").Output()
-	if err != nil {
-		return ""
-	}
-	return strings.TrimSpace(string(out))
-}
-
-// kumaPreflight fails fast (before any funnel mount) if Kuma can't be brought
-// up at all — nothing running and no way to start it.
-func kumaPreflight(c *config) error {
-	switch kumaAlive(c.KumaPort) {
-	case "kuma":
+// preflight fails fast (before any funnel mount) if the app can't be brought up.
+func (a *nodeApp) preflight(c *config) error {
+	switch a.alive(a.portOf(c)) {
+	case "app":
 		return nil
 	case "other":
-		return fmt.Errorf("port %d is serving something that isn't Uptime Kuma — set --kuma-port or stop it", c.KumaPort)
+		return fmt.Errorf("port %d is serving something that isn't %s — free it or change its port", a.portOf(c), a.name)
 	}
-	if haveExec("docker") {
-		return nil // we can start the container
-	}
-	return errors.New("Uptime Kuma isn't running and Docker isn't installed.\n" +
-		"      set it up (recommended):  tshare kuma install\n" +
-		"      …or start Uptime Kuma yourself (any way) on :3001 and re-run: tshare kuma")
-}
-
-// ensureKuma makes Uptime Kuma answer on its port, reusing a running instance
-// or starting the persistent Docker container. It does not track the process —
-// Kuma is meant to stay up (restart=always) even after this share stops.
-func ensureKuma(s *share) error {
-	c := s.cfg
-	if kumaAlive(c.KumaPort) == "kuma" {
-		if !c.Quiet {
-			log.Printf("  ▷ reusing Uptime Kuma already running on :%d", c.KumaPort)
-		}
+	if a.installed(c) {
 		return nil
 	}
-	if !haveExec("docker") {
-		return errors.New("Uptime Kuma isn't running — start it, or: tshare kuma install (needs Docker)")
-	}
-	switch kumaContainerState() {
-	case "running":
-		// container up but not answering yet — just wait below
-	case "exited", "created", "paused", "stopped":
-		if out, err := exec.Command("docker", "start", kumaContainer).CombinedOutput(); err != nil {
-			return fmt.Errorf("docker start %s: %s", kumaContainer, strings.TrimSpace(string(out)))
-		}
-		if !c.Quiet {
-			log.Printf("  ▷ started existing Uptime Kuma container")
-		}
-	default: // absent → create a persistent one
-		if !c.Quiet {
-			log.Printf("  ⇣ starting Uptime Kuma (docker %s, persistent) …", kumaImage)
-		}
-		args := []string{"run", "-d", "--restart=always",
-			"-p", fmt.Sprintf("%d:3001", c.KumaPort),
-			"-v", kumaContainer + ":/app/data", "--name", kumaContainer, kumaImage}
-		if out, err := exec.Command("docker", args...).CombinedOutput(); err != nil {
-			return fmt.Errorf("docker run uptime-kuma: %s", strings.TrimSpace(string(out)))
-		}
-	}
-	deadline := time.Now().Add(90 * time.Second) // first boot pulls the image + inits the DB
-	for time.Now().Before(deadline) {
-		if kumaAlive(c.KumaPort) == "kuma" {
-			if !c.Quiet {
-				log.Printf("  ▷ Uptime Kuma up on :%d", c.KumaPort)
-			}
-			return nil
-		}
-		time.Sleep(1 * time.Second)
-	}
-	return fmt.Errorf("Uptime Kuma didn't become healthy on :%d within 90s (docker logs %s)", c.KumaPort, kumaContainer)
+	return fmt.Errorf("%s isn't installed. one-time setup:  tshare %s install", a.name, a.sub)
 }
 
-// cmdKuma: `tshare kuma [install|status]`, else run+expose (an alias for
-// `tshare --kuma`, accepting the usual share flags).
+// start reuses a running instance or launches the checkout natively (managed by
+// the server engine → stopped with the share). Adds the proc to s.procs.
+func (a *nodeApp) start(s *share) error {
+	c := s.cfg
+	port := a.portOf(c)
+	switch a.alive(port) {
+	case "app":
+		if !c.Quiet {
+			log.Printf("  ▷ reusing %s already running on :%d", a.name, port)
+		}
+		return nil
+	case "other":
+		return fmt.Errorf("port %d is busy with a non-%s service", port, a.name)
+	}
+	if !a.installed(c) {
+		return fmt.Errorf("%s isn't installed — run: tshare %s install", a.name, a.sub)
+	}
+	env := append([]string{}, a.env...)
+	if a.key == "kuma" {
+		env = append(env, fmt.Sprintf("UPTIME_KUMA_PORT=%d", port)) // Kuma's own port var
+	}
+	p, err := s.launchServer(a.key+"-"+s.id, a.dir(c), env, append([]string{}, a.run...), port)
+	if err != nil {
+		return err
+	}
+	s.procs = append(s.procs, p)
+	if !c.Quiet {
+		where := "log " + p.logPath
+		if p.tmuxWin != "" {
+			where = "tmux attach -t " + tmuxSession
+		}
+		log.Printf("  ▷ %s up on :%d (native, %s)", a.name, port, where)
+	}
+	return nil
+}
+
+// install clones the app from GitHub and runs its native setup (git + node/npm).
+func (a *nodeApp) install(c *config) error {
+	if !haveExec("git") {
+		return errors.New("git is required (brew install git)")
+	}
+	if !haveExec("node") || !haveExec("npm") {
+		return errors.New("node + npm are required for the native app — brew install node, then re-run")
+	}
+	dir := a.dir(c)
+	if fileExists(filepath.Join(dir, "package.json")) {
+		fmt.Printf("  ✓ already installed: %s (updating)\n", dir)
+		if out, err := exec.Command("git", "-C", dir, "pull", "--ff-only").CombinedOutput(); err != nil {
+			fmt.Printf("  ⚠ update skipped: %s\n", strings.TrimSpace(string(out)))
+		}
+	} else {
+		fmt.Printf("  ⇣ cloning %s → %s\n", a.repo, dir)
+		if err := os.MkdirAll(filepath.Dir(dir), 0o700); err != nil {
+			return err
+		}
+		cmd := exec.Command("git", "clone", "--depth", "1", a.repo, dir)
+		cmd.Stdout, cmd.Stderr = os.Stderr, os.Stderr
+		if err := cmd.Run(); err != nil {
+			return fmt.Errorf("git clone failed: %w", err)
+		}
+	}
+	for _, cp := range a.templates {
+		src, dst := filepath.Join(dir, cp[0]), filepath.Join(dir, cp[1])
+		if fileExists(dst) || !fileExists(src) {
+			continue
+		}
+		if b, err := os.ReadFile(src); err == nil && os.WriteFile(dst, b, 0o644) == nil {
+			fmt.Printf("  ✓ %s → %s\n", cp[0], cp[1])
+		}
+	}
+	for _, step := range a.setup {
+		fmt.Printf("  ⇣ %s …\n", strings.Join(step, " "))
+		cmd := exec.Command(step[0], step[1:]...)
+		cmd.Dir = dir
+		cmd.Stdout, cmd.Stderr = os.Stderr, os.Stderr
+		if err := cmd.Run(); err != nil {
+			return fmt.Errorf("%s failed: %w", strings.Join(step, " "), err)
+		}
+	}
+	fmt.Printf("\n  ✓ %s ready — start it:  tshare %s\n", a.name, a.flag)
+	return nil
+}
+
+func (a *nodeApp) status(c *config) {
+	fmt.Printf("  install dir: %s (installed: %v)\n", a.dir(c), a.installed(c))
+	st := a.alive(a.portOf(c))
+	if st == "" {
+		st = "not running"
+	}
+	fmt.Printf("  port %d:   %s\n", a.portOf(c), st)
+}
+
 func cmdKuma(args []string) {
+	c := defaultConfig()
+	applyConfig(c, args)
 	sub := ""
 	if len(args) > 0 {
 		sub = args[0]
 	}
 	switch sub {
 	case "install", "setup":
-		kumaInstall()
+		if err := kumaApp.install(c); err != nil {
+			log.Fatalf("tshare: %v", err)
+		}
 	case "status":
-		kumaStatus()
+		kumaApp.status(c)
 	default:
-		c := defaultConfig()
-		applyConfig(c, args)
 		if err := parseArgs(args, c); err != nil {
 			os.Exit(2)
 		}
@@ -5715,39 +5837,6 @@ func cmdKuma(args []string) {
 		}
 	}
 }
-
-func kumaInstall() {
-	if !haveExec("docker") {
-		fmt.Println("  Uptime Kuma's simplest deploy is Docker — tshare bundles nothing:")
-		fmt.Println("      brew install --cask docker      (then open Docker.app once to start the engine)")
-		fmt.Println("  once Docker is running:  tshare kuma install   (pre-pulls the image)")
-		fmt.Println("  or run Uptime Kuma any other way on :3001 and just:  tshare kuma")
-		return
-	}
-	fmt.Printf("  ⇣ docker pull %s …\n", kumaImage)
-	cmd := exec.Command("docker", "pull", kumaImage)
-	cmd.Stdout, cmd.Stderr = os.Stderr, os.Stderr
-	if err := cmd.Run(); err != nil {
-		log.Fatalf("tshare: docker pull failed: %v", err)
-	}
-	fmt.Println("\n  ✓ ready. start + expose it:  tshare kuma")
-	fmt.Println("  (first run creates a persistent container + volume; set your admin login in the browser)")
-}
-
-func kumaStatus() {
-	fmt.Printf("  docker:     %v\n", haveExec("docker"))
-	if st := kumaContainerState(); st != "" {
-		fmt.Printf("  container:  %s (%s)\n", kumaContainer, st)
-	} else if haveExec("docker") {
-		fmt.Printf("  container:  none (tshare kuma will create one)\n")
-	}
-	state := kumaAlive(3001)
-	if state == "" {
-		state = "not running"
-	}
-	fmt.Printf("  port 3001:  %s\n", state)
-}
-
 
 // ---------------------------------------------------------------------------
 // --dashboard: an iOS-home-screen webui tiling every active share. Its own
@@ -5913,110 +6002,7 @@ func (s *share) renderKuma(w *respRec) {
 // is a root-path SPA — it breaks under /<token>/), and stops it again on exit.
 // Signaling stays on your node; the actual call media is WebRTC peer-to-peer.
 
-const mirotalkRepo = "https://github.com/miroslavpejic85/mirotalk"
-
-func mirotalkDefaultDir() string {
-	home, err := os.UserHomeDir()
-	if err != nil {
-		home = os.TempDir()
-	}
-	return filepath.Join(home, ".tshare", "mirotalk")
-}
-
-func mirotalkResolvedDir(c *config) string {
-	if c.MirotalkDir != "" {
-		return c.MirotalkDir
-	}
-	return mirotalkDefaultDir()
-}
-
-// mirotalkAlive probes 127.0.0.1:<port> and classifies it: "mirotalk" (usable),
-// "other" (port busy with something else), or "" (nothing listening).
-func mirotalkAlive(port int) string {
-	client := &http.Client{Timeout: 1500 * time.Millisecond}
-	resp, err := client.Get(fmt.Sprintf("http://127.0.0.1:%d/", port))
-	if err != nil {
-		return ""
-	}
-	defer resp.Body.Close()
-	body, _ := io.ReadAll(io.LimitReader(resp.Body, 64<<10))
-	if strings.Contains(strings.ToLower(string(body)), "mirotalk") {
-		return "mirotalk"
-	}
-	return "other"
-}
-
-// mirotalkLocal locates a usable local MiroTalk: an already-running instance on
-// the configured port, or an installed checkout to spawn. Returned dir is ""
-// when an already-running instance should simply be reused.
-func mirotalkLocal(c *config) (dir string, running bool, err error) {
-	switch mirotalkAlive(c.MirotalkPort) {
-	case "mirotalk":
-		return "", true, nil
-	case "other":
-		return "", false, fmt.Errorf("port %d is serving something that isn't MiroTalk — set mirotalk-port / stop it", c.MirotalkPort)
-	}
-	dir = mirotalkResolvedDir(c)
-	if fileExists(filepath.Join(dir, "package.json")) {
-		return dir, false, nil
-	}
-	return "", false, errors.New("--room needs a MiroTalk instance. One-time local setup:\n" +
-		"      tshare room install        (clones + installs " + mirotalkRepo + ")\n" +
-		"      …or point at a remote one: --mirotalk-url https://meet.example.com")
-}
-
-// mirotalkMethod picks how to run the checkout: explicit config wins, then a
-// prepared docker-compose.yml with docker present, then npm.
-func mirotalkMethod(c *config, dir string) string {
-	if c.MirotalkMethod == "npm" || c.MirotalkMethod == "docker" {
-		return c.MirotalkMethod
-	}
-	if fileExists(filepath.Join(dir, "docker-compose.yml")) && haveExec("docker") {
-		return "docker"
-	}
-	return "npm"
-}
-
 func haveExec(name string) bool { _, err := exec.LookPath(name); return err == nil }
-
-// startLocalMirotalk makes sure a local MiroTalk answers on the configured
-// port, spawning the installed checkout when needed. The spawned child is
-// owned by this share and stopped on exit; a pre-existing instance is reused
-// untouched.
-func startLocalMirotalk(s *share) error {
-	c := s.cfg
-	dir, running, err := mirotalkLocal(c)
-	if err != nil {
-		return err
-	}
-	if running {
-		if !c.Quiet {
-			log.Printf("  ▷ reusing MiroTalk already running on :%d", c.MirotalkPort)
-		}
-		return nil
-	}
-	method := mirotalkMethod(c, dir)
-	var argv []string
-	if method == "docker" {
-		argv = []string{"docker", "compose", "up"} // foreground up: ours to SIGTERM
-	} else {
-		argv = []string{"npm", "start"}
-	}
-	// reuse the shared managed-server engine (tmux/child + health + stop)
-	p, err := s.launchServer("mirotalk-"+s.id, dir, []string{"NODE_ENV=production"}, argv, c.MirotalkPort)
-	if err != nil {
-		return err
-	}
-	s.procs = append(s.procs, p)
-	if !c.Quiet {
-		where := "log " + p.logPath
-		if p.tmuxWin != "" {
-			where = "tmux attach -t " + tmuxSession + " (window " + p.name + ")"
-		}
-		log.Printf("  ▷ local MiroTalk up on :%d (%s, %s)", c.MirotalkPort, method, where)
-	}
-	return nil
-}
 
 // cmdRoom implements `tshare room install|status` — the one-time local setup.
 // defaultConfig is the base config (defaults) shared by the top-level share
@@ -6382,7 +6368,7 @@ func xmlEsc(s string) string {
 
 
 func cmdRoom(args []string) {
-	c := &config{MirotalkPort: 3000}
+	c := defaultConfig()
 	applyConfig(c, args)
 	sub := ""
 	if len(args) > 0 {
@@ -6390,128 +6376,15 @@ func cmdRoom(args []string) {
 	}
 	switch sub {
 	case "install", "setup":
-		if err := roomInstall(c, args[1:]); err != nil {
+		if err := mirotalkApp.install(c); err != nil {
 			log.Fatalf("tshare: %v", err)
 		}
 	case "status":
-		dir := mirotalkResolvedDir(c)
-		fmt.Printf("  install dir : %s (installed: %v)\n", dir, fileExists(filepath.Join(dir, "package.json")))
-		fmt.Printf("  method      : %s\n", mirotalkMethod(c, dir))
-		state := mirotalkAlive(c.MirotalkPort)
-		if state == "" {
-			state = "not running"
-		}
-		fmt.Printf("  port %d   : %s\n", c.MirotalkPort, state)
+		mirotalkApp.status(c)
 	default:
-		fmt.Println("usage: tshare room install   (one-time local MiroTalk setup from GitHub)")
-		fmt.Println("       tshare room status    (where it is, how it runs, is it up)")
+		fmt.Println("usage: tshare room install | status   (start a room with: tshare --room)")
 	}
 }
-
-func roomInstall(c *config, args []string) error {
-	method := ""
-	for _, a := range args {
-		switch a {
-		case "--docker":
-			method = "docker"
-		case "--npm":
-			method = "npm"
-		}
-	}
-	if !haveExec("git") {
-		return errors.New("git is required (brew install git)")
-	}
-	if method == "" {
-		if haveExec("node") && haveExec("npm") {
-			method = "npm"
-		} else if haveExec("docker") {
-			method = "docker"
-		} else {
-			return errors.New("need node+npm or docker to run MiroTalk\n" +
-				"      brew install node        (lightest)\n" +
-				"      …or install Docker Desktop, then re-run: tshare room install")
-		}
-	}
-	dir := mirotalkResolvedDir(c)
-	if fileExists(filepath.Join(dir, "package.json")) {
-		fmt.Printf("  ✓ already cloned: %s (updating)\n", dir)
-		if out, err := exec.Command("git", "-C", dir, "pull", "--ff-only").CombinedOutput(); err != nil {
-			fmt.Printf("  ⚠ update skipped: %s\n", strings.TrimSpace(string(out)))
-		}
-	} else {
-		fmt.Printf("  ⇣ cloning %s → %s\n", mirotalkRepo, dir)
-		if err := os.MkdirAll(filepath.Dir(dir), 0o700); err != nil {
-			return err
-		}
-		cmd := exec.Command("git", "clone", "--depth", "1", mirotalkRepo, dir)
-		cmd.Stdout, cmd.Stderr = os.Stderr, os.Stderr
-		if err := cmd.Run(); err != nil {
-			return fmt.Errorf("git clone failed: %w", err)
-		}
-	}
-	// template files (only if the real one doesn't exist yet — never clobber)
-	copies := [][2]string{
-		{".env.template", ".env"},
-		{filepath.Join("app", "src", "config.template.js"), filepath.Join("app", "src", "config.js")},
-	}
-	if method == "docker" {
-		copies = append(copies, [2]string{"docker-compose.template.yml", "docker-compose.yml"})
-	}
-	for _, cp := range copies {
-		src, dst := filepath.Join(dir, cp[0]), filepath.Join(dir, cp[1])
-		if fileExists(dst) || !fileExists(src) {
-			continue
-		}
-		b, err := os.ReadFile(src)
-		if err != nil {
-			return err
-		}
-		if err := os.WriteFile(dst, b, 0o644); err != nil {
-			return err
-		}
-		fmt.Printf("  ✓ %s → %s\n", cp[0], cp[1])
-	}
-	// dependencies
-	if method == "npm" {
-		fmt.Println("  ⇣ npm install (production deps)…")
-		cmd := exec.Command("npm", "ci", "--omit=dev")
-		cmd.Dir = dir
-		cmd.Stdout, cmd.Stderr = os.Stderr, os.Stderr
-		if err := cmd.Run(); err != nil {
-			cmd = exec.Command("npm", "install", "--omit=dev")
-			cmd.Dir = dir
-			cmd.Stdout, cmd.Stderr = os.Stderr, os.Stderr
-			if err := cmd.Run(); err != nil {
-				return fmt.Errorf("npm install failed: %w", err)
-			}
-		}
-	} else {
-		fmt.Println("  ⇣ docker compose pull…")
-		cmd := exec.Command("docker", "compose", "pull")
-		cmd.Dir = dir
-		cmd.Stdout, cmd.Stderr = os.Stderr, os.Stderr
-		if err := cmd.Run(); err != nil {
-			return fmt.Errorf("docker compose pull failed: %w", err)
-		}
-	}
-	// remember location + method in the config file (create/append, never clobber)
-	if err := appendConfigKeys(map[string]string{
-		"mirotalk-dir":    dir,
-		"mirotalk-method": method,
-	}); err != nil {
-		fmt.Printf("  ⚠ couldn't update config (%v) — pass --mirotalk-dir %s manually\n", err, dir)
-	} else {
-		fmt.Printf("  ✓ saved mirotalk-dir + mirotalk-method to %s\n", configPath())
-	}
-	fmt.Println("\n  done. start a room:  tshare --room standup")
-	fmt.Println("  (first visitor spins it up; media is P2P, signaling stays on your node)")
-	return nil
-}
-
-// appendConfigKeys adds key = value lines to the config file so they apply to
-// every run: inserted right after the [default] header when one exists, else at
-// the very top (keys before any [section] are global). Existing keys are never
-// touched; the file is created 0600 if missing.
 func appendConfigKeys(kv map[string]string) error {
 	path := configPath()
 	if path == "" {
@@ -9057,26 +8930,30 @@ func (s *share) abuseHTML() template.HTML {
 	if contact == "" && !s.cfg.Legal {
 		return ""
 	}
-	linkOf := func(c string) string {
-		e := template.HTMLEscapeString(c)
-		switch {
-		case strings.Contains(c, "@") && !strings.Contains(c, " "):
-			return `<a href="mailto:` + e + `">` + e + `</a>`
-		case strings.HasPrefix(c, "http://") || strings.HasPrefix(c, "https://"):
-			return `<a href="` + e + `" rel="nofollow noreferrer">` + e + `</a>`
-		default:
-			return e
-		}
-	}
 	if s.cfg.Legal {
 		who := "the operator of this link"
 		if contact != "" {
-			who = linkOf(contact)
+			who = contactLink(contact)
 		}
 		return template.HTML(`<div class="abuse">© Shared content remains the property of its ` +
 			`respective owners. Report infringement or request removal: ` + who + `</div>`)
 	}
-	return template.HTML(`<div class="abuse">Report abuse / request takedown: ` + linkOf(contact) + `</div>`)
+	return template.HTML(`<div class="abuse">Report abuse / request takedown: ` + contactLink(contact) + `</div>`)
+}
+
+// contactLink renders an abuse/takedown contact as a mailto:/https: link, or
+// plain escaped text if it's neither. Shared by the opt-in abuse line and the
+// always-on ⚑ report button.
+func contactLink(c string) string {
+	e := template.HTMLEscapeString(c)
+	switch {
+	case strings.Contains(c, "@") && !strings.Contains(c, " "):
+		return `<a href="mailto:` + e + `">` + e + `</a>`
+	case strings.HasPrefix(c, "http://") || strings.HasPrefix(c, "https://"):
+		return `<a href="` + e + `" rel="nofollow noreferrer">` + e + `</a>`
+	default:
+		return e
+	}
 }
 
 func (s *share) expiresLabel() string {
