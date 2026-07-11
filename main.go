@@ -840,6 +840,8 @@ type share struct {
 	probeMu   sync.Mutex
 	lastProbe time.Time
 	probeHeld int
+	reportMu   sync.Mutex // ⚑ report button: throttle owner notifications
+	lastReport time.Time
 
 	maxBytes   int64        // #13: stop after this many bytes served (0 = ∞)
 	bytesServed atomic.Int64 // cumulative response bytes for the byte cap
@@ -2152,6 +2154,10 @@ func (s *share) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		s.handleZip(rec, r, strings.TrimSuffix(strings.TrimSuffix(rel, "__zip"), "/"))
 		return
 	}
+	if rel == "__report" || strings.HasSuffix(rel, "/__report") {
+		s.handleReport(rec, r, who)
+		return
+	}
 
 	// --hub control endpoints (some are POST → route before the GET-only guard).
 	// __upload/__zip above already work for the hub; everything else here.
@@ -2806,6 +2812,46 @@ func (s *share) probeAlert(who, method, path string, status int) {
 		msg += fmt.Sprintf(" (+%d more in 10s)", held-1)
 	}
 	go notify("tshare — invalid access attempt", msg)
+}
+
+// handleReport is the always-available abuse channel behind the ⚑ report button
+// on share pages — the minimal "report" affordance a public host is expected to
+// offer. It needs zero config: it notifies the share's owner and shows the
+// reporter a short confirmation, surfacing any --abuse-contact for escalation.
+func (s *share) handleReport(w *respRec, r *http.Request, who string) {
+	label := s.token
+	if len(s.roots) > 0 && s.roots[0].Name != "" {
+		label = s.roots[0].Name
+	}
+	s.reportAlert(who, label)
+	w.Header().Set("Content-Type", "text/html; charset=utf-8")
+	extra := ""
+	if c := strings.TrimSpace(s.cfg.AbuseContact); c != "" {
+		extra = `<p style="color:#8888">To escalate, contact: ` + contactLink(c) + `</p>`
+	}
+	fmt.Fprintf(w, `<!doctype html><html><head><meta charset="utf-8">`+
+		`<meta name="viewport" content="width=device-width,initial-scale=1">`+
+		`<meta name="robots" content="noindex,nofollow"><title>reported</title>`+
+		`<style>:root{color-scheme:dark light}body{font:15px/1.6 -apple-system,BlinkMacSystemFont,'Segoe UI',Roboto,sans-serif;`+
+		`max-width:460px;margin:0 auto;padding:52px 22px;text-align:center}a{color:#4f63ff}</style></head><body>`+
+		`<h1 style="font-size:18px">⚑ Thank you</h1>`+
+		`<p>This content has been reported to the person hosting this link.</p>%s</body></html>`, extra)
+}
+
+// reportAlert notifies the owner that a viewer used the ⚑ report button,
+// throttled (like probeAlert) so the button can't be used to notification-bomb.
+func (s *share) reportAlert(who, label string) {
+	if s.cfg.NoNotify {
+		return
+	}
+	s.reportMu.Lock()
+	if time.Since(s.lastReport) < 10*time.Second {
+		s.reportMu.Unlock()
+		return
+	}
+	s.lastReport = time.Now()
+	s.reportMu.Unlock()
+	go notify("tshare — content reported ⚑", fmt.Sprintf("a viewer reported %q (from %s)", label, who))
 }
 
 // ---------------------------------------------------------------------------
@@ -3768,6 +3814,7 @@ audio{width:min(680px,92vw)}
  padding:12px 14px calc(12px + env(safe-area-inset-bottom));border-top:1px solid #23232f;background:#101018}
 .bar .nm{color:#9a9aac;max-width:60vw;overflow:hidden;text-overflow:ellipsis;white-space:nowrap}
 .bar a{color:#7d8cff;text-decoration:none;font-weight:600}
+.bar a.rep{color:#6a6a7c;font-weight:400;font-size:12px}
 .abuse{color:#6a6a7c;font-size:11px;text-align:center;padding:0 12px calc(10px + env(safe-area-inset-bottom));opacity:.8}
 .abuse a{color:inherit}
 </style></head>
@@ -3788,7 +3835,7 @@ audio{width:min(680px,92vw)}
  <img src="?raw=1" alt="{{.Name}}">
 {{end}}
 </div>
-<div class="bar"><span class="nm">{{.Name}}</span><a href="?dl=1">⬇ download</a></div>
+<div class="bar"><span class="nm">{{.Name}}</span><a href="?dl=1">⬇ download</a><a class="rep" href="__report">⚑ report</a></div>
 {{.Abuse}}
 </body></html>`))
 
@@ -9057,26 +9104,30 @@ func (s *share) abuseHTML() template.HTML {
 	if contact == "" && !s.cfg.Legal {
 		return ""
 	}
-	linkOf := func(c string) string {
-		e := template.HTMLEscapeString(c)
-		switch {
-		case strings.Contains(c, "@") && !strings.Contains(c, " "):
-			return `<a href="mailto:` + e + `">` + e + `</a>`
-		case strings.HasPrefix(c, "http://") || strings.HasPrefix(c, "https://"):
-			return `<a href="` + e + `" rel="nofollow noreferrer">` + e + `</a>`
-		default:
-			return e
-		}
-	}
 	if s.cfg.Legal {
 		who := "the operator of this link"
 		if contact != "" {
-			who = linkOf(contact)
+			who = contactLink(contact)
 		}
 		return template.HTML(`<div class="abuse">© Shared content remains the property of its ` +
 			`respective owners. Report infringement or request removal: ` + who + `</div>`)
 	}
-	return template.HTML(`<div class="abuse">Report abuse / request takedown: ` + linkOf(contact) + `</div>`)
+	return template.HTML(`<div class="abuse">Report abuse / request takedown: ` + contactLink(contact) + `</div>`)
+}
+
+// contactLink renders an abuse/takedown contact as a mailto:/https: link, or
+// plain escaped text if it's neither. Shared by the opt-in abuse line and the
+// always-on ⚑ report button.
+func contactLink(c string) string {
+	e := template.HTMLEscapeString(c)
+	switch {
+	case strings.Contains(c, "@") && !strings.Contains(c, " "):
+		return `<a href="mailto:` + e + `">` + e + `</a>`
+	case strings.HasPrefix(c, "http://") || strings.HasPrefix(c, "https://"):
+		return `<a href="` + e + `" rel="nofollow noreferrer">` + e + `</a>`
+	default:
+		return e
+	}
 }
 
 func (s *share) expiresLabel() string {
