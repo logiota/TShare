@@ -28,6 +28,7 @@ tshare --call                          # the link IS a built-in 1:1 video call
 tshare --p2p big.iso                   # ⚡ direct browser-to-browser transfer + fallback
 tshare --rar --p2p movie.mkv           # split into 1.4 GB RAR volumes → per-part ⚡ P2P (iPhone-sized)
 tshare --hub                           # 📱 homescreen-style 2-way remote (upload · grab URLs · browse)
+tshare dash                            # 📲 iOS-home-screen webui of ALL your shares (auto-password)
 tshare --allow-upload -p pw ~/proj     # collaboration: browse + upload, password-gated
 tshare -g game.html                    # 🎮 host a GIGA-NET/1-L multiplayer game over the internet:
                                        #    auto-opens as host, join link printed + on your clipboard
