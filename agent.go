@@ -3,15 +3,12 @@
 package main
 
 import (
-	"errors"
 	"fmt"
 	"log"
 	"os"
 	"os/exec"
 	"path/filepath"
-	"regexp"
 	"runtime"
-	"sort"
 	"strconv"
 	"strings"
 )
@@ -200,73 +197,4 @@ func agentPlist(label, bin string, argv []string, keepAlive bool) string {
 func xmlEsc(s string) string {
 	r := strings.NewReplacer("&", "&amp;", "<", "&lt;", ">", "&gt;")
 	return r.Replace(s)
-}
-
-func cmdRoom(args []string) {
-	c := defaultConfig()
-	applyConfig(c, args)
-	sub := ""
-	if len(args) > 0 {
-		sub = args[0]
-	}
-	switch sub {
-	case "install", "setup":
-		parseArgs(args[1:], c) // honor --mirotalk-dir / --mirotalk-port
-		if err := mirotalkApp.install(c); err != nil {
-			log.Fatalf("tshare: %v", err)
-		}
-	case "status":
-		parseArgs(args[1:], c)
-		mirotalkApp.status(c)
-	default:
-		fmt.Println("usage: tshare room install | status   (start a room with: tshare --room)")
-	}
-}
-func appendConfigKeys(kv map[string]string) error {
-	path := configPath()
-	if path == "" {
-		return errors.New("no config path")
-	}
-	existing, _ := os.ReadFile(path)
-	var add []string
-	for k, v := range kv {
-		re := regexp.MustCompile(`(?m)^(\s*(?:--)?` + regexp.QuoteMeta(k) + `\s*=\s*).*$`)
-		if re.Match(existing) { // key already present → rewrite its value in place
-			existing = re.ReplaceAll(existing, []byte("${1}"+v))
-			continue
-		}
-		add = append(add, fmt.Sprintf("%s = %s", k, v))
-	}
-	if len(add) == 0 {
-		return os.WriteFile(path, existing, 0o600) // may have updated values above
-	}
-	sort.Strings(add)
-	block := "# recorded by tshare\n" + strings.Join(add, "\n") + "\n"
-	var out string
-	switch {
-	case len(existing) == 0:
-		out = "# tshare config (see config.example)\n[default]\n" + block
-	default:
-		lines := strings.SplitAfter(string(existing), "\n")
-		at := -1 // insert index: after [default], else before the first section
-		for i, l := range lines {
-			t := strings.TrimSpace(l)
-			if t == "[default]" {
-				at = i + 1
-				break
-			}
-			if strings.HasPrefix(t, "[") && at == -1 {
-				at = i
-				break
-			}
-		}
-		if at == -1 { // no sections at all → append (still global)
-			at = len(lines)
-		}
-		out = strings.Join(lines[:at], "") + block + strings.Join(lines[at:], "")
-	}
-	if err := os.MkdirAll(filepath.Dir(path), 0o700); err != nil {
-		return err
-	}
-	return os.WriteFile(path, []byte(out), 0o600)
 }

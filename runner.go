@@ -393,3 +393,168 @@ func funnelUnavailable(out string) bool {
 	}
 	return false
 }
+
+// splitRunArgs separates share flags from the command to run. Everything after
+// a literal "--" is the command; otherwise the first non-flag token and the
+// rest are the command (so `tshare run --port 3000 node app.js` works too).
+func splitRunArgs(args []string) (flags, cmd []string) {
+	for i, a := range args {
+		if a == "--" {
+			return args[:i], args[i+1:]
+		}
+	}
+	// no "--": walk flags, stop at the first bare token that isn't a flag value
+	i := 0
+	for i < len(args) {
+		a := args[i]
+		if !strings.HasPrefix(a, "-") {
+			return args[:i], args[i:]
+		}
+		i++
+		// a known value-taking flag consumes the next token
+		if runValueFlag(a) && i < len(args) && !strings.HasPrefix(args[i], "-") {
+			i++
+		}
+	}
+	return args, nil
+}
+
+func runValueFlag(f string) bool {
+	switch strings.TrimLeft(f, "-") {
+	case "port", "p", "password", "e", "expires", "name", "n", "max", "https-port",
+		"max-rate", "max-bytes", "min-free", "dir", "abuse-contact", "profile", "template":
+		return true
+	}
+	return false
+}
+
+// cmdRun: launch any command that serves on a port and expose it over the funnel.
+//
+//	tshare run --port 3000 -- npm start
+//	tshare run -- python3 -m http.server 8000
+func cmdRun(args []string) {
+	flags, cmd := splitRunArgs(args)
+	c := defaultConfig()
+	applyConfig(c, flags)
+	if err := parseArgs(flags, c); err != nil {
+		os.Exit(2)
+	}
+	if len(cmd) == 0 && len(c.Paths) > 0 { // command landed in positionals
+		cmd, c.Paths = c.Paths, nil
+	}
+	if len(cmd) == 0 {
+		log.Fatal("usage: tshare run [flags] -- <command…>\n" +
+			"  e.g. tshare run --port 3000 -- npm start\n" +
+			"       tshare run -- python3 -m http.server 8000   (port auto-detected)")
+	}
+	c.RunCmd = cmd
+	if err := runShare(c); err != nil {
+		log.Fatalf("tshare: %v", err)
+	}
+}
+
+// detectStack maps a project folder to a start command, best-effort, for the
+// one-stop `tshare host <dir>`. Bundles nothing — if the runtime is missing,
+// launchServer reports a brew-install suggestion.
+func detectStack(dir string) (cmd []string, kind string) {
+	has := func(f string) bool { return fileExists(filepath.Join(dir, f)) }
+	switch {
+	case has("package.json"):
+		// honor an explicit "start" script; else fall back to a common entry
+		if b, err := os.ReadFile(filepath.Join(dir, "package.json")); err == nil &&
+			regexp.MustCompile(`"scripts"\s*:\s*{[^}]*"start"\s*:`).Match(b) {
+			return []string{"npm", "start"}, "node (npm start)"
+		}
+		for _, e := range []string{"server.js", "index.js", "app.js", "main.js"} {
+			if has(e) {
+				return []string{"node", e}, "node (" + e + ")"
+			}
+		}
+		return []string{"npm", "start"}, "node (npm start)"
+	case has("compose.yaml") || has("compose.yml") || has("docker-compose.yml") || has("docker-compose.yaml"):
+		return []string{"docker", "compose", "up"}, "docker compose"
+	case has("app.py"), has("wsgi.py"), has("manage.py"):
+		if has("manage.py") {
+			return []string{"python3", "manage.py", "runserver", "0.0.0.0:8000"}, "django"
+		}
+		return []string{"python3", filepath.Base(firstExisting(dir, "app.py", "wsgi.py"))}, "python"
+	case has("requirements.txt") && has("main.py"):
+		return []string{"python3", "main.py"}, "python"
+	case has("index.php"):
+		return []string{"php", "-S", "0.0.0.0:8080", "-t", "."}, "php"
+	case has("Gemfile") && has("config.ru"):
+		return []string{"bundle", "exec", "rackup", "-o", "0.0.0.0"}, "ruby (rack)"
+	case has("index.html"):
+		return nil, "static" // handled by --site, not a launched server
+	}
+	return nil, ""
+}
+
+func firstExisting(dir string, names ...string) string {
+	for _, n := range names {
+		if fileExists(filepath.Join(dir, n)) {
+			return n
+		}
+	}
+	return names[0]
+}
+
+// cmdHost: the one-stop "just host this folder" — auto-detect the stack and run
+// it (static folders route to --site; everything else to the run engine).
+func cmdHost(args []string) {
+	// a non-flag arg that names an existing directory is the target dir
+	dir := "."
+	var rest []string
+	for _, a := range args {
+		if fi, err := os.Stat(a); !strings.HasPrefix(a, "-") && err == nil && fi.IsDir() {
+			dir = a
+		} else {
+			rest = append(rest, a)
+		}
+	}
+	abs, err := filepath.Abs(dir)
+	if err != nil {
+		log.Fatalf("tshare: %v", err)
+	}
+	cmd, kind := detectStack(abs)
+	if kind == "" {
+		log.Fatalf("tshare host: couldn't detect a stack in %s\n"+
+			"  (looked for package.json / compose.yml / app.py / index.php / index.html)\n"+
+			"  run it explicitly:  tshare run --dir %s -- <start command>", abs, abs)
+	}
+	fmt.Fprintf(os.Stderr, "  ⓘ detected %s in %s\n", kind, abs)
+	c := defaultConfig()
+	applyConfig(c, rest)
+	if err := parseArgs(rest, c); err != nil {
+		os.Exit(2)
+	}
+	c.Paths = nil
+	if kind == "static" { // a plain site — use the existing static engine
+		c.Site = true
+		c.Paths = []string{abs}
+	} else {
+		c.RunCmd = cmd
+		c.RunDir = abs
+		c.RunName = "host-" + sanitizeRoomName(filepath.Base(abs))
+	}
+	if err := runShare(c); err != nil {
+		log.Fatalf("tshare: %v", err)
+	}
+}
+
+// cmdTmux lists the managed servers running in the shared 'tshare' tmux session
+// (the "backgrounded sessions in one square") and how to attach.
+func cmdTmux(args []string) {
+	if !haveExec("tmux") {
+		fmt.Println("tmux not installed (brew install tmux). Servers run as child processes without --tmux.")
+		return
+	}
+	out, err := exec.Command("tmux", "list-windows", "-t", tmuxSession,
+		"-F", "#{window_index}: #{window_name}  [#{pane_current_command}]  #{?window_active,(active),}").CombinedOutput()
+	if err != nil {
+		fmt.Println("no tshare tmux session — start a server with --tmux (e.g. tshare --tmux --room, or tshare run --tmux -- npm start)")
+		return
+	}
+	fmt.Printf("  tmux session %q — attach with:  tmux attach -t %s\n\n", tmuxSession, tmuxSession)
+	fmt.Print(string(out))
+}

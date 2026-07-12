@@ -57,6 +57,23 @@ func (r *respRec) Flush() {
 	}
 }
 
+// ReadFrom restores the kernel sendfile fast path that wrapping the
+// ResponseWriter would otherwise hide from io.Copy/http.ServeContent.
+// With a throttle (or a non-ReaderFrom writer) it falls back to plain
+// Writes so wait() can pace each chunk; bytes are tallied either way.
+func (r *respRec) ReadFrom(src io.Reader) (int64, error) {
+	rf, ok := r.ResponseWriter.(io.ReaderFrom)
+	if !ok || r.limiter != nil {
+		return io.Copy(struct{ io.Writer }{r}, src) // struct strips ReadFrom → paced Writes
+	}
+	if r.status == 0 {
+		r.status = 200
+	}
+	n, err := rf.ReadFrom(src)
+	r.bytes += n
+	return n, err
+}
+
 func (s *share) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	rec := &respRec{ResponseWriter: w, limiter: s.limiter}
 	start := time.Now()
@@ -430,11 +447,6 @@ func resolveSite(paths []string) (root, index string, err error) {
 	}
 	// a lone .html: serve its folder as the root (so sibling assets load)
 	return filepath.Dir(abs), filepath.Base(abs), nil
-}
-
-func fileExists(p string) bool {
-	fi, err := os.Stat(p)
-	return err == nil && !fi.IsDir()
 }
 
 // siteContentType returns an explicit, correct MIME type for web assets — vital
@@ -837,14 +849,15 @@ func (s *share) serveSubtitle(w *respRec, abs, ext string) {
 
 // srtToVTT does a minimal SubRip→WebVTT conversion (header + comma→dot in
 // timestamps); cue text passes through unchanged.
+var srtTimestampRe = regexp.MustCompile(`(\d\d:\d\d:\d\d),(\d\d\d)`)
+
 func srtToVTT(srt []byte) []byte {
 	text := strings.ReplaceAll(string(srt), "\r\n", "\n")
 	var b strings.Builder
 	b.WriteString("WEBVTT\n\n")
-	tsRe := regexp.MustCompile(`(\d\d:\d\d:\d\d),(\d\d\d)`)
 	for _, line := range strings.Split(text, "\n") {
 		if strings.Contains(line, "-->") {
-			line = tsRe.ReplaceAllString(line, "$1.$2")
+			line = srtTimestampRe.ReplaceAllString(line, "$1.$2")
 		}
 		b.WriteString(line)
 		b.WriteByte('\n')
@@ -1008,8 +1021,24 @@ func (s *share) handleZip(w *respRec, r *http.Request, dirRel string) {
 	}
 }
 
+// alreadyCompressed marks extensions where deflate wastes CPU for ~0 gain —
+// streaming a media folder as a zip goes from compressor-bound to I/O-bound
+// when these are stored raw. The unpacked contents are identical either way.
+var alreadyCompressed = map[string]bool{
+	".mp4": true, ".m4v": true, ".m4a": true, ".mov": true, ".mkv": true, ".webm": true,
+	".avi": true, ".mp3": true, ".aac": true, ".ogg": true, ".opus": true, ".flac": true,
+	".jpg": true, ".jpeg": true, ".png": true, ".gif": true, ".webp": true, ".heic": true, ".avif": true,
+	".zip": true, ".gz": true, ".tgz": true, ".bz2": true, ".xz": true, ".zst": true,
+	".7z": true, ".rar": true, ".dmg": true, ".apk": true, ".jar": true, ".docx": true,
+	".xlsx": true, ".pptx": true, ".pdf": true, ".enc": true,
+}
+
 func zipAdd(zw *zip.Writer, name, abs string, fi fs.FileInfo) error {
-	hdr := &zip.FileHeader{Name: name, Method: zip.Deflate, Modified: fi.ModTime()}
+	method := uint16(zip.Deflate)
+	if alreadyCompressed[strings.ToLower(filepath.Ext(name))] {
+		method = zip.Store
+	}
+	hdr := &zip.FileHeader{Name: name, Method: method, Modified: fi.ModTime()}
 	zf, err := zw.CreateHeader(hdr)
 	if err != nil {
 		return err

@@ -421,7 +421,10 @@ func (s *share) ctlServe() {
 		b, _ := json.Marshal(map[string]any{"ok": true, "changed": changed})
 		w.Write(b)
 	})
-	go http.Serve(ln, mux)
+	// local unix socket, but a header timeout still keeps a wedged client
+	// from pinning a goroutine forever
+	srv := &http.Server{Handler: mux, ReadHeaderTimeout: 5 * time.Second}
+	go srv.Serve(ln)
 }
 
 // resolveID expands a (possibly prefix) id to a known share id.

@@ -160,6 +160,16 @@ type config struct {
 	encKeyHex    string // passed to bg child so it inherits the inbox key
 }
 
+// defaultConfig is the base config (defaults) shared by the top-level share
+// path and the run/host subcommands, so there's one source of truth.
+func defaultConfig() *config {
+	return &config{TokenLen: 16, HTTPSPort: 443, MaxUpload: "5G", MinFree: "32G", CQ: 50,
+		RarSize:      "1400M",
+		MirotalkPort: 7701, KumaPort: 7702,
+		STUN: "stun:stun.l.google.com:19302,stun:stun.cloudflare.com:3478",
+		Copy: true, LAN: true, Password: os.Getenv("TSHARE_PASSWORD")}
+}
+
 func registerFlags(fs *flag.FlagSet, c *config) {
 	fs.StringVar(&c.Password, "p", c.Password, "")
 	fs.StringVar(&c.Password, "password", c.Password, "")
@@ -707,4 +717,53 @@ func loadPolicy(path string) policy {
 		}
 	}
 	return p
+}
+
+func appendConfigKeys(kv map[string]string) error {
+	path := configPath()
+	if path == "" {
+		return errors.New("no config path")
+	}
+	existing, _ := os.ReadFile(path)
+	var add []string
+	for k, v := range kv {
+		re := regexp.MustCompile(`(?m)^(\s*(?:--)?` + regexp.QuoteMeta(k) + `\s*=\s*).*$`)
+		if re.Match(existing) { // key already present → rewrite its value in place
+			existing = re.ReplaceAll(existing, []byte("${1}"+v))
+			continue
+		}
+		add = append(add, fmt.Sprintf("%s = %s", k, v))
+	}
+	if len(add) == 0 {
+		return os.WriteFile(path, existing, 0o600) // may have updated values above
+	}
+	sort.Strings(add)
+	block := "# recorded by tshare\n" + strings.Join(add, "\n") + "\n"
+	var out string
+	switch {
+	case len(existing) == 0:
+		out = "# tshare config (see config.example)\n[default]\n" + block
+	default:
+		lines := strings.SplitAfter(string(existing), "\n")
+		at := -1 // insert index: after [default], else before the first section
+		for i, l := range lines {
+			t := strings.TrimSpace(l)
+			if t == "[default]" {
+				at = i + 1
+				break
+			}
+			if strings.HasPrefix(t, "[") && at == -1 {
+				at = i
+				break
+			}
+		}
+		if at == -1 { // no sections at all → append (still global)
+			at = len(lines)
+		}
+		out = strings.Join(lines[:at], "") + block + strings.Join(lines[at:], "")
+	}
+	if err := os.MkdirAll(filepath.Dir(path), 0o700); err != nil {
+		return err
+	}
+	return os.WriteFile(path, []byte(out), 0o600)
 }

@@ -128,3 +128,20 @@ func notify(title, body string) {
 		exec.Command("notify-send", title, body).Run()
 	}
 }
+
+// haveExec reports whether an executable is on PATH.
+func haveExec(name string) bool { _, err := exec.LookPath(name); return err == nil }
+
+func freePort() (int, error) {
+	ln, err := net.Listen("tcp", "127.0.0.1:0")
+	if err != nil {
+		return 0, err
+	}
+	defer ln.Close()
+	return ln.Addr().(*net.TCPAddr).Port, nil
+}
+
+func fileExists(p string) bool {
+	fi, err := os.Stat(p)
+	return err == nil && !fi.IsDir()
+}
