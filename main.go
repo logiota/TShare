@@ -374,7 +374,8 @@ type config struct {
 	// --kuma: reuse/start a persistent Uptime Kuma monitor and expose it at the
 	// funnel root (Uptime Kuma can't run under a subpath). Native, auto start/stop.
 	Kuma     bool
-	KumaPort int // default 7702
+	KumaPort int    // default 7702
+	KumaDir  string // local Uptime Kuma checkout (default ~/.tshare/kuma)
 
 	// --rar: split the share into RAR volumes before serving (transfer
 	// chunking — e.g. so each part fits an iPhone's in-memory P2P receive)
@@ -504,6 +505,7 @@ func registerFlags(fs *flag.FlagSet, c *config) {
 	fs.BoolVar(&c.Tmux, "tmux", c.Tmux, "")
 	fs.BoolVar(&c.Kuma, "kuma", c.Kuma, "")
 	fs.IntVar(&c.KumaPort, "kuma-port", c.KumaPort, "")
+	fs.StringVar(&c.KumaDir, "kuma-dir", c.KumaDir, "")
 	fs.BoolVar(&c.Dashboard, "dashboard", c.Dashboard, "")
 	fs.BoolVar(&c.Dashboard, "web-ui", c.Dashboard, "")
 	fs.StringVar(&c.RunDir, "dir", c.RunDir, "") // working dir for `tshare run`/`host`
@@ -1143,9 +1145,6 @@ func runShare(c *config) error {
 		if len(c.Paths) > 0 {
 			return errors.New("--kuma takes no path — it exposes your Uptime Kuma dashboard")
 		}
-		if c.Local {
-			return errors.New("--kuma needs the funnel/serve root (drop -l) so the dashboard is reachable")
-		}
 		if err := kumaApp.preflight(c); err != nil { // fail before mounting anything
 			return err
 		}
@@ -1537,12 +1536,16 @@ func runShare(c *config) error {
 		if err := kumaApp.start(s); err != nil {
 			return err
 		}
-		if out, err := tsMount(c, "", c.KumaPort); err != nil {
-			return fmt.Errorf("mounting Uptime Kuma at the %s root failed:\n%s", verb(c), strings.TrimSpace(out))
-		}
-		s.mtRootMounted = true
-		if u, err := url.Parse(s.baseURL); err == nil {
-			s.kumaURL = u.Scheme + "://" + u.Host + "/"
+		if c.Local { // LAN-only: reach Kuma directly, no funnel root mount
+			s.kumaURL = fmt.Sprintf("http://%s:%d/", lanIP(), c.KumaPort)
+		} else {
+			if out, err := tsMount(c, "", c.KumaPort); err != nil {
+				return fmt.Errorf("mounting Uptime Kuma at the %s root failed:\n%s", verb(c), strings.TrimSpace(out))
+			}
+			s.mtRootMounted = true
+			if u, err := url.Parse(s.baseURL); err == nil {
+				s.kumaURL = u.Scheme + "://" + u.Host + "/"
+			}
 		}
 		s.roots[0].Abs = s.kumaURL
 		s.updateState()
@@ -5666,13 +5669,19 @@ var mirotalkApp = &nodeApp{
 var kumaApp = &nodeApp{
 	key: "kuma", name: "Uptime Kuma", repo: "https://github.com/louislam/uptime-kuma",
 	health: "uptime kuma", port: 7702, run: []string{"node", "server/server.js"}, env: []string{"NODE_ENV=production"},
-	setup: [][]string{{"npm", "run", "setup"}}, // installs deps + downloads the prebuilt dist
+	// upstream's `npm run setup` = `git checkout <tag> && npm ci … && npm run download-dist`;
+	// the git checkout needs a tag our shallow clone doesn't have (and just re-pins the version
+	// we already cloned), so run the two real steps directly.
+	setup: [][]string{{"npm", "ci", "--omit=dev", "--no-audit"}, {"npm", "run", "download-dist"}},
 	flag:  "kuma", sub: "kuma",
 }
 
 func (a *nodeApp) dir(c *config) string {
 	if a.key == "mirotalk" && c != nil && c.MirotalkDir != "" {
 		return c.MirotalkDir
+	}
+	if a.key == "kuma" && c != nil && c.KumaDir != "" {
+		return c.KumaDir
 	}
 	home, err := os.UserHomeDir()
 	if err != nil {
@@ -5800,6 +5809,10 @@ func (a *nodeApp) install(c *config) error {
 			return fmt.Errorf("%s failed: %w", strings.Join(step, " "), err)
 		}
 	}
+	// remember where it lives so `tshare` finds it next time.
+	if err := appendConfigKeys(map[string]string{a.key + "-dir": dir}); err == nil {
+		fmt.Printf("  ✓ recorded %s-dir in %s\n", a.key, configPath())
+	}
 	fmt.Printf("\n  ✓ %s ready — start it:  tshare %s\n", a.name, a.flag)
 	return nil
 }
@@ -5822,10 +5835,12 @@ func cmdKuma(args []string) {
 	}
 	switch sub {
 	case "install", "setup":
+		parseArgs(args[1:], c) // honor --kuma-dir / --kuma-port
 		if err := kumaApp.install(c); err != nil {
 			log.Fatalf("tshare: %v", err)
 		}
 	case "status":
+		parseArgs(args[1:], c)
 		kumaApp.status(c)
 	default:
 		if err := parseArgs(args, c); err != nil {
@@ -6376,10 +6391,12 @@ func cmdRoom(args []string) {
 	}
 	switch sub {
 	case "install", "setup":
+		parseArgs(args[1:], c) // honor --mirotalk-dir / --mirotalk-port
 		if err := mirotalkApp.install(c); err != nil {
 			log.Fatalf("tshare: %v", err)
 		}
 	case "status":
+		parseArgs(args[1:], c)
 		mirotalkApp.status(c)
 	default:
 		fmt.Println("usage: tshare room install | status   (start a room with: tshare --room)")
@@ -6393,16 +6410,18 @@ func appendConfigKeys(kv map[string]string) error {
 	existing, _ := os.ReadFile(path)
 	var add []string
 	for k, v := range kv {
-		if regexp.MustCompile(`(?m)^\s*(--)?` + regexp.QuoteMeta(k) + `\s*=`).Match(existing) {
+		re := regexp.MustCompile(`(?m)^(\s*(?:--)?` + regexp.QuoteMeta(k) + `\s*=\s*).*$`)
+		if re.Match(existing) { // key already present → rewrite its value in place
+			existing = re.ReplaceAll(existing, []byte("${1}"+v))
 			continue
 		}
 		add = append(add, fmt.Sprintf("%s = %s", k, v))
 	}
 	if len(add) == 0 {
-		return nil
+		return os.WriteFile(path, existing, 0o600) // may have updated values above
 	}
 	sort.Strings(add)
-	block := "# added by `tshare room install`\n" + strings.Join(add, "\n") + "\n"
+	block := "# recorded by tshare\n" + strings.Join(add, "\n") + "\n"
 	var out string
 	switch {
 	case len(existing) == 0:
