@@ -11,9 +11,13 @@ qr           = true
 # max-rate   = 5M               # throttle served bandwidth to ~5 MB/s
 # min-free   = 32G              # refuse uploads below this much free disk (0 = off)
 # abuse-contact = abuse@example.com   # small-font takedown line on public pages
-# --room video rooms: `tshare room install` fills mirotalk-dir/-method for you.
+# --room video rooms: `tshare room install` records mirotalk-dir for you.
 # mirotalk-url  = https://meet.example.com   # remote instance instead of the local one
-# mirotalk-port = 3000                       # where the local instance listens
+# mirotalk-port = 7701                       # where the local instance listens
+# mirotalk-dir  = /Users/you/dev/mirotalk    # checkout (absolute path; default ~/.tshare/mirotalk)
+# tshare kuma: `tshare kuma install` records kuma-dir the same way.
+# kuma-port    = 7702
+# kuma-dir     = /Users/you/dev/uptime-kuma  # checkout (absolute path; default ~/.tshare/kuma)
 # WebRTC (--p2p / --call): STUN defaults are sane; add TURN for hard-NAT fallback.
 # stun = stun:stun.l.google.com:19302,stun:stun.cloudflare.com:3478
 # turn = turn:turn.example.com:3478          # + turn-user / turn-pass

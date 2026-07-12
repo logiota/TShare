@@ -7,9 +7,10 @@ Default is the simplest thing possible: `tshare <path>` → one public, unguessa
 ## Build
 
 ```sh
-brew install go        # if needed
-cd tshare && go build  # → ./tshare
-sudo make install      # optional: /usr/local/bin/tshare
+brew install go                                  # if needed
+git clone https://github.com/logiota/TShare
+cd TShare && go build                            # → ./tshare
+sudo make install                                # optional: /usr/local/bin/tshare
 ```
 
 Requires Tailscale running, with MagicDNS + HTTPS certs enabled and the `funnel` node attribute ([setup](https://tailscale.com/kb/1223/funnel)). Run `tshare doctor` to check all of it.
@@ -28,7 +29,7 @@ tshare --call                          # the link IS a built-in 1:1 video call
 tshare --p2p big.iso                   # ⚡ direct browser-to-browser transfer + fallback
 tshare --rar --p2p movie.mkv           # split into 1.4 GB RAR volumes → per-part ⚡ P2P (iPhone-sized)
 tshare --hub                           # 📱 homescreen-style 2-way remote (upload · grab URLs · browse)
-tshare dash                            # 📲 iOS-home-screen webui of ALL your shares (auto-password)
+tshare dash                            # 📲 iOS-home-screen web UI of ALL your shares (auto-password)
 tshare --allow-upload -p pw ~/proj     # collaboration: browse + upload, password-gated
 tshare -g game.html                    # 🎮 host a GIGA-NET/1-L multiplayer game over the internet:
                                        #    auto-opens as host, join link printed + on your clipboard
@@ -81,17 +82,30 @@ Emergency stop: `tshare panic` SIGKILLs **every** running share, tears down all 
 
 Reach: a normal share is reachable three ways at once — the **public internet** (Funnel), your **tailnet** (same `https://<host>.ts.net/<token>` URL, since Funnel is built on Serve), and your **local network** directly at `http://<lan-ip>:<port>/<token>` (printed as the `lan` line — faster, no internet round-trip). The LAN URL is gated by the same secret token; a direct hit without it 404s. Use `-t` for tailnet-only, `--no-lan` to drop the LAN path, or `-l/--local` for LAN-only with no Tailscale at all.
 
-Public-DNS caveat: a Funnel link is only *actually* public if `<host>.ts.net` resolves on the **public internet** — occasionally Tailscale reports Funnel "on" (cert + attribute present) but hasn't published the DNS record, so links silently work on your tailnet and NXDOMAIN for everyone else. tshare now checks this: `tshare doctor` reports "funnel DNS resolves publicly", and a share warns at startup if its link won't resolve off-tailnet. The fix is Tailscale-side — re-publish with `tailscale funnel reset && tailscale up`, and confirm HTTPS + Funnel are on in the admin console.
+Public-DNS caveat: a Funnel link is only *actually* public if `<host>.ts.net` resolves on the **public internet** — occasionally Tailscale reports Funnel "on" (cert + attribute present) but hasn't published the DNS record, so links silently work on your tailnet and NXDOMAIN for everyone else. tshare checks this: `tshare doctor` reports "funnel DNS resolves publicly", and a share warns at startup if its link won't resolve off-tailnet. The fix is Tailscale-side — run `tailscale funnel reset`, then restart your shares so the mounts (and the DNS record) are re-published, and confirm HTTPS + Funnel are enabled in the admin console. (Avoid a bare `tailscale up`: it re-applies *only* the flags you give it and can silently drop an exit-node or other settings.)
 
 Media: images, video and audio open in a clean, full-size player page (iOS-friendly — `playsinline`, correct MIME types, byte-range streaming, no quirk-mode mini frame). The raw stream lives at `?raw=1`, `?dl=1` forces download, and folder pages have a ⬇ per row. `--inline` forces in-browser viewing for every type. Non-browser clients (curl, wget) always get the bytes, never the player HTML.
 
 Receiving end needs nothing but a browser or curl:
 
 ```sh
-curl -OJ  https://mac.tailxxxx.ts.net/<token>/report.pdf      # download
+curl -OJ  https://<host>.ts.net/<token>/report.pdf            # download
 curl -u :pw -F f=@notes.txt https://…/<token>/__upload        # send a file
 curl -o all.zip https://…/<token>/__zip                       # folder as zip
 ```
+
+## Share a running server (`-s`)
+
+`-s` / `--server` reverse-proxies an already-running local server over the funnel — dev servers, notebooks, any `http://localhost:PORT`. A localhost URL is auto-detected as a server (so it's proxied, not downloaded by yt-dlp). tshare's token/password/expiry/limits sit in front; the upstream's `Host` header is rewritten so dev-server host checks pass, and WebSockets/HMR pass through.
+
+```sh
+tshare -s http://localhost:8000        # share a server explicitly
+tshare http://localhost:5173           # localhost URL → auto-proxied (Vite, etc.)
+tshare -s http://localhost:3000 -p pw  # password-gate it
+tshare -s http://192.168.1.9:9000      # any reachable host:port with -s
+```
+
+Same subpath caveat as `--site`: the app is served under `/<token>/`, so **relative asset paths** work; root-absolute (`/assets/…`) need your dev server's base path set to the share path (pair with `--name`). For Vite/webpack that's `base`/`publicPath`.
 
 ## One-stop hosting: run & expose any local server
 
@@ -129,27 +143,14 @@ tshare agent status / uninstall
 
 It's shaped like what Homebrew generates, so once tshare is installed from a tap the same thing is available as `brew services start tshare` (see the `service` block in `Formula/tshare.rb`). On Linux, `tshare agent` points you at the equivalent `systemd --user` one-liner.
 
-## Share a running server (v1.10)
-
-`-s` / `--server` reverse-proxies an already-running local server over the funnel — dev servers, notebooks, any `http://localhost:PORT`. A localhost URL is auto-detected as a server (so it's proxied, not downloaded by yt-dlp). tshare's token/password/expiry/limits sit in front; the upstream's `Host` header is rewritten so dev-server host checks pass, and WebSockets/HMR pass through.
-
-```sh
-tshare -s http://localhost:8000        # share a server explicitly
-tshare http://localhost:5173           # localhost URL → auto-proxied (Vite, etc.)
-tshare -s http://localhost:3000 -p pw  # password-gate it
-tshare -s http://192.168.1.9:9000      # any reachable host:port with -s
-```
-
-Same subpath caveat as `--site`: the app is served under `/<token>/`, so **relative asset paths** work; root-absolute (`/assets/…`) need your dev server's base path set to the share path (pair with `--name`). For Vite/webpack that's `base`/`publicPath`.
-
 ## Video rooms (local MiroTalk, auto-managed)
 
 `--room` turns a secret link into the door to a [MiroTalk](https://github.com/miroslavpejic85/mirotalk) video room running **on your own machine**. One-time setup, then it's fully automatic:
 
 ```sh
-tshare room install        # once: clones MiroTalk from GitHub into ~/.tshare/mirotalk,
-                           # copies its .env/config templates, installs deps (npm ci),
-                           # natively — no Docker
+tshare room install        # once: clones MiroTalk from GitHub into ~/.tshare/mirotalk
+                           # (or --mirotalk-dir <path>, remembered in your config), copies
+                           # its .env/config templates, installs deps (npm ci) — no Docker
 tshare --room standup      # every time after: tshare starts MiroTalk (if it isn't
                            # already running), health-checks it, exposes it at your
                            # funnel ROOT, and prints the token-gated room link
@@ -157,18 +158,18 @@ tshare --room standup      # every time after: tshare starts MiroTalk (if it isn
 
 The landing page has a **Join call** button and an optional display-name field; your `-p` password, `-e` expiry and the unguessable token decide **who reaches the join button**. The join URL is the documented `…/join?room=<name>` form. Room ids are random and unguessable unless you name one (`Team Sync` → `Team-Sync`). `?go=1` on the share link skips the landing page and 302s straight into the call. When the share stops, the MiroTalk it started stops with it (a MiroTalk you started yourself is reused and left alone); `tshare panic` reaps it too. Media never touches the server — MiroTalk P2P is mesh WebRTC, so the local instance only carries **signaling**; tshare runs it with `NODE_ENV=production`.
 
-`--mirotalk-url https://meet.mycorp.com` still points at a remote self-hosted instance instead; `tshare room status` shows what's installed/running. It runs natively (git clone + `npm ci`, then `npm start`) — no Docker. Caveats: MiroTalk needs the funnel **root** path (it's mounted at `/`, coexisting with token-path shares), and expiry/revocation gates *new* visitors — people already in the room hold the room URL.
+`--mirotalk-url https://meet.mycorp.com` points at a remote self-hosted instance instead; `tshare room status` shows what's installed/running. Caveats: MiroTalk needs the funnel **root** path (it's mounted at `/`, coexisting with token-path shares), and expiry/revocation gates *new* visitors — people already in the room hold the room URL.
 
 ## Uptime Kuma monitor (`tshare kuma`)
 
 Expose your [Uptime Kuma](https://github.com/louislam/uptime-kuma) status monitor over the funnel with one command:
 
 ```sh
-tshare kuma install    # once: install Uptime Kuma natively (git clone + npm run setup)
+tshare kuma install    # once: clone Uptime Kuma + npm ci + download the prebuilt web dist
 tshare kuma            # start Uptime Kuma and expose it (auto-stops with the share)
 ```
 
-`tshare kuma install` clones Uptime Kuma into `~/.tshare/kuma` and runs its native setup (`npm run setup` — needs `node`/`npm`; tshare bundles nothing and points you at `brew install node` if missing). `tshare kuma` then reuses an instance already listening on `:7702`, or starts the native one on demand and **stops it with the share** — the same managed engine `--room` (MiroTalk) uses. Monitors and history persist in `~/.tshare/kuma/data`. It's mounted at the funnel **root** because Uptime Kuma [can't run under a sub-path](https://github.com/louislam/uptime-kuma/wiki/Reverse-Proxy); the `/<token>/` link is a small landing page with an **Open dashboard →** button (`?go=1` jumps straight there). Auth is Uptime Kuma's own login — set the admin account on first run. `--kuma-port` if `:7702` is taken; `tshare kuma status` shows install/port state.
+`tshare kuma install` clones Uptime Kuma into `~/.tshare/kuma` (or anywhere — `--kuma-dir ~/dev/uptime-kuma` is remembered in your config), installs its server dependencies, and downloads the prebuilt web dist — no build step, no Docker. It needs `node`/`npm`; tshare bundles nothing and points you at `brew install node` if missing. `tshare kuma` then reuses an instance already listening on `:7702`, or starts the native one on demand and **stops it with the share** — the same managed engine `--room` (MiroTalk) uses. Monitors and history persist in the checkout's `data/` folder, so they survive share restarts. It's mounted at the funnel **root** because Uptime Kuma [can't run under a sub-path](https://github.com/louislam/uptime-kuma/wiki/Reverse-Proxy); the `/<token>/` link is a small landing page with an **Open dashboard →** button (`?go=1` jumps straight there). Auth is Uptime Kuma's own login — set the admin account on first run. `--kuma-port` if `:7702` is taken; `tshare kuma status` shows install/port state.
 
 ## ⚡ P2P direct transfers (`--p2p`) and built-in calls (`--call`)
 
@@ -207,7 +208,11 @@ tshare --hub ~/Drop -p pw    # any folder, password-gated
 
 The page has four tiles: **📤 Send files** (upload from the phone straight to the host), **🌐 Grab a URL** (paste any link — the host downloads it with yt-dlp for sites/videos or a direct fetch for file URLs, with live progress), **📁 Files** (browse, download, or delete what's in the folder), and **📝 Note** (a shared scratch note). It ships a web-app manifest and a generated icon, so **Add to Home Screen** on iOS gives you a standalone, app-like remote. Everything sits behind the same token + `-p` password; expiry defaults to never (it's a standing remote). Web-grabs of private/loopback/link-local addresses are refused (SSRF guard) — it's meant to pull from the public web, not your LAN. Uploads honor `--min-free`; grabs land in the hub folder and appear immediately in the file list.
 
-## Static websites over Funnel (v1.8)
+## Dashboard (`tshare dash`)
+
+`tshare dash` serves an iOS-home-screen-style web UI tiling **every active share** — tap a tile to open that share. It generates a random password (printed once) and refreshes itself as shares come and go; add it to your phone's home screen and you have a one-tap index of everything you're serving.
+
+## Static websites over Funnel (`--site`)
 
 `--site` (or `--web`) serves a folder as a **live website** instead of a file browser — `index.html` routing, correct content-types, scripts run (no sandbox, no forced download), `404.html` fallback if present, and `ServeContent` caching (Last-Modified/ETag/304). Expiry defaults to **never** since sites are long-term.
 
@@ -227,7 +232,7 @@ tshare --site --allow-upload ~/app   # site whose pages can ALSO POST files to _
 
 Funnel caveat (same as any subpath host): the site lives under `https://<host>.ts.net/<token>/`, so **use relative asset paths** (`href="style.css"`, `src="js/app.js"`) — they resolve correctly. Root-absolute paths (`/style.css`) escape the mount and 404; if your generator emits those, set its base URL to the share path and pair with `--name` for a stable prefix. Always share the link **with its trailing slash**.
 
-## Folders run on copyparty (v1.6)
+## Folders run on copyparty
 
 Single-folder browse / upload / inbox shares are handed to [copyparty](https://github.com/9001/copyparty) when it's installed — you get resumable + dedup uploads, thumbnails, a media gallery, search, and WebDAV — **reverse-proxied behind tshare**, so the secret token, password, expiry, byte-cap, access log and probe alerts still apply. copyparty binds to loopback only and runs anonymous; tshare is the gate.
 
@@ -242,7 +247,7 @@ tshare --copyparty-bin ./copyparty-sfx.py ~/x   # explicit binary / sfx
 
 tshare's built-in folder server (listing, gallery lightbox, zip-all, native upload + at-rest `--encrypt`) remains as an automatic fallback when copyparty isn't present, and still handles multi-path shares and single files. Native video keeps improving: the player now auto-loads sibling **subtitles** (`movie.srt`/`movie.en.vtt`, `.srt`→WebVTT on the fly) and a **poster** image, on top of the iOS-friendly streaming/seek and `--transcode`/`--hevc`.
 
-## Power features (v1.5)
+## Power features
 
 Change a running foreground share by just **typing options** at it — `-p secret`, `-e 2d`, `-n 5`, `--no-password`, `info`, or `stop` — no second terminal needed (same effect as `tshare set`, which still works from elsewhere).
 
@@ -252,7 +257,7 @@ tshare --max-bytes 2G big.iso            # stop after ~2 GB served (1.5× hard c
 tshare -u --encrypt                      # inbox that encrypts uploads at rest; prints a key
 tshare decrypt -p pass received.txt.enc  # ...decrypt them later
 tshare --transcode --hevc clip.mkv       # hardware H.265/HEVC MP4 (VideoToolbox/NVENC), streamable
-tshare --265 clip.mkv                     # ^ shortcut: hardware HEVC to a temp file at constant quality
+tshare --265 clip.mkv                    # ^ shortcut: hardware HEVC to a temp file at constant quality
 tshare --265 --cq 40 clip.mkv            # tune quality (default CQ 50; see scale note below)
 tshare --heif --strip-exif ~/Photos      # HEIC→JPEG for browsers, EXIF stripped; folder gets a lightbox
 tshare --progressive - < <(yt-dlp -o - URL)   # serve while it downloads
@@ -275,9 +280,9 @@ require_password = true
 max_expires      = 7d
 ```
 
-Homebrew: `brew install tshare` once the tap is live — `brew tap yourname/tshare && brew install tshare` (the `Formula/tshare.rb` here is what the tap publishes). To build straight from this checkout without a tap: `brew install --build-from-source ./Formula/tshare.rb`.
+Homebrew: once the tap is live, `brew tap logiota/tshare && brew install tshare` (the `Formula/tshare.rb` here is what the tap publishes). To build straight from this checkout without a tap: `brew install --build-from-source ./Formula/tshare.rb`.
 
-## All flags
+## Common flags
 
 Nice defaults (each individually disableable): the link is **copied to your clipboard** (`--no-copy`), a **terminal QR code** prints when `qrencode` is installed (`--no-qr`; `brew install qrencode`), **desktop notifications** fire for received uploads *and* for invalid/unauthorized access attempts with the caller's IP + attempted URL, throttled against scanners (`--no-notify`), every share **expires after 15 days** unless you pass `-e` (`-e never` = immortal, changeable later via `tshare set`), and Ctrl-C prints a download/upload summary.
 
@@ -310,6 +315,23 @@ Nice defaults (each individually disableable): the link is **copied to your clip
 | `--https-port` | funnel port 443/8443/10000 |
 | `--port` | pin local backend port |
 | `--tailscale-bin` | CLI path (also env `TAILSCALE`) |
+| `-s, --server` | reverse-proxy a running local server |
+| `--site` / `--web` | serve a folder as a live website |
+| `-g, --gamelink` | one-command GIGA-NET/1-L game hosting (implies `--site --allow-upload`) |
+| `--room` / `--call` / `--p2p` / `--hub` | video room · 1:1 call · ⚡ direct transfer · phone remote |
+| `--rar` / `--rar-size` | split into RAR volumes first (default `1400M`) |
+| `--stun` / `--turn` (+`-user`/`-pass`) | WebRTC ICE servers for `--p2p`/`--call`/`-g` |
+| `--transcode` / `--hevc` / `--265` / `--cq` | video transcodes (see Power features) |
+| `--heif` / `--strip-exif` | HEIC→JPEG for browsers / drop photo metadata |
+| `--encrypt` | encrypt received uploads at rest (AES-256-GCM) |
+| `--progressive` / `--live` / `--fetch` / `--watch` | serve-while-downloading · live streams · wget-style fetch · announce new files |
+| `--max-bytes` | stop after ~this many served bytes (1.5× in-flight ceiling) |
+| `--require-identity` | Funnel link, but tailnet logins only |
+| `--persist` | remembered by `tshare resume` / the LaunchAgent after a reboot |
+| `--profile` / `--template` / `--no-config` | config-file presets on/off |
+| `--lan-https` | self-signed HTTPS for `-l` LAN shares |
+
+Full list with defaults: `tshare help`.
 
 ## Security model
 

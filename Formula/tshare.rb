@@ -3,16 +3,16 @@
 # Local install (from this repo):
 #   brew install --build-from-source ./Formula/tshare.rb
 #
-# For a tap, push tshare to a GitHub repo, cut a release tarball, set `url`
-# and `sha256` below, then:  brew tap <you>/tshare && brew install tshare
+# For a tap, cut a release tarball, set `url` and `sha256` below, then:
+#   brew tap logiota/tshare && brew install tshare
 class Tshare < Formula
   desc "Secret-link file sharing & collaboration over Tailscale Funnel"
-  homepage "https://github.com/yourname/tshare"
-  version "1.5.0"
+  homepage "https://github.com/logiota/TShare"
+  version "1.10.0"
   license "MIT"
 
-  # Replace with your release tarball + checksum (shasum -a 256 tshare-1.5.0.tar.gz):
-  url "https://github.com/yourname/tshare/archive/refs/tags/v1.5.0.tar.gz"
+  # Replace with the release tarball + checksum (shasum -a 256 tshare-1.10.0.tar.gz):
+  url "https://github.com/logiota/TShare/archive/refs/tags/v1.10.0.tar.gz"
   sha256 "0000000000000000000000000000000000000000000000000000000000000000"
 
   depends_on "go" => :build
