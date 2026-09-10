@@ -107,6 +107,30 @@ const (
 	cpSockSz = "2097152" // 2 MiB
 )
 
+// copypartyPerm returns the anonymous volume permission string for this share.
+//
+//	r   — list + download (default folder share, or --ro)
+//	w   — upload-only drop box (default -u inbox)
+//	rw  — collaborative (--allow-upload)
+//	A   — full rights rwmda. (--full): read/write/move/delete/admin/dots
+func (s *share) copypartyPerm() string {
+	c := s.cfg
+	if c.Full {
+		return "A"
+	}
+	if c.ReadOnly {
+		return "r"
+	}
+	switch {
+	case s.mode == "inbox":
+		return "w"
+	case s.upDir != "":
+		return "rw"
+	default:
+		return "r"
+	}
+}
+
 // startCopyparty launches copyparty on a loopback port serving the share's
 // folder at the volume location /<token>, then builds the reverse proxy.
 func startCopyparty(s *share) error {
@@ -119,14 +143,7 @@ func startCopyparty(s *share) error {
 	if s.mode == "inbox" {
 		dir = s.upDir
 	}
-	// permission: read-only browse, rw when uploads allowed, write-only inbox
-	perm := "r"
-	switch {
-	case s.mode == "inbox":
-		perm = "w" // upload-only drop box (no listing/download)
-	case s.upDir != "": // --allow-upload
-		perm = "rw"
-	}
+	perm := s.copypartyPerm()
 	port, err := freePort()
 	if err != nil {
 		return err

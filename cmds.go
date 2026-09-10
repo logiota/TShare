@@ -142,7 +142,23 @@ func cmdRm(args []string) {
 			}
 		}
 		os.Remove(stateFile(r.ID))
+		os.Remove(persistFile(r.ID))
+		os.Remove(filepath.Join(ctlDir(), r.ID+".sock"))
 		fmt.Printf("  ✓ stopped %s (%s)\n", r.ID, r.URL)
+	}
+	// rm all: also sweep every resume record and stale control socket, so the
+	// keepalive/resume loop can't resurrect any of them 60s later.
+	if all {
+		if des, err := os.ReadDir(persistDir()); err == nil {
+			for _, de := range des {
+				os.Remove(filepath.Join(persistDir(), de.Name()))
+			}
+		}
+		if des, err := os.ReadDir(ctlDir()); err == nil {
+			for _, de := range des {
+				os.Remove(filepath.Join(ctlDir(), de.Name()))
+			}
+		}
 	}
 	if n == 0 {
 		fmt.Println("no matching share id — see: tshare ls")

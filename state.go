@@ -22,6 +22,7 @@ type stateRec struct {
 	PID       int       `json:"pid"`
 	Token     string    `json:"token"`
 	Mode      string    `json:"mode"`
+	Title     string    `json:"title,omitempty"` // short human label (filename, host, room name, …)
 	URL       string    `json:"url"`
 	Target    string    `json:"target"`
 	Tailnet   bool      `json:"tailnet_only"`
@@ -67,7 +68,7 @@ func (s *share) stateRec(port int) stateRec {
 	}
 	gameJoin, gameHost := s.gameLinks()
 	return stateRec{
-		ID: s.id, PID: os.Getpid(), Token: s.token, Mode: s.mode,
+		ID: s.id, PID: os.Getpid(), Token: s.token, Mode: s.mode, Title: s.title(),
 		URL: s.prettyURL(), Target: target, Tailnet: s.cfg.Tailnet, Local: s.cfg.Local,
 		HTTPSPort: s.cfg.HTTPSPort, Port: port, Password: s.getPassword() != "",
 		MaxDL: s.maxDL.Load(), Downloads: s.dl.Load(), Uploads: s.upCount.Load(),
@@ -330,9 +331,17 @@ func cmdResume(args []string) {
 		if live[rec.ID] {
 			continue // already running
 		}
+		// a live share may already hold this record's name/token (e.g. it was
+		// resumed earlier under a different id) — don't start a duplicate.
+		if name := persistName(rec.Args); name != "" && nameInUse(name) {
+			continue
+		}
 		ra := append([]string{}, rec.Args...)
 		if !hasArg(ra, "-b") && !hasArg(ra, "--bg") {
 			ra = append(ra, "-b") // resume detached
+		}
+		if !hasArg(ra, "--__id") {
+			ra = append(ra, "--__id", rec.ID) // reuse the persist id so resume is idempotent
 		}
 		cmd := exec.Command(exe, ra...)
 		cmd.Dir = rec.Cwd
@@ -344,4 +353,18 @@ func cmdResume(args []string) {
 		n++
 	}
 	fmt.Printf("resumed %d share(s)\n", n)
+}
+
+// persistName extracts the --name/-n token from a persisted record's args, if
+// any, so resume can detect that the name is already served by a live share.
+func persistName(args []string) string {
+	for i, a := range args {
+		if (a == "--name" || a == "-n") && i+1 < len(args) {
+			return args[i+1]
+		}
+		if strings.HasPrefix(a, "--name=") {
+			return strings.TrimPrefix(a, "--name=")
+		}
+	}
+	return ""
 }

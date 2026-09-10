@@ -240,7 +240,10 @@ Single-folder browse / upload / inbox shares are handed to [copyparty](https://g
 pip install copyparty            # then folders "just work"
 tshare ~/Designs                 # browse via copyparty behind your secret link
 tshare --allow-upload ~/proj     # collaborative (read+write)
+tshare --full ~/proj             # full copyparty rights (read/write/move/delete)
 tshare -u                        # write-only drop-box inbox
+tshare -u --full                 # uploads folder with full rights (browse + manage)
+tshare -u --ro                   # share the uploads folder read-only
 tshare --no-copyparty ~/Designs  # force the built-in native folder server
 tshare --copyparty-bin ./copyparty-sfx.py ~/x   # explicit binary / sfx
 ```
@@ -292,9 +295,11 @@ Nice defaults (each individually disableable): the link is **copied to your clip
 | `-e, --expires` | auto-stop: `30m`, `2h`, `1d`, `1w`, `never` (default: **15d**) |
 | `--filename` | public name for stdin shares / rename a single-file share |
 | `-n, --max` / `--once` | stop after N / 1 completed downloads |
-| `-u, --upload [dir]` | inbox mode (default `./tshare-inbox`) |
+| `-u, --upload [dir]` | inbox mode (default `./tshare-inbox`); write-only drop-box unless paired with `--full` / `--ro` |
 | `-i, --blackhole` | write-only sink: uploads read + counted + notified, **bytes discarded** (nothing on disk) |
 | `--allow-upload` | folder share also accepts uploads (also works with `--site`: pages run *and* `__upload` accepts POSTs — e.g. in-page signalling like GIGA-NET/1-L) |
+| `--full` | full copyparty rights (`A` = read/write/move/delete/admin) on a folder or `-u` uploads folder |
+| `--ro`, `--read-only` | force read-only access; with `-u`, browse the uploads folder without further uploads |
 | `--max-rate` | throttle served bandwidth, e.g. `2M` = ~2 MB/s (default: off) |
 | `--min-free` | refuse uploads when free disk space drops below this (default **32G**; `0` = off) |
 | `--abuse-contact` | show a small-font takedown/abuse line on public share pages (email/URL auto-linked) |

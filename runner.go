@@ -351,7 +351,12 @@ func setupRun(c *config, s *share) error {
 	if dir == "" {
 		dir, _ = os.Getwd()
 	}
-	name := c.RunName
+	// --name is an explicit label and must win over the auto-derived name
+	// (host-<dirname> from `tshare host`, or run-<id>).
+	name := c.Name
+	if name == "" {
+		name = c.RunName
+	}
 	if name == "" {
 		name = "run-" + s.id
 	}
@@ -397,26 +402,124 @@ func funnelUnavailable(out string) bool {
 // splitRunArgs separates share flags from the command to run. Everything after
 // a literal "--" is the command; otherwise the first non-flag token and the
 // rest are the command (so `tshare run --port 3000 node app.js` works too).
+// Share flags may also be placed AFTER the command: a trailing run of tshare
+// flags is lifted back onto the share, so `tshare run -- node app.js --tmux
+// --name demo` behaves the same as the flags-before form.
 func splitRunArgs(args []string) (flags, cmd []string) {
 	for i, a := range args {
 		if a == "--" {
-			return args[:i], args[i+1:]
+			flags, cmd = args[:i], args[i+1:]
+			break
 		}
 	}
-	// no "--": walk flags, stop at the first bare token that isn't a flag value
-	i := 0
-	for i < len(args) {
-		a := args[i]
-		if !strings.HasPrefix(a, "-") {
-			return args[:i], args[i:]
-		}
-		i++
-		// a known value-taking flag consumes the next token
-		if runValueFlag(a) && i < len(args) && !strings.HasPrefix(args[i], "-") {
+	if cmd == nil {
+		// no "--": walk flags, stop at the first bare token that isn't a flag value
+		i := 0
+		for i < len(args) {
+			a := args[i]
+			if !strings.HasPrefix(a, "-") {
+				flags, cmd = args[:i], args[i:]
+				break
+			}
 			i++
+			// a known value-taking flag consumes the next token
+			if runValueFlag(a) && i < len(args) && !strings.HasPrefix(args[i], "-") {
+				i++
+			}
+		}
+		if cmd == nil {
+			flags, cmd = args, nil
 		}
 	}
-	return args, nil
+	if tail := trailingShareFlags(cmd); len(tail) > 0 {
+		flags = append(append([]string(nil), flags...), tail...)
+		cmd = cmd[:len(cmd)-len(tail)]
+	}
+	return flags, cmd
+}
+
+// trailingShareFlags detects a trailing run of tshare flags on a run command
+// (e.g. "-- node app.js --tmux --name demo") and returns them. Nothing is
+// lifted unless the run includes a flag that is unmistakably tshare's (tmux,
+// -b, --persist, …), so an app's own trailing options are left alone.
+func trailingShareFlags(cmd []string) []string {
+	if len(cmd) < 2 {
+		return nil
+	}
+	i := len(cmd)
+	for i > 0 {
+		if !isTshareFlag(cmd[i-1]) {
+			if i >= 2 && isTshareFlag(cmd[i-2]) {
+				i -= 2 // a tshare value flag + its value
+				continue
+			}
+			break
+		}
+		i--
+	}
+	cluster := cmd[i:]
+	if len(cluster) == 0 || !tshareIntent(cluster) {
+		return nil
+	}
+	return cluster
+}
+
+// isTshareFlag reports whether tok names one of tshare's own flags (value-taking
+// or boolean), so trailing-flag lifting only ever peels tshare flags off a
+// command and never touches an app's options.
+func isTshareFlag(tok string) bool {
+	name := strings.TrimLeft(tok, "-")
+	if name == "" || name == tok {
+		return false
+	}
+	switch name {
+	case "port", "p", "password", "e", "expires", "name", "n", "max", "https-port",
+		"max-rate", "max-bytes", "min-free", "dir", "abuse-contact", "profile", "template",
+		"token-len", "max-upload", "tailscale-bin", "filename", "yt-format", "yt-args",
+		"room-name", "mirotalk-url", "mirotalk-dir", "mirotalk-method", "mirotalk-port",
+		"mirotalk-jwt-key", "kuma-port", "kuma-dir", "copyparty-bin", "copyparty-args",
+		"rar-size", "stun", "turn", "turn-user", "turn-pass", "cq":
+		return true
+	}
+	return tshareBoolFlag(name)
+}
+
+func tshareBoolFlag(name string) bool {
+	switch name {
+	case "once", "t", "tailnet", "u", "upload", "allow-upload", "z", "zip", "site",
+		"web", "gamelink", "g", "l", "local", "lan", "no-lan", "inline", "b", "bg",
+		"q", "qr", "c", "copy", "no-qr", "no-copy", "no-notify", "no-open", "open",
+		"quiet", "json", "Y", "yt-dlp", "yt-audio", "a", "playlist", "fetch",
+		"progressive", "live", "s", "server", "require-identity", "i", "blackhole",
+		"room", "mirotalk", "p2p", "p2pi", "call", "hub", "tmux", "kuma", "dashboard",
+		"web-ui", "rar", "full", "ro", "read-only", "lan-https", "no-config", "watch",
+		"persist", "no-repl", "265", "hevc", "transcode", "strip-exif", "no-gallery",
+		"encrypt", "copyparty", "no-copyparty":
+		return true
+	}
+	return false
+}
+
+// runIntentFlags are tshare options unlikely to belong to a launched app, so a
+// run containing any of them is treated as passing tshare flags after the --.
+func tshareIntent(cluster []string) bool {
+	for _, c := range cluster {
+		if tshareIntentSet[strings.TrimLeft(c, "-")] {
+			return true
+		}
+	}
+	return false
+}
+
+var tshareIntentSet = map[string]bool{
+	"b": true, "bg": true, "tmux": true, "persist": true, "no-repl": true,
+	"room": true, "mirotalk": true, "kuma": true, "hub": true, "dashboard": true,
+	"web-ui": true, "call": true, "p2p": true, "p2pi": true, "blackhole": true,
+	"i": true, "rar": true, "gamelink": true, "g": true, "quiet": true, "json": true,
+	"no-config": true, "tailnet": true, "t": true, "upload": true, "u": true,
+	"full": true, "ro": true, "read-only": true, "no-open": true, "no-notify": true,
+	"no-qr": true, "no-copy": true, "require-identity": true, "site": true,
+	"web": true, "local": true, "l": true, "watch": true, "encrypt": true,
 }
 
 func runValueFlag(f string) bool {

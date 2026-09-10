@@ -86,6 +86,9 @@ SECURITY FLAGS
 MODES
   -t, --tailnet           tailnet-only (tailscale serve) instead of public funnel
   -u, --upload [dir]      inbox mode: receive files into dir (default ./tshare-inbox)
+                          default is write-only (drop-box). Pair with --full for
+                          full copyparty rights on that folder, or --ro to share
+                          it read-only (browse/download, no further uploads).
   -i, --blackhole         write-only sink: uploads are read, counted & notified,
                           but the bytes are discarded (nothing hits disk). Best
                           over the printed 'lan' URL for a direct throughput test.
@@ -133,6 +136,10 @@ FOLDER ENGINE
       --no-copyparty      always use the native folder server
       --copyparty-bin <p> copyparty binary or copyparty-sfx.py (or env TSHARE_COPYPARTY)
       --copyparty-args    extra raw copyparty args
+      --full              full copyparty rights (read/write/move/delete/admin)
+                          on a folder share or -u uploads folder (perm A)
+      --ro, --read-only   force read-only access (list + download). With -u:
+                          share the uploads folder browse-only (no upload)
   -z, --zip               serve a folder as a single .zip download
       --site, --web       serve a folder as a LIVE static website: index.html is
                           rendered, every file opens in-browser (not downloaded),
@@ -178,6 +185,8 @@ ONE-STOP HOSTING (launch a local server and expose it over the funnel)
                           then reverse-proxied. e.g.
                             tshare run -- npm start
                             tshare run --port 8000 -- python3 -m http.server 8000
+                          share flags may also follow the command:
+                            tshare run -- node app.js --tmux --name demo
   tshare host [dir]       detect the stack in a folder (package.json→node,
                           compose.yml→docker, app.py/manage.py→python, index.php→php,
                           index.html→static) and host it. Missing runtime? it
@@ -221,7 +230,10 @@ EXAMPLES
   tshare --once secrets.env              link dies after first download
   tshare -z -e 1w ~/Photos/trip          one-week link to a zip of the folder
   tshare -u -e 2d                        2-day upload inbox (drop-box)
+  tshare -u --full                       uploads folder with full copyparty rights
+  tshare -u --ro                         share uploads folder read-only
   tshare --allow-upload -p s3cret ~/proj shared folder: browse + upload
+  tshare --full ~/proj                   folder with full copyparty rights
   tshare --site ~/blog                   serve a static website over funnel
   tshare -s http://localhost:5173        share your running dev server
   tshare "https://youtu.be/…"            yt-dlp download → iOS-ready mp4 link

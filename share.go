@@ -4,8 +4,11 @@ package main
 
 import (
 	"context"
+	"crypto/hmac"
 	"crypto/rand"
+	"crypto/sha256"
 	"crypto/tls"
+	"encoding/base64"
 	"encoding/json"
 	"errors"
 	"fmt"
@@ -94,8 +97,10 @@ type share struct {
 	srvURL   string                 // its target URL (for display)
 
 	roomName      string // --room: MiroTalk room id
-	roomURL       string // --room: full MiroTalk join URL
+	roomURL       string // --room: full MiroTalk join URL (with sealed JWT token)
 	roomLocal     bool   // --room: using the local MiroTalk install
+	roomOrigin    string // --room: MiroTalk base URL (scheme+host+port) for generating sealed tokens
+	mirotalkJWTKey string // MiroTalk JWT signing key for sealed room tokens
 	kuma          bool   // --kuma: exposing Uptime Kuma at the funnel root
 	kumaURL       string // the root dashboard URL
 	mtRootMounted bool   // we mounted the funnel/serve ROOT path → unmount on exit
@@ -159,6 +164,15 @@ func runShare(c *config) error {
 	}
 	if c.Upload && c.Zip {
 		return errors.New("-u and -z don't combine")
+	}
+	if c.Full && c.ReadOnly {
+		return errors.New("--full and --ro/--read-only don't combine")
+	}
+	if c.ReadOnly && c.AllowUpload {
+		return errors.New("--ro/--read-only and --allow-upload don't combine")
+	}
+	if (c.Full || c.ReadOnly) && c.Blackhole {
+		return errors.New("--full/--ro don't apply to blackhole (-i)")
 	}
 	// links default to a 15-day lifetime so forgotten public links don't
 	// live forever; any explicit -e (including "never") overrides, and a
@@ -401,13 +415,19 @@ func runShare(c *config) error {
 		}
 		s.mode = "room"
 		s.roomName = name
+		s.mirotalkJWTKey = c.MirotalkJWTKey
 		base := strings.TrimRight(c.MirotalkURL, "/")
 		switch {
 		case base != "":
 			if !strings.HasPrefix(base, "http://") && !strings.HasPrefix(base, "https://") {
 				return errors.New("--mirotalk-url must be an http(s) URL")
 			}
-			s.roomURL = base + "/join?room=" + url.QueryEscape(name)
+		s.roomOrigin = base
+		var errRoom error
+		s.roomURL, errRoom = s.sealedRoomURL(base, name)
+		if errRoom != nil {
+			return errRoom
+		}
 		default:
 			// local instance: resolved/started later (needs the funnel host for the
 			// join URL). Verify it's locatable now so the error comes before mounting.
@@ -443,8 +463,18 @@ func runShare(c *config) error {
 		if err := os.MkdirAll(abs, 0o755); err != nil {
 			return err
 		}
-		s.mode, s.upDir = "inbox", abs
 		s.roots = []rootEnt{{Name: filepath.Base(abs), Abs: abs, IsDir: true}}
+		// Default -u is a write-only drop box. --full / --ro open the uploads
+		// folder for browsing: full rights (copyparty A) or read-only.
+		// Native fallback uses dir mode so listing works without copyparty.
+		switch {
+		case c.ReadOnly:
+			s.mode, s.upDir = "dir", ""
+		case c.Full:
+			s.mode, s.upDir = "dir", abs
+		default:
+			s.mode, s.upDir = "inbox", abs
+		}
 	case len(c.Paths) == 0:
 		fmt.Print(usageText)
 		return errors.New("nothing to share")
@@ -491,6 +521,10 @@ func runShare(c *config) error {
 				return errors.New("--allow-upload works with a single folder share")
 			}
 		}
+	}
+	// --full / --ro only apply to a single folder (incl. -u uploads dir).
+	if (c.Full || c.ReadOnly) && s.mode != "dir" && s.mode != "inbox" {
+		return errors.New("--full/--ro apply to a folder share or -u uploads inbox")
 	}
 	if c.Zip && s.mode == "file" {
 		c.Zip = false // zipping one file is pointless; serve as-is
@@ -737,10 +771,13 @@ func runShare(c *config) error {
 			return err
 		}
 		if c.Local {
-			// same-machine testing only: cam/mic need a secure context, so plain
-			// LAN HTTP works from this machine (localhost) but not from others.
 			origin := fmt.Sprintf("http://%s:%d", lanIP(), c.MirotalkPort)
-			s.roomURL = origin + "/join?room=" + url.QueryEscape(s.roomName)
+			s.roomOrigin = origin
+			var errRoom error
+			s.roomURL, errRoom = s.sealedRoomURL(origin, s.roomName)
+			if errRoom != nil {
+				return errRoom
+			}
 			if !c.Quiet {
 				log.Printf("  ⚠ --local room: browsers block cam/mic on plain HTTP except on this machine — use funnel/serve for real calls")
 			}
@@ -753,7 +790,12 @@ func runShare(c *config) error {
 			if err != nil {
 				return err
 			}
-			s.roomURL = u.Scheme + "://" + u.Host + "/join?room=" + url.QueryEscape(s.roomName)
+			s.roomOrigin = u.Scheme + "://" + u.Host
+			var errRoom error
+			s.roomURL, errRoom = s.sealedRoomURL(s.roomOrigin, s.roomName)
+			if errRoom != nil {
+				return errRoom
+			}
 		}
 		s.roots[0].Abs = s.roomURL
 		s.updateState() // re-record: join URL + child pid + root mount now exist
@@ -966,6 +1008,46 @@ func randToken(n int) string {
 	return string(b)
 }
 
+// makeJWT creates a signed JWT token containing the given claims (room, name, etc.)
+// using HMAC-SHA256 signed with the provided key. No external deps — stdlib only.
+func makeJWT(key string, claims map[string]interface{}, expiry time.Duration) (string, error) {
+	header := base64.RawURLEncoding.EncodeToString([]byte(`{"alg":"HS256","typ":"JWT"}`))
+
+	now := time.Now().Unix()
+	if expiry > 0 {
+		claims["iat"] = now
+		claims["exp"] = now + int64(expiry.Seconds())
+	} else {
+		claims["iat"] = now
+	}
+
+	payloadBytes, err := json.Marshal(claims)
+	if err != nil {
+		return "", err
+	}
+	payload := base64.RawURLEncoding.EncodeToString(payloadBytes)
+
+	signingInput := header + "." + payload
+	mac := hmac.New(sha256.New, []byte(key))
+	mac.Write([]byte(signingInput))
+	sig := base64.RawURLEncoding.EncodeToString(mac.Sum(nil))
+
+	return signingInput + "." + sig, nil
+}
+
+// sealedRoomURL builds a room join URL where all secret params (room, name, etc.)
+// are sealed inside a JWT token instead of visible as query parameters.
+func (s *share) sealedRoomURL(origin, roomName string) (string, error) {
+	claims := map[string]interface{}{
+		"room": roomName,
+	}
+	token, err := makeJWT(s.mirotalkJWTKey, claims, 0)
+	if err != nil {
+		return "", err
+	}
+	return origin + "/join?token=" + url.PathEscape(token), nil
+}
+
 // randSid mints a GIGA-NET/1-L session id — lowercase alphanumeric only, since
 // that's the charset the game pages accept in #gn=/#gnhost= fragments. A
 // 32-char set indexed with &31 keeps the draw uniform (no modulo bias); the
@@ -1085,6 +1167,74 @@ func linkExtras(c *config, link string) {
 	}
 }
 
+// title is a short human label for dashboards / lists: filename, host, room name, etc.
+func (s *share) title() string {
+	switch s.mode {
+	case "file":
+		if len(s.roots) > 0 && s.roots[0].Name != "" {
+			return s.roots[0].Name
+		}
+	case "server":
+		if len(s.roots) > 0 && s.roots[0].Name != "" {
+			return s.roots[0].Name
+		}
+		if u, err := url.Parse(s.srvURL); err == nil && u.Host != "" {
+			return u.Host
+		}
+		return s.srvURL
+	case "site", "dir":
+		if len(s.roots) > 0 {
+			if s.roots[0].Name != "" {
+				return s.roots[0].Name
+			}
+			if base := filepath.Base(s.roots[0].Abs); base != "" && base != "." {
+				return base
+			}
+		}
+	case "hub":
+		if base := filepath.Base(s.upDir); base != "" && base != "." {
+			return base
+		}
+		return "hub"
+	case "inbox":
+		if s.blackhole {
+			return "blackhole"
+		}
+		if base := filepath.Base(s.upDir); base != "" && base != "." {
+			return base
+		}
+		return "inbox"
+	case "room":
+		if s.roomName != "" {
+			return s.roomName
+		}
+		return "video room"
+	case "kuma":
+		return "Uptime Kuma"
+	case "call":
+		return "video call"
+	case "multi":
+		if n := len(s.roots); n > 0 {
+			if s.roots[0].Name != "" {
+				if n == 1 {
+					return s.roots[0].Name
+				}
+				return fmt.Sprintf("%s +%d", s.roots[0].Name, n-1)
+			}
+			return fmt.Sprintf("%d items", n)
+		}
+	case "dashboard":
+		return "shares"
+	}
+	if len(s.roots) > 0 && s.roots[0].Name != "" {
+		return s.roots[0].Name
+	}
+	if s.mode != "" {
+		return s.mode
+	}
+	return "share"
+}
+
 func (s *share) describe() string {
 	cp := ""
 	if s.cpProxy != nil {
@@ -1099,6 +1249,12 @@ func (s *share) describe() string {
 		}
 		return fmt.Sprintf("%s (%s)", s.roots[0].Abs, humanSize(s.roots[0].Size))
 	case "server":
+		// Prefer the run/host app name when it isn't just the upstream host.
+		if len(s.roots) > 0 && s.roots[0].Name != "" {
+			if u, err := url.Parse(s.srvURL); err == nil && s.roots[0].Name != u.Host {
+				return s.roots[0].Name + " → " + s.srvURL
+			}
+		}
 		return "reverse proxy → " + s.srvURL
 	case "site":
 		return fmt.Sprintf("website %s (index: %s)", s.roots[0].Abs, s.siteIndex)
@@ -1121,7 +1277,12 @@ func (s *share) describe() string {
 		if s.cfg.Zip {
 			extra = " (as zip)"
 		}
-		if s.upDir != "" {
+		switch {
+		case s.cfg.Full:
+			extra = " (full access)"
+		case s.cfg.ReadOnly:
+			extra = " (read-only)"
+		case s.upDir != "":
 			extra = " (uploads allowed)"
 		}
 		return s.roots[0].Abs + extra + cp

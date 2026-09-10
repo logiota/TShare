@@ -85,6 +85,7 @@ type config struct {
 	MirotalkDir    string // local MiroTalk checkout (default ~/.tshare/mirotalk)
 	MirotalkMethod string // how the local instance runs: npm | docker (auto-detected if "")
 	MirotalkPort   int    // local MiroTalk port (default 7701)
+	MirotalkJWTKey string // signing key for JWT-sealed room join URLs (must match MiroTalk's jwt.key)
 
 	// hub (--hub): homescreen-style 2-way remote page — upload, grab URLs,
 	// browse/manage the hub folder, from a phone or any browser
@@ -142,6 +143,8 @@ type config struct {
 	NoCopyparty   bool   // never use copyparty (native folder server)
 	CopypartyBin  string // explicit copyparty binary / sfx path
 	CopypartyArgs string // extra raw copyparty args
+	Full          bool   // --full: full copyparty rights (A = rwmda.) on the shared folder / -u inbox
+	ReadOnly      bool   // --ro / --read-only: force read-only (r); with -u, browse the inbox without upload
 
 	// ops
 	LanHTTPS bool   // --local: serve HTTPS with a self-signed cert
@@ -239,6 +242,8 @@ func registerFlags(fs *flag.FlagSet, c *config) {
 	fs.StringVar(&c.MirotalkDir, "mirotalk-dir", c.MirotalkDir, "")
 	fs.StringVar(&c.MirotalkMethod, "mirotalk-method", c.MirotalkMethod, "")
 	fs.IntVar(&c.MirotalkPort, "mirotalk-port", c.MirotalkPort, "")
+	fs.StringVar(&c.MirotalkJWTKey, "mirotalk-jwt-key", c.MirotalkJWTKey,
+		"JWT signing key for sealed room join URLs (must match MiroTalk's jwt.key)")
 	fs.BoolVar(&c.P2P, "p2p", c.P2P, "")
 	fs.BoolVar(&c.P2P, "p2pi", c.P2P, "") // common typo/alias
 	fs.BoolVar(&c.Call, "call", c.Call, "")
@@ -270,6 +275,9 @@ func registerFlags(fs *flag.FlagSet, c *config) {
 	fs.BoolVar(&c.NoCopyparty, "no-copyparty", c.NoCopyparty, "")
 	fs.StringVar(&c.CopypartyBin, "copyparty-bin", c.CopypartyBin, "")
 	fs.StringVar(&c.CopypartyArgs, "copyparty-args", c.CopypartyArgs, "")
+	fs.BoolVar(&c.Full, "full", c.Full, "")
+	fs.BoolVar(&c.ReadOnly, "ro", c.ReadOnly, "")
+	fs.BoolVar(&c.ReadOnly, "read-only", c.ReadOnly, "")
 	fs.BoolVar(&c.LanHTTPS, "lan-https", c.LanHTTPS, "")
 	fs.StringVar(&c.Profile, "profile", c.Profile, "")
 	fs.StringVar(&c.Profile, "template", c.Profile, "") // --template = apply a saved preset
