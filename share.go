@@ -89,21 +89,19 @@ type share struct {
 	ytPend        *ytPending   // yt-dlp download still running: hold visitors until ready
 	afterAnnounce func()       // run once after the link/QR is printed (e.g. start the yt-dlp download)
 
-	cpCmd   *exec.Cmd              // copyparty subprocess (folder engine), if used
-	cpProxy *httputil.ReverseProxy // reverse proxy to copyparty on loopback
-	cpPort  int
+	cpProxy *httputil.ReverseProxy // reverse proxy to copyparty on loopback (its proc is in procs)
 
 	srvProxy *httputil.ReverseProxy // -s: reverse proxy to a user-run server
 	srvURL   string                 // its target URL (for display)
 
-	roomName      string // --room: MiroTalk room id
-	roomURL       string // --room: full MiroTalk join URL (with sealed JWT token)
-	roomLocal     bool   // --room: using the local MiroTalk install
-	roomOrigin    string // --room: MiroTalk base URL (scheme+host+port) for generating sealed tokens
+	roomName       string // --room: MiroTalk room id
+	roomURL        string // --room: full MiroTalk join URL (with sealed JWT token)
+	roomLocal      bool   // --room: using the local MiroTalk install
+	roomOrigin     string // --room: MiroTalk base URL (scheme+host+port) for generating sealed tokens
 	mirotalkJWTKey string // MiroTalk JWT signing key for sealed room tokens
-	kuma          bool   // --kuma: exposing Uptime Kuma at the funnel root
-	kumaURL       string // the root dashboard URL
-	mtRootMounted bool   // we mounted the funnel/serve ROOT path → unmount on exit
+	kuma           bool   // --kuma: exposing Uptime Kuma at the funnel root
+	kumaURL        string // the root dashboard URL
+	mtRootMounted  bool   // we mounted the funnel/serve ROOT path → unmount on exit
 
 	procs []*serverProc // managed local servers we launched (run/host/room) — stopped on exit
 
@@ -153,6 +151,33 @@ func (s *share) doExtend(spec string) (string, error) {
 	}
 	s.expiresAt = s.expiresAt.Add(d) // push the existing expiry out by d
 	return "expiry +" + spec + " → " + s.expiresAt.Format("Jan 2 15:04"), nil
+}
+
+func init() { defaultRun = cmdShare }
+
+// cmdShare is the bare `tshare [flags] <path…>` entry: build the config
+// (defaults < config file/profile < CLI flags, #71) and run the share.
+func cmdShare(args []string) {
+	c := defaultConfig()
+	applyConfig(c, args)
+	if err := parseArgs(args, c); err != nil {
+		os.Exit(2)
+	}
+	if c.Once {
+		c.MaxDL = 1
+	}
+	if c.Live {
+		c.Progress = true // live implies progressive serving
+	}
+	if c.H265 { // --265: hardware HEVC to a temp file at constant quality
+		c.Transcode, c.Hevc = true, true
+		if c.CQ <= 0 || c.CQ > 63 {
+			c.CQ = 50
+		}
+	}
+	if err := runShare(c); err != nil {
+		log.Fatalf("tshare: %v", err)
+	}
 }
 
 func runShare(c *config) error {
@@ -208,6 +233,14 @@ func runShare(c *config) error {
 	}
 
 	s := &share{cfg: c, shutdown: make(chan string, 1), createdAt: time.Now()}
+	// Servers launched during setup (run/host) must not outlive a setup
+	// failure; the full cleanup below takes them over once it's deferred.
+	cleanupArmed := false
+	defer func() {
+		if !cleanupArmed {
+			stopAll(s.procs)
+		}
+	}()
 
 	// identity (needed before stdin buffering names its temp file)
 	s.id = c.daemonID
@@ -422,12 +455,12 @@ func runShare(c *config) error {
 			if !strings.HasPrefix(base, "http://") && !strings.HasPrefix(base, "https://") {
 				return errors.New("--mirotalk-url must be an http(s) URL")
 			}
-		s.roomOrigin = base
-		var errRoom error
-		s.roomURL, errRoom = s.sealedRoomURL(base, name)
-		if errRoom != nil {
-			return errRoom
-		}
+			s.roomOrigin = base
+			var errRoom error
+			s.roomURL, errRoom = s.sealedRoomURL(base, name)
+			if errRoom != nil {
+				return errRoom
+			}
 		default:
 			// local instance: resolved/started later (needs the funnel host for the
 			// join URL). Verify it's locatable now so the error comes before mounting.
@@ -751,17 +784,13 @@ func runShare(c *config) error {
 		// intentional stop/expiry → drop the resume record (reboot keeps it,
 		// because cleanup doesn't run when the process is killed by shutdown)
 		os.Remove(persistFile(s.id))
-		if s.cpCmd != nil && s.cpCmd.Process != nil {
-			s.cpCmd.Process.Kill()
-		}
 		if s.mtRootMounted {
-			tsUnmount(c, "") // root path we mounted for local MiroTalk
+			tsUnmount(c, "") // root path we mounted for local MiroTalk / Kuma
 		}
-		for _, p := range s.procs { // stop every managed server (run/host/room)
-			p.stop()
-		}
+		stopAll(s.procs) // every managed server: run/host/room/kuma/copyparty
 	}
 	defer cleanup()
+	cleanupArmed = true
 
 	// --room with the LOCAL MiroTalk: start it (or reuse a running one), expose
 	// it at the funnel/serve ROOT path, and point the join URL at that origin.
@@ -828,7 +857,7 @@ func runShare(c *config) error {
 	// on loopback and reverse-proxy to it — tshare keeps the token gate,
 	// password, expiry, byte cap, logging and probe alerts in front.
 	if s.useCopyparty() {
-		if err := startCopyparty(s); err != nil {
+		if p, err := startCopyparty(s); err != nil {
 			if c.Copyparty { // explicitly requested → hard error
 				return err
 			}
@@ -836,7 +865,7 @@ func runShare(c *config) error {
 				log.Printf("  copyparty failed to start — using native folder server:\n  %v", err)
 			}
 		} else if !c.Quiet {
-			log.Printf("  ▷ folders served by copyparty (pid %d) behind tshare", s.cpCmd.Process.Pid)
+			log.Printf("  ▷ folders served by copyparty (pid %d) behind tshare", p.pid())
 		}
 	} else if (s.mode == "dir" || s.mode == "inbox") && !c.NoCopyparty && s.encKey == nil && !c.Quiet {
 		// folder share, auto mode, copyparty simply not detected — say so, since

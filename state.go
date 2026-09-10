@@ -150,7 +150,29 @@ func pidAlive(pid int) bool {
 // ---------------------------------------------------------------------------
 // background mode
 
+// daemonEnv marks a process as a detached -b child. The argv markers below are
+// what the child parses; this is the backstop that makes a re-daemonize loop
+// impossible even if a future argv layout ever hides those markers.
+const daemonEnv = "TSHARE_DAEMON_CHILD"
+
+// insertArgs splices tshare-internal flags in right after the subcommand name
+// (or first, for a bare share) — never at the end, where `run … -- cmd` would
+// hand them to the user's command instead of to tshare.
+func insertArgs(args []string, extra ...string) []string {
+	at := 0
+	if len(args) > 0 && commands[args[0]] != nil {
+		at = 1
+	}
+	out := make([]string, 0, len(args)+len(extra))
+	out = append(out, args[:at]...)
+	out = append(out, extra...)
+	return append(out, args[at:]...)
+}
+
 func daemonize(s *share) error {
+	if os.Getenv(daemonEnv) != "" {
+		return errors.New("internal: a background child tried to background itself again (daemon markers lost) — refusing")
+	}
 	exe, err := os.Executable()
 	if err != nil {
 		return err
@@ -158,6 +180,7 @@ func daemonize(s *share) error {
 	// re-exec with daemon markers (child sees --bg too, but daemonChild
 	// short-circuits re-daemonizing, so flags and defaults stay identical)
 	args := append([]string{}, os.Args[1:]...)
+	var extra []string
 	if s.tmpRoot != "" {
 		// stdin/yt input was already produced by THIS parent — the child can't
 		// re-read stdin or re-download, so hand it the materialized path and
@@ -170,22 +193,22 @@ func daemonize(s *share) error {
 			}
 		}
 		if s.mode == "file" {
-			args = append(args, "--filename", s.roots[0].Name)
+			extra = append(extra, "--filename", s.roots[0].Name)
 		}
 		if s.tmpFile != "" {
-			args = append(args, "--__tmp", s.tmpFile)
+			extra = append(extra, "--__tmp", s.tmpFile)
 		}
 		if s.tmpDir != "" {
-			args = append(args, "--__tmpdir", s.tmpDir)
+			extra = append(extra, "--__tmpdir", s.tmpDir)
 		}
 	}
 	if s.cfg.encKeyHex != "" { // hand the inbox key to the child so it stays stable
-		args = append(args, "--__enckey", s.cfg.encKeyHex)
+		extra = append(extra, "--__enckey", s.cfg.encKeyHex)
 	}
 	if s.gameSid != "" { // hand the game session id to the child so its join link matches what we advertise
-		args = append(args, "--__gamesid", s.gameSid)
+		extra = append(extra, "--__gamesid", s.gameSid)
 	}
-	args = append(args, "--__daemon", "--__id", s.id)
+	args = insertArgs(args, append(extra, "--__daemon", "--__id", s.id)...)
 
 	logDir := filepath.Join(filepath.Dir(stateDir()), "logs")
 	os.MkdirAll(logDir, 0o700)
@@ -197,6 +220,7 @@ func daemonize(s *share) error {
 	defer lf.Close()
 
 	cmd := exec.Command(exe, args...)
+	cmd.Env = append(os.Environ(), daemonEnv+"=1")
 	cmd.Stdout = lf
 	cmd.Stderr = lf
 	cmd.SysProcAttr = &syscall.SysProcAttr{Setsid: true}
@@ -305,6 +329,8 @@ func savePersist(s *share) error {
 	return writeJSON(persistFile(s.id), rec)
 }
 
+func init() { register(cmdResume, "resume") }
+
 func cmdResume(args []string) {
 	des, err := os.ReadDir(persistDir())
 	if err != nil || len(des) == 0 {
@@ -337,12 +363,14 @@ func cmdResume(args []string) {
 			continue
 		}
 		ra := append([]string{}, rec.Args...)
+		var extra []string
 		if !hasArg(ra, "-b") && !hasArg(ra, "--bg") {
-			ra = append(ra, "-b") // resume detached
+			extra = append(extra, "-b") // resume detached
 		}
 		if !hasArg(ra, "--__id") {
-			ra = append(ra, "--__id", rec.ID) // reuse the persist id so resume is idempotent
+			extra = append(extra, "--__id", rec.ID) // reuse the persist id so resume is idempotent
 		}
+		ra = insertArgs(ra, extra...)
 		cmd := exec.Command(exe, ra...)
 		cmd.Dir = rec.Cwd
 		cmd.Stdout, cmd.Stderr = os.Stdout, os.Stderr

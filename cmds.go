@@ -51,6 +51,16 @@ func loadStates() []stateRec {
 	return out
 }
 
+func init() {
+	register(cmdLs, "ls", "list")
+	register(cmdRm, "rm", "stop", "revoke")
+	register(cmdSet, "set")
+	register(cmdExtend, "extend", "-x")
+	register(func([]string) { cmdPanic() }, "panic", "--panic")
+	register(cmdInfo, "info")
+	register(func([]string) { cmdDoctor() }, "doctor")
+}
+
 func cmdLs(args []string) {
 	recs := loadStates()
 	for _, a := range args {

@@ -2,6 +2,13 @@
 
 package main
 
+import "fmt"
+
+func init() {
+	register(func([]string) { fmt.Println("tshare v" + version) }, "version", "--version", "-v")
+	register(func([]string) { fmt.Print(usageText) }, "help", "--help", "-h")
+}
+
 const version = "1.10.0"
 
 const usageText = `tshare v` + version + ` — secret-link file sharing over Tailscale Funnel

@@ -83,7 +83,6 @@ type config struct {
 	RoomName       string // explicit room id (else the positional arg, else random)
 	MirotalkURL    string // remote instance base URL ("" = use/spawn the local install)
 	MirotalkDir    string // local MiroTalk checkout (default ~/.tshare/mirotalk)
-	MirotalkMethod string // how the local instance runs: npm | docker (auto-detected if "")
 	MirotalkPort   int    // local MiroTalk port (default 7701)
 	MirotalkJWTKey string // signing key for JWT-sealed room join URLs (must match MiroTalk's jwt.key)
 
@@ -240,7 +239,6 @@ func registerFlags(fs *flag.FlagSet, c *config) {
 	fs.StringVar(&c.RoomName, "room-name", c.RoomName, "")
 	fs.StringVar(&c.MirotalkURL, "mirotalk-url", c.MirotalkURL, "")
 	fs.StringVar(&c.MirotalkDir, "mirotalk-dir", c.MirotalkDir, "")
-	fs.StringVar(&c.MirotalkMethod, "mirotalk-method", c.MirotalkMethod, "")
 	fs.IntVar(&c.MirotalkPort, "mirotalk-port", c.MirotalkPort, "")
 	fs.StringVar(&c.MirotalkJWTKey, "mirotalk-jwt-key", c.MirotalkJWTKey,
 		"JWT signing key for sealed room join URLs (must match MiroTalk's jwt.key)")
@@ -554,6 +552,8 @@ func loadConfigArgs(path, profile string) []string {
 // config sections (#25). Templates ARE config profiles; this just lets you
 // save/list/remove them from the CLI instead of hand-editing the config, and
 // apply one with `tshare --template <name> <path>`.
+func init() { register(cmdTemplate, "template", "templates") }
+
 func cmdTemplate(args []string) {
 	sub := ""
 	if len(args) > 0 {

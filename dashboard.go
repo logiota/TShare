@@ -99,9 +99,10 @@ func dashName(r stateRec) string {
 }
 
 // prettyShareTitle turns raw share names into short readable labels.
-//   Branches-of-Philosophy.png  →  Branches of Philosophy
-//   Song [abc123XY].m4a         →  Song
-//   tshare-inbox                →  Inbox
+//
+//	Branches-of-Philosophy.png  →  Branches of Philosophy
+//	Song [abc123XY].m4a         →  Song
+//	tshare-inbox                →  Inbox
 func prettyShareTitle(mode, raw string) string {
 	raw = strings.TrimSpace(raw)
 	switch mode {
@@ -451,6 +452,8 @@ setInterval(function(){ fetch('__shares').then(function(r){return r.json();}).th
 
 // cmdDashboard: `tshare dash` — mints a random password if none is given, then
 // serves the shares webui.
+func init() { register(cmdDashboard, "dash", "dashboard") }
+
 func cmdDashboard(args []string) {
 	c := defaultConfig()
 	applyConfig(c, args)

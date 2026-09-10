@@ -25,6 +25,8 @@ func agentPlistPath() string {
 	return filepath.Join(home, "Library", "LaunchAgents", agentLabel+".plist")
 }
 
+func init() { register(cmdAgent, "agent", "service") }
+
 func cmdAgent(args []string) {
 	if runtime.GOOS != "darwin" {
 		fmt.Println("tshare agent is macOS (launchd) only.")

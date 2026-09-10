@@ -3,8 +3,10 @@
 package main
 
 import (
+	"context"
 	"errors"
 	"fmt"
+	"io"
 	"log"
 	"net"
 	"net/http"
@@ -16,6 +18,7 @@ import (
 	"regexp"
 	"strconv"
 	"strings"
+	"sync"
 	"syscall"
 	"time"
 )
@@ -46,79 +49,141 @@ func hostPort(u *url.URL) string {
 }
 
 // ---------------------------------------------------------------------------
-// managed servers: launch a local server (in tmux or as a child), wait for its
-// port, and reverse-proxy it over the funnel. Shared by `tshare run`, `tshare
-// host <dir>`, and --room (MiroTalk) so there's one launch/health/stop path.
+// managed servers: THE one engine for every server tshare launches and owns —
+// `tshare run`, `tshare host`, --room (MiroTalk), --kuma (Uptime Kuma) and the
+// copyparty folder backend. One launch / readiness / crash-detect / stop path,
+// one proxy builder, and every proc lands in s.procs so it's recorded in the
+// share's state and reaped by cleanup, `tshare rm` and `tshare panic` alike.
 
 const tmuxSession = "tshare"
+
+// srvSpec describes a server to launch.
+type srvSpec struct {
+	name string        // label: log file, tmux window, messages
+	dir  string        // working dir ("" = inherit)
+	env  []string      // extra environment (KEY=VAL)
+	argv []string      // command + args
+	port int           // >0: bind/health-check this port (also passed as $PORT); 0: auto-detect
+	wait time.Duration // readiness deadline (0 = 60s)
+	tmux bool          // user-facing server: may run in the shared tmux session (--tmux)
+	tee  bool          // also echo its output to our stderr (unless --quiet)
+}
 
 // serverProc is a launched server tshare owns and must stop on share exit.
 type serverProc struct {
 	name    string
 	port    int
-	tmuxWin string    // "tshare:<name>" if launched in tmux; else ""
-	cmd     *exec.Cmd // child process (process group) if not tmux
+	tmuxWin string        // "tshare:<name>" if launched in tmux; else ""
+	cmd     *exec.Cmd     // child process (own process group) if not tmux
+	done    chan struct{} // closed when the child exits (nil for tmux)
+	err     error         // child's exit status, valid once done is closed
 	logPath string
 }
 
 func (s *share) haveTmux() bool { return s.cfg.Tmux && haveExec("tmux") }
 
-// launchServer starts argv (in dir, with extra env) and returns once it is
-// listening on a TCP port. wantPort>0 uses that port (passed as $PORT and
-// health-checked); wantPort==0 auto-detects whatever port the process opens.
-func (s *share) launchServer(name, dir string, extraEnv, argv []string, wantPort int) (*serverProc, error) {
-	if len(argv) == 0 {
+// launchServer starts sp and returns once it is listening on a TCP port. A
+// server that dies during startup fails fast with the tail of its log instead
+// of burning the whole readiness deadline.
+func (s *share) launchServer(sp srvSpec) (*serverProc, error) {
+	if len(sp.argv) == 0 {
 		return nil, errors.New("no command to run")
 	}
+	argv := append([]string{}, sp.argv...)
 	if p, err := exec.LookPath(argv[0]); err == nil {
 		argv[0] = p
 	} else {
 		return nil, fmt.Errorf("%s not found on PATH — install it (e.g. brew install %s)", argv[0], brewSuggest(argv[0]))
 	}
-	if wantPort > 0 && portListening(wantPort) { // conflict: something already owns it
-		return nil, fmt.Errorf("port %d is already in use — free it or pick another (--port)", wantPort)
+	if sp.port > 0 && portListening(sp.port) { // conflict: something already owns it
+		return nil, fmt.Errorf("port %d is already in use — free it or pick another (--port)", sp.port)
 	}
+	// logs can carry the secret /<token> path (copyparty logs requests) → 0600
 	logDir := filepath.Join(filepath.Dir(stateDir()), "logs")
-	os.MkdirAll(logDir, 0o755)
-	p := &serverProc{name: name, port: wantPort, logPath: filepath.Join(logDir, "srv-"+name+".log")}
-	env := append([]string{}, extraEnv...)
-	if wantPort > 0 {
-		env = append(env, fmt.Sprintf("PORT=%d", wantPort))
+	os.MkdirAll(logDir, 0o700)
+	p := &serverProc{name: sp.name, port: sp.port, logPath: filepath.Join(logDir, "srv-"+sp.name+".log")}
+	env := append([]string{}, sp.env...)
+	if sp.port > 0 {
+		env = append(env, fmt.Sprintf("PORT=%d", sp.port))
 	}
 
-	if s.haveTmux() {
-		if err := tmuxLaunch(name, dir, env, argv, p.logPath); err != nil {
+	if sp.tmux && s.haveTmux() {
+		if err := tmuxLaunch(sp.name, sp.dir, env, argv, p.logPath); err != nil {
 			return nil, err
 		}
-		p.tmuxWin = tmuxSession + ":" + name
+		p.tmuxWin = tmuxSession + ":" + sp.name
 	} else {
-		cmd := exec.Command(argv[0], argv[1:]...)
-		cmd.Dir = dir
-		cmd.Env = append(os.Environ(), env...)
-		if f, err := os.Create(p.logPath); err == nil {
-			cmd.Stdout, cmd.Stderr = f, f
+		lf, err := os.OpenFile(p.logPath, os.O_CREATE|os.O_WRONLY|os.O_TRUNC, 0o600)
+		if err != nil {
+			return nil, err
 		}
+		var out io.Writer = lf
+		if sp.tee && !s.cfg.Quiet {
+			out = io.MultiWriter(lf, os.Stderr)
+		}
+		cmd := exec.Command(argv[0], argv[1:]...)
+		cmd.Dir = sp.dir
+		cmd.Env = append(withoutEnv(os.Environ(), daemonEnv), env...)
+		cmd.Stdout, cmd.Stderr = out, out
 		cmd.SysProcAttr = &syscall.SysProcAttr{Setpgid: true} // spawns children → kill the group
 		if err := cmd.Start(); err != nil {
-			return nil, fmt.Errorf("starting %s: %w", name, err)
+			lf.Close()
+			return nil, fmt.Errorf("starting %s: %w", sp.name, err)
 		}
-		p.cmd = cmd
+		p.cmd, p.done = cmd, make(chan struct{})
+		go func() { p.err = cmd.Wait(); lf.Close(); close(p.done) }()
 	}
 
-	deadline := time.Now().Add(60 * time.Second)
-	for time.Now().Before(deadline) {
-		if wantPort > 0 {
-			if portListening(wantPort) {
-				return p, nil
+	if err := s.awaitReady(p, sp.wait); err != nil {
+		p.stop()
+		return nil, err
+	}
+	return p, nil
+}
+
+// awaitReady polls until p listens, backing off 50ms→400ms, and wakes at once
+// if the child exits (the done channel is nil for tmux, so that case never fires).
+func (s *share) awaitReady(p *serverProc, limit time.Duration) error {
+	if limit <= 0 {
+		limit = 60 * time.Second
+	}
+	deadline := time.Now().Add(limit)
+	delay := 50 * time.Millisecond
+	for {
+		if p.exited() {
+			return fmt.Errorf("%s exited during startup (%v)%s", p.name, p.err, logTail(p.logPath, 400))
+		}
+		if p.port > 0 {
+			if portListening(p.port) {
+				return nil
 			}
 		} else if port := s.detectPort(p); port > 0 {
 			p.port = port
-			return p, nil
+			return nil
 		}
-		time.Sleep(400 * time.Millisecond)
+		if time.Now().After(deadline) {
+			return fmt.Errorf("%s did not open a port within %s — see %s", p.name, limit, p.logPath)
+		}
+		select {
+		case <-p.done:
+		case <-time.After(delay):
+		}
+		if delay < 400*time.Millisecond {
+			delay *= 2
+		}
 	}
-	p.stop()
-	return nil, fmt.Errorf("%s did not open a port within 60s — see %s", name, p.logPath)
+}
+
+func (p *serverProc) exited() bool {
+	if p.done == nil {
+		return false
+	}
+	select {
+	case <-p.done:
+		return true
+	default:
+		return false
+	}
 }
 
 func (p *serverProc) pid() int {
@@ -128,6 +193,9 @@ func (p *serverProc) pid() int {
 	return 0
 }
 
+// stop terminates the server's whole process group (npm→node, compose→
+// containers): SIGTERM, then SIGKILL after 8s. The group is signalled even if
+// the leader already exited, so children it left behind are still reaped.
 func (p *serverProc) stop() {
 	if p == nil {
 		return
@@ -136,17 +204,69 @@ func (p *serverProc) stop() {
 		exec.Command("tmux", "kill-window", "-t", p.tmuxWin).Run()
 		return
 	}
-	if p.cmd != nil && p.cmd.Process != nil {
-		pid := p.cmd.Process.Pid
-		syscall.Kill(-pid, syscall.SIGTERM) // whole group (npm→node, compose→containers)
-		done := make(chan struct{})
-		go func() { p.cmd.Wait(); close(done) }()
-		select {
-		case <-done:
-		case <-time.After(8 * time.Second):
-			syscall.Kill(-pid, syscall.SIGKILL)
+	if p.cmd == nil || p.cmd.Process == nil {
+		return
+	}
+	pid := p.cmd.Process.Pid
+	syscall.Kill(-pid, syscall.SIGTERM)
+	select {
+	case <-p.done:
+	case <-time.After(8 * time.Second):
+		syscall.Kill(-pid, syscall.SIGKILL)
+	}
+}
+
+// adopt takes ownership of a launched server: it's stopped with the share and,
+// once the share's state file exists, recorded at once (not on the throttled
+// flush) so `tshare rm`/`panic` can reap it even if tshare itself crashes.
+func (s *share) adopt(p *serverProc) {
+	s.stateMu.Lock()
+	defer s.stateMu.Unlock()
+	s.procs = append(s.procs, p)
+	if !s.lastStateWrite.IsZero() {
+		s.stateDirty = true
+		s.flushStateLocked()
+	}
+}
+
+// stopAll stops servers concurrently, so shutdown costs the slowest one's
+// grace period rather than the sum of them.
+func stopAll(procs []*serverProc) {
+	var wg sync.WaitGroup
+	for _, p := range procs {
+		wg.Add(1)
+		go func(p *serverProc) { defer wg.Done(); p.stop() }(p)
+	}
+	wg.Wait()
+}
+
+// withoutEnv drops key from an environment list.
+func withoutEnv(env []string, key string) []string {
+	out := env[:0:0]
+	for _, kv := range env {
+		if !strings.HasPrefix(kv, key+"=") {
+			out = append(out, kv)
 		}
 	}
+	return out
+}
+
+// logTail returns the last n bytes of a log as an indented block ("" if empty).
+func logTail(path string, n int64) string {
+	f, err := os.Open(path)
+	if err != nil {
+		return ""
+	}
+	defer f.Close()
+	if fi, err := f.Stat(); err == nil && fi.Size() > n {
+		f.Seek(-n, io.SeekEnd)
+	}
+	b, _ := io.ReadAll(f)
+	t := strings.TrimSpace(string(b))
+	if t == "" {
+		return ""
+	}
+	return "\n  " + strings.ReplaceAll(t, "\n", "\n  ")
 }
 
 // detectPort finds a TCP port a process in this server's tree is listening on.
@@ -296,30 +416,51 @@ func brewSuggest(cmd string) string {
 	}
 }
 
-// newHostProxy builds the reverse proxy tshare puts in front of an upstream
-// server (shared by -s and `tshare run`/`host`). Presents the upstream's own
-// Host so dev-server host checks pass; WebSockets/HMR upgrade through as usual.
-func newHostProxy(u *url.URL, c *config) *httputil.ReverseProxy {
+// newProxy builds the reverse proxy tshare puts in front of any upstream — -s,
+// `run`/`host`, and the copyparty backend. keepHost=false presents the
+// upstream's own Host (dev-server host checks pass); keepHost=true forwards
+// the visitor's Host. WebSockets/HMR upgrade through as usual.
+func newProxy(u *url.URL, c *config, what string, keepHost bool) *httputil.ReverseProxy {
 	base := strings.TrimSuffix(u.Path, "/")
 	return &httputil.ReverseProxy{
 		Director: func(req *http.Request) {
 			req.URL.Scheme = u.Scheme
 			req.URL.Host = u.Host
-			req.Host = u.Host
+			if !keepHost {
+				req.Host = u.Host
+			}
 			if base != "" {
 				req.URL.Path = base + req.URL.Path
+				if req.URL.RawPath != "" {
+					req.URL.RawPath = base + req.URL.RawPath
+				}
+			}
+			if _, ok := req.Header["User-Agent"]; !ok {
+				req.Header.Set("User-Agent", "") // don't inject Go's default UA
 			}
 		},
-		FlushInterval: 250 * time.Millisecond,
-		BufferPool:    proxyBufPool,
+		FlushInterval: 250 * time.Millisecond, // stream downloads
+		BufferPool:    proxyBufPool,           // reuse 64 KiB buffers (less GC)
 		ErrorHandler: func(w http.ResponseWriter, r *http.Request, e error) {
-			if !c.Quiet {
-				log.Printf("  upstream error: %v", e)
+			if errors.Is(e, context.Canceled) {
+				return // visitor went away mid-transfer: nothing to report or send
 			}
-			http.Error(w, "502 upstream not reachable", http.StatusBadGateway)
+			if !c.Quiet {
+				log.Printf("  %s proxy error: %v", what, e)
+			}
+			http.Error(w, "502 "+what+" not reachable", http.StatusBadGateway)
 		},
 	}
 }
+
+// bufPool is an httputil.BufferPool backed by a sync.Pool of 64 KiB slices, so
+// the reverse proxy reuses transfer buffers instead of allocating per request.
+type bufPool struct{ p sync.Pool }
+
+func (b *bufPool) Get() []byte  { return b.p.Get().([]byte) }
+func (b *bufPool) Put(x []byte) { b.p.Put(x) }
+
+var proxyBufPool = &bufPool{p: sync.Pool{New: func() any { return make([]byte, 64<<10) }}}
 
 func setupServer(c *config, s *share) error {
 	u, err := url.Parse(c.Paths[0])
@@ -329,7 +470,7 @@ func setupServer(c *config, s *share) error {
 	s.mode = "server"
 	s.srvURL = c.Paths[0]
 	s.roots = []rootEnt{{Name: u.Host, Abs: c.Paths[0]}} // placeholder for shared code
-	s.srvProxy = newHostProxy(u, c)
+	s.srvProxy = newProxy(u, c, "upstream", false)
 	// best-effort: warn (don't fail) if nothing is listening yet
 	d := net.Dialer{Timeout: 800 * time.Millisecond}
 	if conn, derr := d.Dial("tcp", hostPort(u)); derr == nil {
@@ -364,6 +505,13 @@ func setupRun(c *config, s *share) error {
 	// listener must NOT reuse it, so free c.Port for auto-pick after capturing.
 	wantPort := c.Port
 	c.Port = 0
+	// -b: the detached child re-runs this and owns the server. Launching here
+	// too would double-start it (a port clash with --port) and orphan ours.
+	if c.Background && !c.daemonChild {
+		s.mode = "server"
+		s.roots = []rootEnt{{Name: name, Abs: strings.Join(c.RunCmd, " ")}}
+		return nil
+	}
 	if !c.Quiet {
 		how := "as a child process"
 		if s.haveTmux() {
@@ -371,15 +519,15 @@ func setupRun(c *config, s *share) error {
 		}
 		log.Printf("  ▶ launching %s %s …", strings.Join(c.RunCmd, " "), how)
 	}
-	p, err := s.launchServer(name, dir, nil, c.RunCmd, wantPort)
+	p, err := s.launchServer(srvSpec{name: name, dir: dir, argv: c.RunCmd, port: wantPort, tmux: true})
 	if err != nil {
 		return err
 	}
-	s.procs = append(s.procs, p)
+	s.adopt(p)
 	s.mode = "server"
 	s.srvURL = fmt.Sprintf("http://127.0.0.1:%d", p.port)
 	u, _ := url.Parse(s.srvURL)
-	s.srvProxy = newHostProxy(u, c)
+	s.srvProxy = newProxy(u, c, "upstream", false)
 	s.roots = []rootEnt{{Name: name, Abs: s.srvURL}}
 	if !c.Quiet {
 		log.Printf("  ▷ %s listening on :%d — proxied over the funnel", name, p.port)
@@ -476,7 +624,7 @@ func isTshareFlag(tok string) bool {
 	case "port", "p", "password", "e", "expires", "name", "n", "max", "https-port",
 		"max-rate", "max-bytes", "min-free", "dir", "abuse-contact", "profile", "template",
 		"token-len", "max-upload", "tailscale-bin", "filename", "yt-format", "yt-args",
-		"room-name", "mirotalk-url", "mirotalk-dir", "mirotalk-method", "mirotalk-port",
+		"room-name", "mirotalk-url", "mirotalk-dir", "mirotalk-port",
 		"mirotalk-jwt-key", "kuma-port", "kuma-dir", "copyparty-bin", "copyparty-args",
 		"rar-size", "stun", "turn", "turn-user", "turn-pass", "cq":
 		return true
@@ -525,10 +673,17 @@ var tshareIntentSet = map[string]bool{
 func runValueFlag(f string) bool {
 	switch strings.TrimLeft(f, "-") {
 	case "port", "p", "password", "e", "expires", "name", "n", "max", "https-port",
-		"max-rate", "max-bytes", "min-free", "dir", "abuse-contact", "profile", "template":
+		"max-rate", "max-bytes", "min-free", "dir", "abuse-contact", "profile", "template",
+		"filename", "__id", "__tmp", "__tmpdir", "__enckey", "__gamesid": // + daemon/resume internals
 		return true
 	}
 	return false
+}
+
+func init() {
+	register(cmdRun, "run")
+	register(cmdHost, "host")
+	register(cmdTmux, "tmux")
 }
 
 // cmdRun: launch any command that serves on a port and expose it over the funnel.
