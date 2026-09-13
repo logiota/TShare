@@ -16,6 +16,7 @@ import (
 	"os/exec"
 	"path/filepath"
 	"regexp"
+	"sort"
 	"strconv"
 	"strings"
 	"sync"
@@ -739,6 +740,9 @@ func detectStack(dir string) (cmd []string, kind string) {
 		return []string{"python3", filepath.Base(firstExisting(dir, "app.py", "wsgi.py"))}, "python"
 	case has("requirements.txt") && has("main.py"):
 		return []string{"python3", "main.py"}, "python"
+	case nodeEntry(dir) != "":
+		e := nodeEntry(dir)
+		return []string{"node", e}, "node (" + e + ")"
 	case has("index.php"):
 		return []string{"php", "-S", "0.0.0.0:8080", "-t", "."}, "php"
 	case has("Gemfile") && has("config.ru"):
@@ -747,6 +751,74 @@ func detectStack(dir string) (cmd []string, kind string) {
 		return nil, "static" // handled by --site, not a launched server
 	}
 	return nil, ""
+}
+
+// nodeEntry finds a runnable Node server in a folder that has no package.json:
+// a .js file whose source actually starts a server. The content check is the
+// point — a static site is an index.html plus browser .js, and those must be
+// SERVED, never executed, so only a file that listens qualifies.
+func nodeEntry(dir string) string {
+	des, err := os.ReadDir(dir)
+	if err != nil {
+		return ""
+	}
+	var names []string
+	for _, de := range des {
+		if !de.IsDir() && strings.HasSuffix(de.Name(), ".js") {
+			names = append(names, de.Name())
+		}
+	}
+	sort.Slice(names, func(i, j int) bool { // conventional entry points first
+		ri, rj := nodeEntryRank(names[i]), nodeEntryRank(names[j])
+		if ri != rj {
+			return ri < rj
+		}
+		return names[i] < names[j]
+	})
+	for _, n := range names {
+		b, err := os.ReadFile(filepath.Join(dir, n))
+		if err != nil {
+			continue
+		}
+		if len(b) > 64<<10 {
+			b = b[:64<<10]
+		}
+		if isServerJS(b) {
+			return n
+		}
+	}
+	return ""
+}
+
+// isServerJS decides whether a .js file is a server we should RUN rather than
+// a browser asset we should SERVE. createServer / Bun.serve / Deno.serve are
+// unambiguous; a bare .listen( is not (browser code has socket.listen(...)),
+// so that only counts alongside an import of a server module.
+func isServerJS(src []byte) bool {
+	if serverStrongRe.Match(src) {
+		return true
+	}
+	return serverModRe.Match(src) && serverListenRe.Match(src)
+}
+
+var (
+	serverStrongRe = regexp.MustCompile(`createServer|(?:Bun|Deno)\.serve\s*\(`)
+	serverModRe    = regexp.MustCompile(`(?:require\s*\(|from\s+)['"](?:node:)?(?:http|https|http2|net|express|fastify|koa|hono)['"]`)
+	serverListenRe = regexp.MustCompile(`\.listen\s*\(`)
+)
+
+func nodeEntryRank(name string) int {
+	switch name {
+	case "server.js":
+		return 0
+	case "app.js":
+		return 1
+	case "main.js":
+		return 2
+	case "index.js":
+		return 3
+	}
+	return 4
 }
 
 func firstExisting(dir string, names ...string) string {
@@ -778,7 +850,7 @@ func cmdHost(args []string) {
 	cmd, kind := detectStack(abs)
 	if kind == "" {
 		log.Fatalf("tshare host: couldn't detect a stack in %s\n"+
-			"  (looked for package.json / compose.yml / app.py / index.php / index.html)\n"+
+			"  (looked for package.json / a .js server / compose.yml / app.py / index.php / index.html)\n"+
 			"  run it explicitly:  tshare run --dir %s -- <start command>", abs, abs)
 	}
 	fmt.Fprintf(os.Stderr, "  ⓘ detected %s in %s\n", kind, abs)

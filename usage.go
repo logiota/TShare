@@ -22,7 +22,8 @@ USAGE
   tshare -i                           blackhole inbox: accept & count uploads, keep nothing
   tshare --hub [dir]                  homescreen-style 2-way remote: upload + grab URLs + browse
   tshare run [--port N] -- <cmd…>     launch any server (auto-detect its port) & expose it
-  tshare host [dir]                   auto-detect the stack in a folder & host it (node/py/docker/php/static)
+  tshare host [dir]                   auto-detect the stack in a folder & host it
+                                      (package.json / a .js server / py / docker / php / static)
   tshare tmux                         list servers running in the shared 'tshare' tmux session
   tshare agent install                run 'tshare resume' at login (macOS LaunchAgent; brew-service-ready)
   tshare --rar --p2p big.mkv          split into 1.4 GB RAR volumes → per-part ⚡ P2P
