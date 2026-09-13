@@ -674,7 +674,8 @@ func runValueFlag(f string) bool {
 	switch strings.TrimLeft(f, "-") {
 	case "port", "p", "password", "e", "expires", "name", "n", "max", "https-port",
 		"max-rate", "max-bytes", "min-free", "dir", "abuse-contact", "profile", "template",
-		"filename", "__id", "__tmp", "__tmpdir", "__enckey", "__gamesid": // + daemon/resume internals
+		"filename", "__id", "__tmp", "__tmpdir", "__enckey", "__gamesid",
+		"__token", "__expires", "__bindport": // + daemon/resume internals
 		return true
 	}
 	return false

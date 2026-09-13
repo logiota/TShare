@@ -338,7 +338,7 @@ func dashDetail(r stateRec) string {
 func (s *share) dashTiles() []dashTile {
 	var out []dashTile
 	for _, r := range loadStates() {
-		if r.ID == s.id || !pidAlive(r.PID) {
+		if r.ID == s.id || !recAlive(r) {
 			continue
 		}
 		raw := dashRawName(r)

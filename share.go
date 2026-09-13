@@ -247,9 +247,17 @@ func runShare(c *config) error {
 	if s.id == "" {
 		s.id = randToken(6)
 	}
-	if c.Name != "" {
+	switch {
+	case c.tokenSeed != "":
+		// resumed/re-execed share: serve the SAME secret path, so every link
+		// handed out before the restart still works.
+		if !validSlug(c.tokenSeed) {
+			return errors.New("--__token is not a valid share path")
+		}
+		s.token = c.tokenSeed
+	case c.Name != "":
 		s.token = c.Name
-	} else {
+	default:
 		s.token = randToken(c.TokenLen)
 	}
 
@@ -661,7 +669,15 @@ func runShare(c *config) error {
 	// runtime-mutable settings (changeable later via `tshare set`)
 	s.password = c.Password
 	s.maxDL.Store(c.MaxDL)
-	if c.Expires > 0 {
+	if c.expiresPin != "" {
+		// resumed share: restore the original deadline instead of starting the
+		// clock over, so a reboot can't quietly extend a share's life.
+		t, err := time.Parse(time.RFC3339, c.expiresPin)
+		if err != nil {
+			return fmt.Errorf("bad --__expires %q: %v", c.expiresPin, err)
+		}
+		s.expiresAt = t
+	} else if c.Expires > 0 {
 		s.expiresAt = time.Now().Add(c.Expires)
 	}
 
@@ -677,6 +693,12 @@ func runShare(c *config) error {
 	bind := "127.0.0.1:"
 	if lanOn {
 		bind = "0.0.0.0:"
+	}
+	// resumed share: take back the port it had, so a --local link (which
+	// carries the port) is byte-identical after a restart. Best effort — if
+	// something else took it meanwhile, fall through to a fresh one.
+	if c.bindPort > 0 && c.Port == 0 && !portListening(c.bindPort) {
+		c.Port = c.bindPort
 	}
 	ln, err := net.Listen("tcp", bind+strconv.Itoa(c.Port))
 	if err != nil {

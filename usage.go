@@ -108,7 +108,7 @@ MODES
                           Media is WebRTC P2P; signaling stays on your node.
       --mirotalk-url <u>  use a remote self-hosted instance instead
       --room-name <id>    explicit room id instead of a positional / random one
-      --mirotalk-dir/-method/-port   where/how the local install runs
+      --mirotalk-dir/-port   where the local install lives / which port it uses
       --call              the secret link IS a built-in 1:1 WebRTC video call —
                           no MiroTalk needed. Two participants, mute/cam/leave.
       --p2p               file OR folder share also offers ⚡ DIRECT browser-to-
@@ -166,6 +166,8 @@ FOLDER ENGINE
                           LAN via http://<lan-ip>:<port>/<token>, token-gated)
       --watch             watch a shared folder; announce new files as they land
       --persist           remember this share so 'tshare resume' restarts it
+                          after a reboot — same token, port and expiry, so the
+                          link you handed out still works
       --profile <name>    use a [name] section from ~/.config/tshare/config
       --template <name>   apply a saved template (== a profile; see: tshare template)
       --no-config         ignore the config file

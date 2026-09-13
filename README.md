@@ -143,6 +143,10 @@ tshare agent status / uninstall
 
 It's shaped like what Homebrew generates, so once tshare is installed from a tap the same thing is available as `brew services start tshare` (see the `service` block in `Formula/tshare.rb`). On Linux, `tshare agent` points you at the equivalent `systemd --user` one-liner.
 
+**What a resumed share keeps.** `--persist` records the share's *identity*, not just its command, so `tshare resume` brings back **the same link**: same secret token, same backend port, and the same absolute expiry (changing it live with `tshare set -e` updates the record too, so a restart restores what the share is *now*). A share whose deadline passed while the machine was off is dropped instead of resurrected. Resume also waits for `tailscaled` before restarting funnel/serve shares — at login it otherwise races the daemon and dies with "tailscale not ready" — and reaps any upstream server orphaned by an unclean shutdown, which would otherwise still be holding the port. Links you handed out before the reboot keep working.
+
+Note the agent runs at **login**, not at boot: a Mac that reboots to the login window restores shares once you log in.
+
 ## Video rooms (local MiroTalk, auto-managed)
 
 `--room` turns a secret link into the door to a [MiroTalk](https://github.com/miroslavpejic85/mirotalk) video room running **on your own machine**. One-time setup, then it's fully automatic:

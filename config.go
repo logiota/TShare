@@ -160,6 +160,9 @@ type config struct {
 	daemonTmp    string // temp file the daemon child must delete on exit
 	daemonTmpDir string // temp dir the daemon child must delete on exit
 	encKeyHex    string // passed to bg child so it inherits the inbox key
+	tokenSeed    string // --__token: serve this exact secret path again (daemon child / resume) so handed-out links survive a restart
+	expiresPin   string // --__expires: absolute RFC3339 deadline (resume) so a restart doesn't silently extend the share
+	bindPort     int    // --__bindport: rebind tshare's own backend port (resume) so a --local link is identical too
 }
 
 // defaultConfig is the base config (defaults) shared by the top-level share
@@ -289,6 +292,9 @@ func registerFlags(fs *flag.FlagSet, c *config) {
 	fs.StringVar(&c.daemonTmp, "__tmp", c.daemonTmp, "")
 	fs.StringVar(&c.daemonTmpDir, "__tmpdir", c.daemonTmpDir, "")
 	fs.StringVar(&c.encKeyHex, "__enckey", c.encKeyHex, "")
+	fs.StringVar(&c.tokenSeed, "__token", c.tokenSeed, "")
+	fs.StringVar(&c.expiresPin, "__expires", c.expiresPin, "")
+	fs.IntVar(&c.bindPort, "__bindport", c.bindPort, "")
 }
 
 // durFlag accepts 30m / 2h / 1d / 1w / never, and records explicit use.
