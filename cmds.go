@@ -51,6 +51,16 @@ func loadStates() []stateRec {
 	return out
 }
 
+func init() {
+	register(cmdLs, "ls", "list")
+	register(cmdRm, "rm", "stop", "revoke")
+	register(cmdSet, "set")
+	register(cmdExtend, "extend", "-x")
+	register(func([]string) { cmdPanic() }, "panic", "--panic")
+	register(cmdInfo, "info")
+	register(func([]string) { cmdDoctor() }, "doctor")
+}
+
 func cmdLs(args []string) {
 	recs := loadStates()
 	for _, a := range args {
@@ -68,7 +78,7 @@ func cmdLs(args []string) {
 	defer fmt.Println("\n  stop: tshare rm <id> · change: tshare set <id> -p pw -e 3d -n 9 · stats: tshare info <id>")
 	for _, r := range recs {
 		state := "live"
-		if !pidAlive(r.PID) {
+		if !recAlive(r) {
 			state = "dead"
 		}
 		exp := "never"
@@ -120,7 +130,7 @@ func cmdRm(args []string) {
 			continue
 		}
 		n++
-		if pidAlive(r.PID) {
+		if recAlive(r) { // never signal a pid the kernel reused after a reboot
 			syscall.Kill(r.PID, syscall.SIGTERM)
 			for i := 0; i < 30 && pidAlive(r.PID); i++ {
 				time.Sleep(100 * time.Millisecond)
@@ -131,18 +141,34 @@ func cmdRm(args []string) {
 		}
 		// belt & braces: remove funnel mount + state even if process is gone;
 		// reap owned managed servers (run/host/room) if the share died uncleanly.
-		if !pidAlive(r.PID) {
+		if !recAlive(r) {
 			reapProcs(r.Procs, syscall.SIGTERM)
 		}
 		if !r.Local {
 			c := &config{Tailnet: r.Tailnet, HTTPSPort: r.HTTPSPort}
 			tsUnmount(c, r.Token)
-			if r.RootMount && !pidAlive(r.PID) {
+			if r.RootMount && !recAlive(r) {
 				tsUnmount(c, "")
 			}
 		}
 		os.Remove(stateFile(r.ID))
+		os.Remove(persistFile(r.ID))
+		os.Remove(filepath.Join(ctlDir(), r.ID+".sock"))
 		fmt.Printf("  ✓ stopped %s (%s)\n", r.ID, r.URL)
+	}
+	// rm all: also sweep every resume record and stale control socket, so the
+	// keepalive/resume loop can't resurrect any of them 60s later.
+	if all {
+		if des, err := os.ReadDir(persistDir()); err == nil {
+			for _, de := range des {
+				os.Remove(filepath.Join(persistDir(), de.Name()))
+			}
+		}
+		if des, err := os.ReadDir(ctlDir()); err == nil {
+			for _, de := range des {
+				os.Remove(filepath.Join(ctlDir(), de.Name()))
+			}
+		}
 	}
 	if n == 0 {
 		fmt.Println("no matching share id — see: tshare ls")
@@ -167,7 +193,7 @@ func reapProcs(procs []procRec, sig syscall.Signal) {
 func cmdPanic() {
 	recs := loadStates()
 	for _, r := range recs {
-		if pidAlive(r.PID) {
+		if recAlive(r) {
 			syscall.Kill(r.PID, syscall.SIGKILL) // no waiting — this is a panic
 		}
 		// SIGKILL means the share's own cleanup never ran: reap owned managed
@@ -414,6 +440,9 @@ func (s *share) ctlServe() {
 			changed = append(changed, fmt.Sprintf("max downloads → %d", n))
 		}
 		s.updateState() // after releasing s.mu (lock order: stateMu → mu)
+		if len(changed) > 0 {
+			s.rePersist() // a new deadline must survive the next restart too
+		}
 		if !s.cfg.Quiet && len(changed) > 0 {
 			log.Printf("⚙ settings changed: %s", strings.Join(changed, "; "))
 		}
@@ -678,5 +707,6 @@ func (s *share) applyOptionLine(line string) {
 		return
 	}
 	s.updateState()
+	s.rePersist() // a new deadline must survive the next restart too
 	fmt.Fprintf(os.Stderr, "  ⚙ %s\n", strings.Join(changed, "; "))
 }

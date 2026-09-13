@@ -3,22 +3,13 @@
 package main
 
 import (
-	"bytes"
 	"errors"
-	"fmt"
-	"io"
-	"log"
-	"net"
-	"net/http"
-	"net/http/httputil"
 	"net/url"
 	"os"
 	"os/exec"
 	"path/filepath"
 	"strconv"
 	"strings"
-	"sync"
-	"syscall"
 	"time"
 )
 
@@ -107,31 +98,50 @@ const (
 	cpSockSz = "2097152" // 2 MiB
 )
 
+// copypartyPerm returns the anonymous volume permission string for this share.
+//
+//	r   — list + download (default folder share, or --ro)
+//	w   — upload-only drop box (default -u inbox)
+//	rw  — collaborative (--allow-upload)
+//	A   — full rights rwmda. (--full): read/write/move/delete/admin/dots
+func (s *share) copypartyPerm() string {
+	c := s.cfg
+	if c.Full {
+		return "A"
+	}
+	if c.ReadOnly {
+		return "r"
+	}
+	switch {
+	case s.mode == "inbox":
+		return "w"
+	case s.upDir != "":
+		return "rw"
+	default:
+		return "r"
+	}
+}
+
 // startCopyparty launches copyparty on a loopback port serving the share's
-// folder at the volume location /<token>, then builds the reverse proxy.
-func startCopyparty(s *share) error {
+// folder at the volume location /<token> — through the shared managed-server
+// engine, so it's health-checked, crash-detected, recorded in the share's
+// state and reaped with the share like every other server — then builds the
+// reverse proxy.
+func startCopyparty(s *share) (*serverProc, error) {
 	c := s.cfg
 	inv := copypartyInvocation(c)
 	if inv == nil {
-		return errors.New("copyparty not found (pip install copyparty, or set --copyparty-bin)")
+		return nil, errors.New("copyparty not found (pip install copyparty, or set --copyparty-bin)")
 	}
 	dir := s.roots[0].Abs
 	if s.mode == "inbox" {
 		dir = s.upDir
 	}
-	// permission: read-only browse, rw when uploads allowed, write-only inbox
-	perm := "r"
-	switch {
-	case s.mode == "inbox":
-		perm = "w" // upload-only drop box (no listing/download)
-	case s.upDir != "": // --allow-upload
-		perm = "rw"
-	}
+	perm := s.copypartyPerm()
 	port, err := freePort()
 	if err != nil {
-		return err
+		return nil, err
 	}
-	s.cpPort = port
 
 	// copyparty sits behind tshare under the secret /<token> subpath. --rp-loc
 	// tells it that base path so every URL it emits (including its /.cpr static
@@ -156,69 +166,18 @@ func startCopyparty(s *share) error {
 		// user args come last so they can override our buffer defaults
 		args = append(args, shellSplit(c.CopypartyArgs)...)
 	}
-	cmd := exec.Command(inv[0], args...)
-	// capture stderr so a bad-flag / crash-on-start explains itself; still echo
-	// it live unless we're in quiet mode.
-	var errbuf bytes.Buffer
-	if c.Quiet {
-		cmd.Stderr = &errbuf
-	} else {
-		cmd.Stderr = io.MultiWriter(os.Stderr, &errbuf)
+	// tee: copyparty's own warnings stay visible live (it runs with -q, so this
+	// is errors only); a crash at startup is reported with its log tail.
+	p, err := s.launchServer(srvSpec{
+		name: "copyparty-" + s.id, argv: append(inv[:1:1], args...),
+		port: port, wait: 15 * time.Second, tee: true,
+	})
+	if err != nil {
+		return nil, err
 	}
-	cmd.SysProcAttr = &syscall.SysProcAttr{Setsid: true} // own process group
-	if err := cmd.Start(); err != nil {
-		return fmt.Errorf("could not launch %s: %w", strings.Join(inv, " "), err)
-	}
-	s.cpCmd = cmd
-
-	// watch for early exit (e.g. an unrecognized flag) while we poll the port
-	exited := make(chan error, 1)
-	go func() { exited <- cmd.Wait() }()
-
-	addr := "127.0.0.1:" + strconv.Itoa(port)
-	deadline := time.After(15 * time.Second)
-	ready := false
-	for !ready {
-		select {
-		case werr := <-exited:
-			tail := strings.TrimSpace(errbuf.String())
-			if len(tail) > 400 {
-				tail = "…" + tail[len(tail)-400:]
-			}
-			return fmt.Errorf("copyparty exited at startup (%v)\n%s", werr, tail)
-		case <-deadline:
-			cmd.Process.Kill()
-			s.cpCmd = nil
-			return errors.New("copyparty did not start listening in time")
-		default:
-			if conn, derr := net.DialTimeout("tcp", addr, 300*time.Millisecond); derr == nil {
-				conn.Close()
-				ready = true
-			} else {
-				time.Sleep(150 * time.Millisecond)
-			}
-		}
-	}
-
-	target := &url.URL{Scheme: "http", Host: addr}
-	proxy := httputil.NewSingleHostReverseProxy(target)
-	proxy.FlushInterval = 250 * time.Millisecond // stream downloads
-	proxy.BufferPool = proxyBufPool              // reuse 64 KiB buffers (less GC)
-	proxy.ErrorHandler = func(w http.ResponseWriter, r *http.Request, e error) {
-		if !c.Quiet {
-			log.Printf("  copyparty proxy error: %v", e)
-		}
-		http.Error(w, "502 folder backend unavailable", http.StatusBadGateway)
-	}
-	s.cpProxy = proxy
-	return nil
+	s.adopt(p)
+	// keepHost: copyparty builds its links from the visitor's Host header
+	target := &url.URL{Scheme: "http", Host: "127.0.0.1:" + strconv.Itoa(port)}
+	s.cpProxy = newProxy(target, c, "folder backend", true)
+	return p, nil
 }
-
-// bufPool is an httputil.BufferPool backed by a sync.Pool of 64 KiB slices, so
-// the reverse proxy reuses transfer buffers instead of allocating per request.
-type bufPool struct{ p sync.Pool }
-
-func (b *bufPool) Get() []byte  { return b.p.Get().([]byte) }
-func (b *bufPool) Put(x []byte) { b.p.Put(x) }
-
-var proxyBufPool = &bufPool{p: sync.Pool{New: func() any { return make([]byte, 64<<10) }}}

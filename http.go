@@ -261,6 +261,11 @@ func (s *share) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		}
 	}
 
+	if s.mode == "room" && rel == "" && r.Method == http.MethodPost {
+		s.handleRoomToken(rec, r)
+		return
+	}
+
 	if r.Method != http.MethodGet && r.Method != http.MethodHead {
 		http.Error(rec, "405 method not allowed", http.StatusMethodNotAllowed)
 		return
@@ -938,7 +943,34 @@ func (s *share) reportAlert(who, label string) {
 }
 
 // ---------------------------------------------------------------------------
-// zip streaming
+// room token endpoint: POST with {name: "..."} returns a sealed join URL
+// containing a JWT with room + visitor name, so neither appears in the URL.
+func (s *share) handleRoomToken(rec http.ResponseWriter, r *http.Request) {
+	if s.mirotalkJWTKey == "" {
+		http.Error(rec, "403 room token sealing not configured", http.StatusForbidden)
+		return
+	}
+	var req struct {
+		Name string `json:"name"`
+	}
+	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+		http.Error(rec, "400 bad request", http.StatusBadRequest)
+		return
+	}
+	claims := map[string]interface{}{
+		"room": s.roomName,
+	}
+	if req.Name != "" {
+		claims["name"] = req.Name
+	}
+	token, err := makeJWT(s.mirotalkJWTKey, claims, 0)
+	if err != nil {
+		http.Error(rec, "500 internal error", http.StatusInternalServerError)
+		return
+	}
+	rec.Header().Set("Content-Type", "application/json")
+	fmt.Fprintf(rec, `{"url":"%s/join?token=%s"}`, s.roomOrigin, url.PathEscape(token))
+}
 
 func (s *share) handleZip(w *respRec, r *http.Request, dirRel string) {
 	if r.Method != http.MethodGet {

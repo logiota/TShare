@@ -9,3 +9,7 @@
 # macOS / editor / sync cruft
 .DS_Store
 .stfolder/
+*.sync-conflict-*
+
+# local app checkouts (third-party repos run natively by --room / --kuma)
+/mirotalk/

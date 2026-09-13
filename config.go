@@ -83,8 +83,8 @@ type config struct {
 	RoomName       string // explicit room id (else the positional arg, else random)
 	MirotalkURL    string // remote instance base URL ("" = use/spawn the local install)
 	MirotalkDir    string // local MiroTalk checkout (default ~/.tshare/mirotalk)
-	MirotalkMethod string // how the local instance runs: npm | docker (auto-detected if "")
 	MirotalkPort   int    // local MiroTalk port (default 7701)
+	MirotalkJWTKey string // signing key for JWT-sealed room join URLs (must match MiroTalk's jwt.key)
 
 	// hub (--hub): homescreen-style 2-way remote page — upload, grab URLs,
 	// browse/manage the hub folder, from a phone or any browser
@@ -142,6 +142,8 @@ type config struct {
 	NoCopyparty   bool   // never use copyparty (native folder server)
 	CopypartyBin  string // explicit copyparty binary / sfx path
 	CopypartyArgs string // extra raw copyparty args
+	Full          bool   // --full: full copyparty rights (A = rwmda.) on the shared folder / -u inbox
+	ReadOnly      bool   // --ro / --read-only: force read-only (r); with -u, browse the inbox without upload
 
 	// ops
 	LanHTTPS bool   // --local: serve HTTPS with a self-signed cert
@@ -158,6 +160,9 @@ type config struct {
 	daemonTmp    string // temp file the daemon child must delete on exit
 	daemonTmpDir string // temp dir the daemon child must delete on exit
 	encKeyHex    string // passed to bg child so it inherits the inbox key
+	tokenSeed    string // --__token: serve this exact secret path again (daemon child / resume) so handed-out links survive a restart
+	expiresPin   string // --__expires: absolute RFC3339 deadline (resume) so a restart doesn't silently extend the share
+	bindPort     int    // --__bindport: rebind tshare's own backend port (resume) so a --local link is identical too
 }
 
 // defaultConfig is the base config (defaults) shared by the top-level share
@@ -237,8 +242,9 @@ func registerFlags(fs *flag.FlagSet, c *config) {
 	fs.StringVar(&c.RoomName, "room-name", c.RoomName, "")
 	fs.StringVar(&c.MirotalkURL, "mirotalk-url", c.MirotalkURL, "")
 	fs.StringVar(&c.MirotalkDir, "mirotalk-dir", c.MirotalkDir, "")
-	fs.StringVar(&c.MirotalkMethod, "mirotalk-method", c.MirotalkMethod, "")
 	fs.IntVar(&c.MirotalkPort, "mirotalk-port", c.MirotalkPort, "")
+	fs.StringVar(&c.MirotalkJWTKey, "mirotalk-jwt-key", c.MirotalkJWTKey,
+		"JWT signing key for sealed room join URLs (must match MiroTalk's jwt.key)")
 	fs.BoolVar(&c.P2P, "p2p", c.P2P, "")
 	fs.BoolVar(&c.P2P, "p2pi", c.P2P, "") // common typo/alias
 	fs.BoolVar(&c.Call, "call", c.Call, "")
@@ -270,6 +276,9 @@ func registerFlags(fs *flag.FlagSet, c *config) {
 	fs.BoolVar(&c.NoCopyparty, "no-copyparty", c.NoCopyparty, "")
 	fs.StringVar(&c.CopypartyBin, "copyparty-bin", c.CopypartyBin, "")
 	fs.StringVar(&c.CopypartyArgs, "copyparty-args", c.CopypartyArgs, "")
+	fs.BoolVar(&c.Full, "full", c.Full, "")
+	fs.BoolVar(&c.ReadOnly, "ro", c.ReadOnly, "")
+	fs.BoolVar(&c.ReadOnly, "read-only", c.ReadOnly, "")
 	fs.BoolVar(&c.LanHTTPS, "lan-https", c.LanHTTPS, "")
 	fs.StringVar(&c.Profile, "profile", c.Profile, "")
 	fs.StringVar(&c.Profile, "template", c.Profile, "") // --template = apply a saved preset
@@ -283,6 +292,9 @@ func registerFlags(fs *flag.FlagSet, c *config) {
 	fs.StringVar(&c.daemonTmp, "__tmp", c.daemonTmp, "")
 	fs.StringVar(&c.daemonTmpDir, "__tmpdir", c.daemonTmpDir, "")
 	fs.StringVar(&c.encKeyHex, "__enckey", c.encKeyHex, "")
+	fs.StringVar(&c.tokenSeed, "__token", c.tokenSeed, "")
+	fs.StringVar(&c.expiresPin, "__expires", c.expiresPin, "")
+	fs.IntVar(&c.bindPort, "__bindport", c.bindPort, "")
 }
 
 // durFlag accepts 30m / 2h / 1d / 1w / never, and records explicit use.
@@ -546,6 +558,8 @@ func loadConfigArgs(path, profile string) []string {
 // config sections (#25). Templates ARE config profiles; this just lets you
 // save/list/remove them from the CLI instead of hand-editing the config, and
 // apply one with `tshare --template <name> <path>`.
+func init() { register(cmdTemplate, "template", "templates") }
+
 func cmdTemplate(args []string) {
 	sub := ""
 	if len(args) > 0 {

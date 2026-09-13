@@ -2,6 +2,13 @@
 
 package main
 
+import "fmt"
+
+func init() {
+	register(func([]string) { fmt.Println("tshare v" + version) }, "version", "--version", "-v")
+	register(func([]string) { fmt.Print(usageText) }, "help", "--help", "-h")
+}
+
 const version = "1.10.0"
 
 const usageText = `tshare v` + version + ` — secret-link file sharing over Tailscale Funnel
@@ -15,7 +22,8 @@ USAGE
   tshare -i                           blackhole inbox: accept & count uploads, keep nothing
   tshare --hub [dir]                  homescreen-style 2-way remote: upload + grab URLs + browse
   tshare run [--port N] -- <cmd…>     launch any server (auto-detect its port) & expose it
-  tshare host [dir]                   auto-detect the stack in a folder & host it (node/py/docker/php/static)
+  tshare host [dir]                   auto-detect the stack in a folder & host it
+                                      (package.json / a .js server / py / docker / php / static)
   tshare tmux                         list servers running in the shared 'tshare' tmux session
   tshare agent install                run 'tshare resume' at login (macOS LaunchAgent; brew-service-ready)
   tshare --rar --p2p big.mkv          split into 1.4 GB RAR volumes → per-part ⚡ P2P
@@ -86,6 +94,9 @@ SECURITY FLAGS
 MODES
   -t, --tailnet           tailnet-only (tailscale serve) instead of public funnel
   -u, --upload [dir]      inbox mode: receive files into dir (default ./tshare-inbox)
+                          default is write-only (drop-box). Pair with --full for
+                          full copyparty rights on that folder, or --ro to share
+                          it read-only (browse/download, no further uploads).
   -i, --blackhole         write-only sink: uploads are read, counted & notified,
                           but the bytes are discarded (nothing hits disk). Best
                           over the printed 'lan' URL for a direct throughput test.
@@ -98,7 +109,7 @@ MODES
                           Media is WebRTC P2P; signaling stays on your node.
       --mirotalk-url <u>  use a remote self-hosted instance instead
       --room-name <id>    explicit room id instead of a positional / random one
-      --mirotalk-dir/-method/-port   where/how the local install runs
+      --mirotalk-dir/-port   where the local install lives / which port it uses
       --call              the secret link IS a built-in 1:1 WebRTC video call —
                           no MiroTalk needed. Two participants, mute/cam/leave.
       --p2p               file OR folder share also offers ⚡ DIRECT browser-to-
@@ -133,6 +144,10 @@ FOLDER ENGINE
       --no-copyparty      always use the native folder server
       --copyparty-bin <p> copyparty binary or copyparty-sfx.py (or env TSHARE_COPYPARTY)
       --copyparty-args    extra raw copyparty args
+      --full              full copyparty rights (read/write/move/delete/admin)
+                          on a folder share or -u uploads folder (perm A)
+      --ro, --read-only   force read-only access (list + download). With -u:
+                          share the uploads folder browse-only (no upload)
   -z, --zip               serve a folder as a single .zip download
       --site, --web       serve a folder as a LIVE static website: index.html is
                           rendered, every file opens in-browser (not downloaded),
@@ -152,6 +167,8 @@ FOLDER ENGINE
                           LAN via http://<lan-ip>:<port>/<token>, token-gated)
       --watch             watch a shared folder; announce new files as they land
       --persist           remember this share so 'tshare resume' restarts it
+                          after a reboot — same token, port and expiry, so the
+                          link you handed out still works
       --profile <name>    use a [name] section from ~/.config/tshare/config
       --template <name>   apply a saved template (== a profile; see: tshare template)
       --no-config         ignore the config file
@@ -178,6 +195,8 @@ ONE-STOP HOSTING (launch a local server and expose it over the funnel)
                           then reverse-proxied. e.g.
                             tshare run -- npm start
                             tshare run --port 8000 -- python3 -m http.server 8000
+                          share flags may also follow the command:
+                            tshare run -- node app.js --tmux --name demo
   tshare host [dir]       detect the stack in a folder (package.json→node,
                           compose.yml→docker, app.py/manage.py→python, index.php→php,
                           index.html→static) and host it. Missing runtime? it
@@ -221,7 +240,10 @@ EXAMPLES
   tshare --once secrets.env              link dies after first download
   tshare -z -e 1w ~/Photos/trip          one-week link to a zip of the folder
   tshare -u -e 2d                        2-day upload inbox (drop-box)
+  tshare -u --full                       uploads folder with full copyparty rights
+  tshare -u --ro                         share uploads folder read-only
   tshare --allow-upload -p s3cret ~/proj shared folder: browse + upload
+  tshare --full ~/proj                   folder with full copyparty rights
   tshare --site ~/blog                   serve a static website over funnel
   tshare -s http://localhost:5173        share your running dev server
   tshare "https://youtu.be/…"            yt-dlp download → iOS-ready mp4 link

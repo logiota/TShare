@@ -118,7 +118,7 @@ tshare host ~/myapp                          # auto-detect the stack in a folder
 tshare host ~/site --tmux -p pw              # …in tmux, password-gated
 ```
 
-`tshare host` sniffs the folder — `package.json` → node (`npm start` or `server.js`), `compose.yml` → `docker compose up`, `app.py`/`manage.py` → python, `index.php` → PHP's built-in server, `index.html` → a static `--site`. The upstream **port is auto-detected** (tshare watches which port the process opens, via `lsof`) so you rarely pass `--port`; a `--port` that's already taken is reported as a conflict. tshare **bundles no runtimes** — if `node`/`python`/`docker` is missing it just tells you the `brew install` to run. Under the hood this is the same managed-server engine `--room` (MiroTalk) uses, so it inherits health-checks, WebSocket pass-through, and clean shutdown.
+`tshare host` sniffs the folder — `package.json` → node (`npm start` or `server.js`), a lone **`.js` server** (no `package.json`) → `node <file>`, `compose.yml` → `docker compose up`, `app.py`/`manage.py` → python, `index.php` → PHP's built-in server, `index.html` → a static `--site`. A `.js` file only counts as a server if it actually starts one (`createServer`, `Bun.serve`, or `.listen(` next to an `http`/`express`-style import) — browser assets are served, never executed — and when a folder has both a server and an `index.html`, the server wins, because it can serve that page itself on the same path (see [`examples/`](examples)). The upstream **port is auto-detected** (tshare watches which port the process opens, via `lsof`) so you rarely pass `--port`; a `--port` that's already taken is reported as a conflict. tshare **bundles no runtimes** — if `node`/`python`/`docker` is missing it just tells you the `brew install` to run. Under the hood this is the same managed-server engine `--room` (MiroTalk) uses, so it inherits health-checks, WebSocket pass-through, and clean shutdown.
 
 ### Watch them in tmux (`--tmux`)
 
@@ -142,6 +142,12 @@ tshare agent status / uninstall
 ```
 
 It's shaped like what Homebrew generates, so once tshare is installed from a tap the same thing is available as `brew services start tshare` (see the `service` block in `Formula/tshare.rb`). On Linux, `tshare agent` points you at the equivalent `systemd --user` one-liner.
+
+**What a resumed share keeps.** `--persist` records the share's *identity*, not just its command, so `tshare resume` brings back **the same link**: same secret token, same backend port, and the same absolute expiry (changing it live with `tshare set -e` updates the record too, so a restart restores what the share is *now*). A share whose deadline passed while the machine was off is dropped instead of resurrected. Resume also waits for `tailscaled` before restarting funnel/serve shares — at login it otherwise races the daemon and dies with "tailscale not ready" — and reaps any upstream server orphaned by an unclean shutdown, which would otherwise still be holding the port. Links you handed out before the reboot keep working.
+
+A share stopped **on purpose** — Ctrl-C, `tshare rm`, an expiry — is forgotten and stays gone. A share still running when the **machine** goes down keeps its record: at shutdown the OS SIGTERMs every process, and tshare treats that as "I'll be back", not "forget me".
+
+Two things to know: the agent runs at **login**, not at boot, so a Mac that reboots to the login window restores shares once you log in — and without `tshare agent install` nothing runs `resume` for you at all, so `--persist` records just sit there until you run it by hand.
 
 ## Video rooms (local MiroTalk, auto-managed)
 
@@ -240,7 +246,10 @@ Single-folder browse / upload / inbox shares are handed to [copyparty](https://g
 pip install copyparty            # then folders "just work"
 tshare ~/Designs                 # browse via copyparty behind your secret link
 tshare --allow-upload ~/proj     # collaborative (read+write)
+tshare --full ~/proj             # full copyparty rights (read/write/move/delete)
 tshare -u                        # write-only drop-box inbox
+tshare -u --full                 # uploads folder with full rights (browse + manage)
+tshare -u --ro                   # share the uploads folder read-only
 tshare --no-copyparty ~/Designs  # force the built-in native folder server
 tshare --copyparty-bin ./copyparty-sfx.py ~/x   # explicit binary / sfx
 ```
@@ -292,9 +301,11 @@ Nice defaults (each individually disableable): the link is **copied to your clip
 | `-e, --expires` | auto-stop: `30m`, `2h`, `1d`, `1w`, `never` (default: **15d**) |
 | `--filename` | public name for stdin shares / rename a single-file share |
 | `-n, --max` / `--once` | stop after N / 1 completed downloads |
-| `-u, --upload [dir]` | inbox mode (default `./tshare-inbox`) |
+| `-u, --upload [dir]` | inbox mode (default `./tshare-inbox`); write-only drop-box unless paired with `--full` / `--ro` |
 | `-i, --blackhole` | write-only sink: uploads read + counted + notified, **bytes discarded** (nothing on disk) |
 | `--allow-upload` | folder share also accepts uploads (also works with `--site`: pages run *and* `__upload` accepts POSTs — e.g. in-page signalling like GIGA-NET/1-L) |
+| `--full` | full copyparty rights (`A` = read/write/move/delete/admin) on a folder or `-u` uploads folder |
+| `--ro`, `--read-only` | force read-only access; with `-u`, browse the uploads folder without further uploads |
 | `--max-rate` | throttle served bandwidth, e.g. `2M` = ~2 MB/s (default: off) |
 | `--min-free` | refuse uploads when free disk space drops below this (default **32G**; `0` = off) |
 | `--abuse-contact` | show a small-font takedown/abuse line on public share pages (email/URL auto-linked) |
