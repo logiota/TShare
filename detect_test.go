@@ -59,3 +59,22 @@ func TestDetectStackJS(t *testing.T) {
 		})
 	}
 }
+
+// A clean shutdown SIGTERMs every process, and the share's own cleanup runs.
+// Dropping the resume record there would delete exactly the shares --persist
+// exists to bring back, so only a deliberate stop forgets a share.
+func TestKeepsResumeRecord(t *testing.T) {
+	cases := map[string]bool{
+		"terminated":       true,  // SIGTERM — machine going down
+		"interrupt":        false, // Ctrl-C
+		"expired":          false,
+		"stop requested":   false,
+		"byte cap reached": false,
+		"":                 false,
+	}
+	for reason, want := range cases {
+		if got := keepsResumeRecord(reason); got != want {
+			t.Errorf("keepsResumeRecord(%q) = %v, want %v", reason, got, want)
+		}
+	}
+}

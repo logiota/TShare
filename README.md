@@ -145,7 +145,9 @@ It's shaped like what Homebrew generates, so once tshare is installed from a tap
 
 **What a resumed share keeps.** `--persist` records the share's *identity*, not just its command, so `tshare resume` brings back **the same link**: same secret token, same backend port, and the same absolute expiry (changing it live with `tshare set -e` updates the record too, so a restart restores what the share is *now*). A share whose deadline passed while the machine was off is dropped instead of resurrected. Resume also waits for `tailscaled` before restarting funnel/serve shares — at login it otherwise races the daemon and dies with "tailscale not ready" — and reaps any upstream server orphaned by an unclean shutdown, which would otherwise still be holding the port. Links you handed out before the reboot keep working.
 
-Note the agent runs at **login**, not at boot: a Mac that reboots to the login window restores shares once you log in.
+A share stopped **on purpose** — Ctrl-C, `tshare rm`, an expiry — is forgotten and stays gone. A share still running when the **machine** goes down keeps its record: at shutdown the OS SIGTERMs every process, and tshare treats that as "I'll be back", not "forget me".
+
+Two things to know: the agent runs at **login**, not at boot, so a Mac that reboots to the login window restores shares once you log in — and without `tshare agent install` nothing runs `resume` for you at all, so `--persist` records just sit there until you run it by hand.
 
 ## Video rooms (local MiroTalk, auto-managed)
 

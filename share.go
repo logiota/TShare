@@ -153,6 +153,13 @@ func (s *share) doExtend(spec string) (string, error) {
 	return "expiry +" + spec + " → " + s.expiresAt.Format("Jan 2 15:04"), nil
 }
 
+// keepsResumeRecord reports whether a stop for this reason must PRESERVE the
+// share's --persist record. Only a SIGTERM does: that's what the OS sends every
+// process at shutdown, which is precisely the case --persist exists for. Every
+// other reason is a deliberate stop, and a share stopped on purpose should stay
+// stopped across the next boot.
+func keepsResumeRecord(reason string) bool { return reason == "terminated" }
+
 func init() { defaultRun = cmdShare }
 
 // cmdShare is the bare `tshare [flags] <path…>` entry: build the config
@@ -783,6 +790,7 @@ func runShare(c *config) error {
 	if err := s.saveState(port); err != nil {
 		log.Printf("warn: %v", err)
 	}
+	stopReason := "" // set when we know why we're shutting down (see below)
 	cleanup := func() {
 		if !c.Local {
 			tsUnmount(c, s.token)
@@ -803,9 +811,15 @@ func runShare(c *config) error {
 		if c.daemonTmpDir != "" {
 			os.RemoveAll(c.daemonTmpDir)
 		}
-		// intentional stop/expiry → drop the resume record (reboot keeps it,
-		// because cleanup doesn't run when the process is killed by shutdown)
-		os.Remove(persistFile(s.id))
+		// Drop the resume record only when the stop was INTENTIONAL: Ctrl-C, an
+		// expiry, a byte cap, an explicit `stop`. SIGTERM is what the OS sends
+		// every process at shutdown (launchd and systemd both do), and cleanup
+		// does run then — dropping the record there would delete exactly the
+		// shares --persist exists to bring back. `tshare rm`/`panic` remove the
+		// record themselves, so stopping a share on purpose still forgets it.
+		if !keepsResumeRecord(stopReason) {
+			os.Remove(persistFile(s.id))
+		}
 		if s.mtRootMounted {
 			tsUnmount(c, "") // root path we mounted for local MiroTalk / Kuma
 		}
@@ -985,6 +999,7 @@ func runShare(c *config) error {
 	case err := <-errCh:
 		return err // deferred cleanup runs
 	}
+	stopReason = reason
 	if !c.Quiet {
 		log.Printf("⏹  stopping (%s)…", reason)
 	}
