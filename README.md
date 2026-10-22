@@ -147,7 +147,7 @@ It's shaped like what Homebrew generates, so once tshare is installed from a tap
 
 A share stopped **on purpose** — Ctrl-C, `tshare rm`, an expiry — is forgotten and stays gone. A share still running when the **machine** goes down keeps its record: at shutdown the OS SIGTERMs every process, and tshare treats that as "I'll be back", not "forget me".
 
-Two things to know: the agent runs at **login**, not at boot, so a Mac that reboots to the login window restores shares once you log in — and without `tshare agent install` nothing runs `resume` for you at all, so `--persist` records just sit there until you run it by hand.
+You don't have to set anything up: the first `--persist` share **installs the login agent itself** (it says so, and `tshare agent uninstall` undoes it), because a resume record restores nothing unless something runs `tshare resume` for you. One thing to know: the agent runs at **login**, not at boot, so a Mac that reboots to the login window restores shares once you log in. On Linux there's no launchd, so tshare tells you to run `resume` from your own session startup instead.
 
 ## Video rooms (local MiroTalk, auto-managed)
 

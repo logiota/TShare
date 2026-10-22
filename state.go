@@ -384,14 +384,12 @@ func savePersist(s *share) error {
 	// --__gamesid is stripped here and re-appended below so exactly one (the live
 	// session id) survives — resume then reuses it, keeping distributed join links valid.
 	var args []string
-	skip := map[string]bool{"--__daemon": true, "--__id": true, "--__tmp": true, "--__tmpdir": true,
-		"--__enckey": true, "--__gamesid": true, "--__token": true, "--__expires": true,
-		"--__bindport": true}
-	for i := 0; i < len(os.Args[1:]); i++ {
-		a := os.Args[1:][i]
-		if skip[a] {
-			if a != "--__daemon" {
-				i++ // also skip its value
+	argv := os.Args[1:]
+	for i := 0; i < len(argv); i++ {
+		a := argv[i]
+		if tshareInternalFlag(a) { // --__daemon/--__id/--__token/… are per-run, never persisted
+			if runValueFlag(a) && !strings.Contains(a, "=") {
+				i++ // skip its value too
 			}
 			continue
 		}

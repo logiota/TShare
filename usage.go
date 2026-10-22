@@ -166,7 +166,9 @@ FOLDER ENGINE
                           (by default a share is ALSO reachable directly on your
                           LAN via http://<lan-ip>:<port>/<token>, token-gated)
       --watch             watch a shared folder; announce new files as they land
-      --persist           remember this share so 'tshare resume' restarts it
+      --persist           survive a reboot: remembers this share and installs
+                          the login agent that restarts it (undo: tshare
+                          agent uninstall)
                           after a reboot — same token, port and expiry, so the
                           link you handed out still works
       --profile <name>    use a [name] section from ~/.config/tshare/config

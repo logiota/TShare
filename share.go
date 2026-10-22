@@ -688,6 +688,14 @@ func runShare(c *config) error {
 		s.expiresAt = time.Now().Add(c.Expires)
 	}
 
+	// --persist is a promise that these shares come back, and that needs
+	// something to run `tshare resume` at login. Do it here, before the -b
+	// hand-off, so the interactive process reports it to the terminal rather
+	// than the detached child's log file.
+	if c.Persist && !c.daemonChild {
+		ensurePersistAgent(c)
+	}
+
 	// background: re-exec a detached child, wait for it to publish its state
 	if c.Background && !c.daemonChild {
 		return daemonize(s)
@@ -1002,6 +1010,14 @@ func runShare(c *config) error {
 	stopReason = reason
 	if !c.Quiet {
 		log.Printf("⏹  stopping (%s)…", reason)
+	}
+	// A server we launched (run/host) is what holds proxied streams open —
+	// SSE, long polls — and those would pin the drain below for its whole 20s,
+	// past `tshare rm`'s patience (it SIGKILLs us, and cleanup never runs).
+	// Stop the upstream first so the drain ends at once; cleanup's stopAll is
+	// then a no-op.
+	if s.srvProxy != nil {
+		stopAll(s.procs)
 	}
 	ctx, cancel := context.WithTimeout(context.Background(), 20*time.Second)
 	defer cancel()

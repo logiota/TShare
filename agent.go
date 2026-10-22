@@ -76,24 +76,13 @@ func agentInstall(args []string) {
 	if !keepSet { // long-running share commands should be restarted; `resume` is one-shot
 		keepAlive = runArgs[0] != "resume"
 	}
-	bin, err := os.Executable()
-	if err != nil || bin == "" {
-		bin, _ = exec.LookPath("tshare")
-	}
-	plist := agentPlist(agentLabel, bin, runArgs, keepAlive)
 	if print {
-		fmt.Print(plist)
+		fmt.Print(agentPlist(agentLabel, agentBin(), runArgs, keepAlive))
 		return
 	}
-	path := agentPlistPath()
-	if err := os.MkdirAll(filepath.Dir(path), 0o755); err != nil {
+	path, err := writeAgent(runArgs, keepAlive)
+	if err != nil {
 		log.Fatalf("tshare: %v", err)
-	}
-	if err := os.WriteFile(path, []byte(plist), 0o644); err != nil {
-		log.Fatalf("tshare: %v", err)
-	}
-	if out, err := exec.Command("plutil", "-lint", path).CombinedOutput(); err != nil {
-		log.Fatalf("tshare: generated plist failed validation: %s", strings.TrimSpace(string(out)))
 	}
 	fmt.Printf("  ✓ wrote %s\n", path)
 	fmt.Printf("    runs at login:  tshare %s   (KeepAlive=%v)\n", strings.Join(runArgs, " "), keepAlive)
@@ -101,18 +90,82 @@ func agentInstall(args []string) {
 		fmt.Printf("    load it yourself:  launchctl bootstrap gui/%d %s\n", os.Getuid(), path)
 		return
 	}
-	uid := strconv.Itoa(os.Getuid())
-	exec.Command("launchctl", "bootout", "gui/"+uid+"/"+agentLabel).Run() // ignore if not loaded
-	if out, err := exec.Command("launchctl", "bootstrap", "gui/"+uid, path).CombinedOutput(); err != nil {
-		// older macOS fallback
-		if out2, err2 := exec.Command("launchctl", "load", "-w", path).CombinedOutput(); err2 != nil {
-			fmt.Printf("  ⚠ plist written but launchctl load failed:\n    %s\n    %s\n",
-				strings.TrimSpace(string(out)), strings.TrimSpace(string(out2)))
-			return
-		}
+	if err := loadAgent(path); err != nil {
+		fmt.Printf("  ⚠ plist written but launchctl load failed:\n    %v\n", err)
+		return
 	}
 	fmt.Println("  ✓ loaded into launchd — it will run at every login")
 	fmt.Println("    later, if installed via brew:  brew services start tshare")
+}
+
+// agentBin is the tshare binary the agent should run.
+func agentBin() string {
+	bin, err := os.Executable()
+	if err != nil || bin == "" {
+		bin, _ = exec.LookPath("tshare")
+	}
+	return bin
+}
+
+// writeAgent renders and validates the plist, returning its path.
+func writeAgent(runArgs []string, keepAlive bool) (string, error) {
+	path := agentPlistPath()
+	if err := os.MkdirAll(filepath.Dir(path), 0o755); err != nil {
+		return "", err
+	}
+	if err := os.WriteFile(path, []byte(agentPlist(agentLabel, agentBin(), runArgs, keepAlive)), 0o644); err != nil {
+		return "", err
+	}
+	if out, err := exec.Command("plutil", "-lint", path).CombinedOutput(); err != nil {
+		return "", fmt.Errorf("generated plist failed validation: %s", strings.TrimSpace(string(out)))
+	}
+	return path, nil
+}
+
+// loadAgent (re)loads the plist into launchd, falling back to older syntax.
+func loadAgent(path string) error {
+	uid := strconv.Itoa(os.Getuid())
+	exec.Command("launchctl", "bootout", "gui/"+uid+"/"+agentLabel).Run() // ignore if not loaded
+	out, err := exec.Command("launchctl", "bootstrap", "gui/"+uid, path).CombinedOutput()
+	if err == nil {
+		return nil
+	}
+	out2, err2 := exec.Command("launchctl", "load", "-w", path).CombinedOutput()
+	if err2 == nil {
+		return nil
+	}
+	return fmt.Errorf("%s / %s", strings.TrimSpace(string(out)), strings.TrimSpace(string(out2)))
+}
+
+// agentInstalled reports whether the login agent's plist is in place.
+func agentInstalled() bool { return fileExists(agentPlistPath()) }
+
+// ensurePersistAgent is what makes --persist mean what it says. A resume record
+// alone restores nothing: something has to run `tshare resume` after a reboot.
+// Requiring the user to know that was the whole failure mode — a share flagged
+// --persist that quietly never came back — so the first --persist share installs
+// the login agent itself, says so, and says how to undo it.
+func ensurePersistAgent(c *config) {
+	if c.Quiet || agentInstalled() {
+		return
+	}
+	if runtime.GOOS != "darwin" {
+		log.Printf("  ⚠ --persist records this share, but nothing restores it automatically here.")
+		log.Printf("    run `tshare resume` at login (systemd --user service, .profile, …)")
+		return
+	}
+	path, err := writeAgent([]string{"resume"}, false)
+	if err == nil {
+		err = loadAgent(path)
+	}
+	if err != nil {
+		log.Printf("  ⚠ --persist needs a login agent to restore shares, and installing it failed:")
+		log.Printf("    %v", err)
+		log.Printf("    install it yourself:  tshare agent install")
+		return
+	}
+	log.Printf("  ✓ --persist: installed the login agent, so these shares come back after a reboot")
+	log.Printf("    (runs `tshare resume` at login · undo: tshare agent uninstall)")
 }
 
 func agentUninstall() {
@@ -128,7 +181,7 @@ func agentUninstall() {
 
 func agentStatus() {
 	path := agentPlistPath()
-	if !fileExists(path) {
+	if !agentInstalled() {
 		fmt.Println("no tshare agent installed (tshare agent install)")
 		return
 	}

@@ -5,6 +5,7 @@ package main
 import (
 	"context"
 	"errors"
+	"flag"
 	"fmt"
 	"io"
 	"log"
@@ -613,47 +614,62 @@ func trailingShareFlags(cmd []string) []string {
 	return cluster
 }
 
-// isTshareFlag reports whether tok names one of tshare's own flags (value-taking
-// or boolean), so trailing-flag lifting only ever peels tshare flags off a
-// command and never touches an app's options.
+// tshare's own flags, derived from registerFlags so these can never drift from
+// the real flag set. The value is whether the flag consumes the next token:
+// `--name demo` does, `--tmux` doesn't — the same distinction the flag package
+// makes, read straight off each flag's Value. Hand-written copies of this list
+// are how `tshare run -- cmd` used to mis-split a newly added flag.
+var tshareFlags = sync.OnceValue(func() map[string]bool {
+	fs := flag.NewFlagSet("introspect", flag.ContinueOnError)
+	fs.SetOutput(io.Discard)
+	registerFlags(fs, defaultConfig())
+	m := make(map[string]bool, 128)
+	fs.VisitAll(func(f *flag.Flag) {
+		b, isBool := f.Value.(interface{ IsBoolFlag() bool })
+		m[f.Name] = !(isBool && b.IsBoolFlag())
+	})
+	return m
+})
+
+// flagName strips leading dashes, returning "" for a non-flag token (so a bare
+// command word is never mistaken for a flag).
+func flagName(tok string) string {
+	if !strings.HasPrefix(tok, "-") {
+		return ""
+	}
+	name, _, _ := strings.Cut(strings.TrimLeft(tok, "-"), "=")
+	return name
+}
+
+// isTshareFlag reports whether tok names one of tshare's own flags, so
+// trailing-flag lifting only ever peels tshare flags off a command and never
+// touches an app's options.
 func isTshareFlag(tok string) bool {
-	name := strings.TrimLeft(tok, "-")
-	if name == "" || name == tok {
+	name := flagName(tok)
+	if name == "" {
 		return false
 	}
-	switch name {
-	case "port", "p", "password", "e", "expires", "name", "n", "max", "https-port",
-		"max-rate", "max-bytes", "min-free", "dir", "abuse-contact", "profile", "template",
-		"token-len", "max-upload", "tailscale-bin", "filename", "yt-format", "yt-args",
-		"room-name", "mirotalk-url", "mirotalk-dir", "mirotalk-port",
-		"mirotalk-jwt-key", "kuma-port", "kuma-dir", "copyparty-bin", "copyparty-args",
-		"rar-size", "stun", "turn", "turn-user", "turn-pass", "cq":
-		return true
-	}
-	return tshareBoolFlag(name)
+	_, known := tshareFlags()[name]
+	return known
 }
 
-func tshareBoolFlag(name string) bool {
-	switch name {
-	case "once", "t", "tailnet", "u", "upload", "allow-upload", "z", "zip", "site",
-		"web", "gamelink", "g", "l", "local", "lan", "no-lan", "inline", "b", "bg",
-		"q", "qr", "c", "copy", "no-qr", "no-copy", "no-notify", "no-open", "open",
-		"quiet", "json", "Y", "yt-dlp", "yt-audio", "a", "playlist", "fetch",
-		"progressive", "live", "s", "server", "require-identity", "i", "blackhole",
-		"room", "mirotalk", "p2p", "p2pi", "call", "hub", "tmux", "kuma", "dashboard",
-		"web-ui", "rar", "full", "ro", "read-only", "lan-https", "no-config", "watch",
-		"persist", "no-repl", "265", "hevc", "transcode", "strip-exif", "no-gallery",
-		"encrypt", "copyparty", "no-copyparty":
-		return true
-	}
-	return false
+// runValueFlag reports whether a tshare flag consumes the following token.
+func runValueFlag(tok string) bool {
+	return tshareFlags()[flagName(tok)]
 }
 
-// runIntentFlags are tshare options unlikely to belong to a launched app, so a
+// tshareInternalFlag reports whether a flag is one of the private --__ markers
+// daemonize/resume pass to a child (never part of a persisted command line).
+func tshareInternalFlag(tok string) bool {
+	return strings.HasPrefix(flagName(tok), "__")
+}
+
+// tshareIntent: unlike the sets above, this is a deliberate POLICY list, not a
+// mirror of the flag set — options unlikely to belong to a launched app, so a
 // run containing any of them is treated as passing tshare flags after the --.
 func tshareIntent(cluster []string) bool {
 	for _, c := range cluster {
-		if tshareIntentSet[strings.TrimLeft(c, "-")] {
+		if tshareIntentSet[flagName(c)] {
 			return true
 		}
 	}
@@ -669,17 +685,6 @@ var tshareIntentSet = map[string]bool{
 	"full": true, "ro": true, "read-only": true, "no-open": true, "no-notify": true,
 	"no-qr": true, "no-copy": true, "require-identity": true, "site": true,
 	"web": true, "local": true, "l": true, "watch": true, "encrypt": true,
-}
-
-func runValueFlag(f string) bool {
-	switch strings.TrimLeft(f, "-") {
-	case "port", "p", "password", "e", "expires", "name", "n", "max", "https-port",
-		"max-rate", "max-bytes", "min-free", "dir", "abuse-contact", "profile", "template",
-		"filename", "__id", "__tmp", "__tmpdir", "__enckey", "__gamesid",
-		"__token", "__expires", "__bindport": // + daemon/resume internals
-		return true
-	}
-	return false
 }
 
 func init() {
