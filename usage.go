@@ -22,6 +22,7 @@ USAGE
   tshare -i                           blackhole inbox: accept & count uploads, keep nothing
   tshare --hub [dir]                  homescreen-style 2-way remote: upload + grab URLs + browse
   tshare run [--port N] -- <cmd…>     launch any server (auto-detect its port) & expose it
+  tshare --webwiz [path]              checklist wizard: every option explained → command
   tshare host [dir]                   auto-detect the stack in a folder & host it
                                       (package.json / a .js server / py / docker / php / static)
   tshare tmux                         list servers running in the shared 'tshare' tmux session
@@ -110,6 +111,14 @@ MODES
       --mirotalk-url <u>  use a remote self-hosted instance instead
       --room-name <id>    explicit room id instead of a positional / random one
       --mirotalk-dir/-port   where the local install lives / which port it uses
+      --mirotalk-jwt-key <k>
+                          seal room join links as a signed JWT (must match
+                          MiroTalk's jwt.key), so the room never sits in the URL
+      --kuma              expose your Uptime Kuma monitor at the funnel root
+                          (same as: tshare kuma · one-time: tshare kuma install)
+      --kuma-dir/-port <x>  where the native install lives / its port (7702)
+      --dashboard         an iOS-home-screen web UI tiling all your shares, on its
+                          own password-gated link (same as: tshare dash)
       --call              the secret link IS a built-in 1:1 WebRTC video call —
                           no MiroTalk needed. Two participants, mute/cam/leave.
       --p2p               file OR folder share also offers ⚡ DIRECT browser-to-
@@ -127,6 +136,7 @@ MODES
       --stun <urls>       ICE STUN servers (comma list; sane public defaults)
       --turn <url>        optional TURN relay (+ --turn-user/--turn-pass) for a
                           guaranteed direct-ish path when hole-punch fails
+      --turn-user/-pass <s>  credentials for that TURN relay
       --hub [dir]         a homescreen-style 2-way remote (dir default ./tshare-
                           hub): upload files to the host, paste a URL for the
                           host to GRAB (yt-dlp/site or direct file), browse/
@@ -149,32 +159,44 @@ FOLDER ENGINE
       --ro, --read-only   force read-only access (list + download). With -u:
                           share the uploads folder browse-only (no upload)
   -z, --zip               serve a folder as a single .zip download
-      --site, --web       serve a folder as a LIVE static website: index.html is
-                          rendered, every file opens in-browser (not downloaded),
-                          and folders without an index get a browsable listing.
+      --watch             watch a shared folder; announce new files as they land
+
+WEBSITES & APPS
+      --site, --web       serve a folder as a LIVE website, the way a static host
+                          does: index.html routing, clean URLs (/about →
+                          about.html), single-page-app routes (an unknown page
+                          gets index.html — ship a 404.html for strict 404s),
+                          /dir → /dir/ redirects, gzip and cache validators.
                           Scripts run (no sandbox); expiry defaults to never.
-                          Pair with --name for a stable /<name>/ path
+      --root              publish at the root of your node (https://<host>/)
+                          instead of a secret /<token>/ path, so root-absolute
+                          links (/style.css, fetch('/api')) work unmodified.
+                          Public by design — add -p to gate it. One share per
+                          node holds the root. A folder or .html implies --site;
+                          also works for run/host/-s apps.
   -g, --gamelink          host a GIGA-NET/1-L multiplayer game page in one shot:
                           implies --site --allow-upload, prints + copies a JOIN
                           link for the other player, and auto-opens the page here
                           in host mode — zero clicks (e.g. GigaSnakes). Over
                           funnel/tailnet the game hole-punches via STUN (add
                           --turn for symmetric NAT); -l keeps it LAN-only
+  -s, --server            reverse-proxy a running server URL over the funnel
+                          (auto for localhost URLs; rewrites Host, passes
+                          WebSockets). Root-absolute asset paths need --root.
+      --tmux              launch managed servers (run/host/room) as windows of one
+                          'tshare' tmux session (attach: tmux attach -t tshare;
+                          list: tshare tmux) instead of piped child processes
+      --dir <path>        working directory for 'tshare run' (else current dir)
+
+NETWORK & REACH
   -l, --local             no tailscale: plain HTTP on your LAN (testing/offline)
+      --lan               also answer directly on the LAN — ON by default
       --lan-https         --local: serve HTTPS with a self-signed cert
       --no-lan            funnel/serve only — don't also expose on the LAN
                           (by default a share is ALSO reachable directly on your
                           LAN via http://<lan-ip>:<port>/<token>, token-gated)
-      --watch             watch a shared folder; announce new files as they land
-      --persist           survive a reboot: remembers this share and installs
-                          the login agent that restarts it (undo: tshare
-                          agent uninstall)
-                          after a reboot — same token, port and expiry, so the
-                          link you handed out still works
-      --profile <name>    use a [name] section from ~/.config/tshare/config
-      --template <name>   apply a saved template (== a profile; see: tshare template)
-      --no-config         ignore the config file
-      --inline            display in browser instead of forcing download
+
+DOWNLOADS & STREAMS (URLs, yt-dlp, stdin)
   -Y, --yt-dlp            force treating the argument as a yt-dlp URL
   -a, --yt-audio          yt-dlp: smart audio-only → tagged M4A (cover art)
       --yt-format <f>     yt-dlp: -f format selector
@@ -183,13 +205,6 @@ FOLDER ENGINE
       --fetch             plain HTTP download (wget-style) instead of yt-dlp
       --progressive       serve while it downloads (stdin or URL)
       --live              live stream: progressive, ends when the source does
-  -s, --server            reverse-proxy a running server URL over the funnel
-                          (auto for localhost URLs; rewrites Host, passes
-                          WebSockets; use relative asset paths under /<token>/)
-      --tmux              launch managed servers (run/host/room) as windows of one
-                          'tshare' tmux session (attach: tmux attach -t tshare;
-                          list: tshare tmux) instead of piped child processes
-      --dir <path>        working directory for 'tshare run' (else current dir)
 
 ONE-STOP HOSTING (launch a local server and expose it over the funnel)
   tshare run [flags] -- <command…>   run any command that serves on a port; the
@@ -220,6 +235,17 @@ MEDIA TRANSFORMS (need ffmpeg / sips / imagemagick on PATH)
 
 OUTPUT & LIFECYCLE
   -b, --bg                run in background (manage with tshare ls / set / rm)
+      --persist           survive a reboot: same link, port and expiry after a
+                          restart. The first --persist share installs the login
+                          agent that brings shares back (undo: tshare agent
+                          uninstall)
+      --profile <name>    use a [name] section from ~/.config/tshare/config
+      --template <name>   apply a saved template (== a profile; see: tshare template)
+      --no-config         ignore the config file
+      --inline            display in browser instead of forcing download
+      --webwiz            interactive checklist of every option, explained —
+                          builds the command as you tick, then runs it
+      --no-repl           don't read option changes typed at a foreground share
       --filename <name>   public file name (stdin shares & single-file renames)
   -q, --qr                QR code — ON by default when qrencode is installed
   -c, --copy              copy link to clipboard — ON by default
@@ -247,6 +273,8 @@ EXAMPLES
   tshare --allow-upload -p s3cret ~/proj shared folder: browse + upload
   tshare --full ~/proj                   folder with full copyparty rights
   tshare --site ~/blog                   serve a static website over funnel
+  tshare --root ~/blog                   …at https://<host>/ so /absolute paths work
+  tshare host ~/myapp                    run a node/python/php app and publish it
   tshare -s http://localhost:5173        share your running dev server
   tshare "https://youtu.be/…"            yt-dlp download → iOS-ready mp4 link
   tshare -t plan.md                      tailnet-only (not public)

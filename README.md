@@ -94,6 +94,12 @@ curl -u :pw -F f=@notes.txt https://…/<token>/__upload        # send a file
 curl -o all.zip https://…/<token>/__zip                       # folder as zip
 ```
 
+## Not sure which flags? `--webwiz`
+
+`tshare --webwiz [path]` opens an interactive checklist of **every** option, grouped and explained, with the command it adds up to shown live underneath. Tick with space, type values with ⏎, `/` to filter, `tab` to jump sections; then `r` runs it, `p` prints it, `c` copies it. Point it at a folder and it starts in website mode (`tshare host`), with what it detected shown — so publishing a site or an app is a few keystrokes. Flags you already typed come pre-ticked (`tshare --webwiz -p pw ~/blog`), passwords stay masked on screen, and with no terminal (`tshare --webwiz | less`) it prints the same checklist as plain text.
+
+The wizard keeps no list of its own: the rows come from tshare's real flag set and the explanations from `--help`, so it can't fall out of date, and a test fails if an option ever ships without an explanation.
+
 ## Share a running server (`-s`)
 
 `-s` / `--server` reverse-proxies an already-running local server over the funnel — dev servers, notebooks, any `http://localhost:PORT`. A localhost URL is auto-detected as a server (so it's proxied, not downloaded by yt-dlp). tshare's token/password/expiry/limits sit in front; the upstream's `Host` header is rewritten so dev-server host checks pass, and WebSockets/HMR pass through.
@@ -105,7 +111,7 @@ tshare -s http://localhost:3000 -p pw  # password-gate it
 tshare -s http://192.168.1.9:9000      # any reachable host:port with -s
 ```
 
-Same subpath caveat as `--site`: the app is served under `/<token>/`, so **relative asset paths** work; root-absolute (`/assets/…`) need your dev server's base path set to the share path (pair with `--name`). For Vite/webpack that's `base`/`publicPath`.
+The app is served under `/<token>/`, so **relative asset paths** work out of the box. Root-absolute ones (`/assets/…`, what Vite and webpack emit by default) need either `--root` — `tshare -s --root http://localhost:5173` publishes at `https://<host>.ts.net/` and the app works unchanged — or your dev server's base path set to the share path (`base`/`publicPath`, paired with `--name` for a stable prefix).
 
 ## One-stop hosting: run & expose any local server
 
@@ -220,23 +226,37 @@ The page has four tiles: **📤 Send files** (upload from the phone straight to 
 
 ## Static websites over Funnel (`--site`)
 
-`--site` (or `--web`) serves a folder as a **live website** instead of a file browser — `index.html` routing, correct content-types, scripts run (no sandbox, no forced download), `404.html` fallback if present, and `ServeContent` caching (Last-Modified/ETag/304). Expiry defaults to **never** since sites are long-term.
+`--site` (or `--web`) serves a folder as a **live website** instead of a file browser, behaving the way a modern static host does. Expiry defaults to **never** since sites are long-term.
 
 ```sh
 tshare --site ~/blog                 # serve the folder as a website
-tshare --site ~/blog/index.html      # same — a lone .html uses its folder as root
+tshare --root ~/blog                 # …at https://<host>.ts.net/ — /absolute paths just work
+tshare --site ~/blog/index.html      # a lone .html uses its folder as root
 tshare --name blog --site ~/blog     # stable path: https://<host>.ts.net/blog/
 tshare --site -p hunter2 ~/blog      # password-gated site
 tshare --site --allow-upload ~/app   # site whose pages can ALSO POST files to __upload
+tshare --webwiz ~/blog               # not sure which options? tick them in a checklist
 ```
+
+What a request gets:
+
+| Request | Served |
+|---|---|
+| `/docs/` | `docs/index.html` (or a browsable listing if there's none) |
+| `/docs` | a `301` to `docs/`, so relative links inside that page resolve |
+| `/about` | `about.html` when there's no `about` — clean URLs |
+| `/app/settings` from a browser | `index.html`: a single-page app's client-side route survives a reload or a shared deep link |
+| `/missing.js`, or a `fetch()` | a plain `404` — never an HTML page in place of an asset |
+
+Ship a `404.html` and it's used for every miss instead, which turns the single-page-app fallback off (the [Cloudflare Pages](https://developers.cloudflare.com/pages/configuration/serving-pages/) convention). Text assets are **gzipped** when the browser accepts it (skipped for range requests and tiny files), and every file carries `Last-Modified`/`ETag` for `304` revalidation. Scripts run: there's no sandbox and no forced download.
+
+**Absolute paths: `--root`.** A share normally lives under its secret `/<token>/` path, so a page that links `/style.css` or calls `fetch('/api')` escapes the share and 404s — relative paths (`style.css`) are fine. `--root` publishes at the root of your node, `https://<host>.ts.net/`, so a site or app works exactly as written, with no base-path setting. That trade is deliberate: a root URL isn't secret, so it's for things meant to be public — add `-p` to gate it. Only one share can hold the root (rooms and Kuma use it too, and tshare refuses rather than clobber). A folder or `.html` given with `--root` implies `--site`, and it works the same for apps: `tshare host --root ~/myapp`, `tshare run --root -- npm start`, `tshare -s --root http://localhost:5173`. Under `--local` it serves `http://<lan-ip>:<port>/` without a token; otherwise a root share is reachable only through Tailscale, never token-less on the LAN.
 
 `--site --allow-upload` keeps the pages running as a live site *and* enables the `__upload` endpoint (uploads land in the site root). That lets an in-page app use the share as its own tiny data channel — e.g. the Giga games' [GIGA-NET/1-L automatic multiplayer links](../GigaSnake/WEBRTC-MULTIPLAYER.md), where WebRTC offer/answer files ride the share instead of being copy-pasted.
 
 `-g` / `--gamelink <game.html>` goes one step further and makes game hosting a **single command**: it implies `--site --allow-upload`, pre-mints a GIGA-NET/1-L session id, prints a 🎮 **join** link (also copied to your clipboard, and the QR if enabled) and a 🎮 **host** link, then auto-opens the host link here (`--no-open` prints it instead) — the page starts hosting by itself via its `#gnhost` fragment, and the other player just clicks the join link. `--quiet` prints only the join link; `--json` adds `game_join`/`game_host`. One session per link: re-run for a rematch.
 
 **LAN or internet.** `-g` follows the share's scope. Default (Tailscale Funnel) makes the join link a public HTTPS URL *and* lets the game connect across the internet: tshare serves the ICE config at a token-gated `__ice` endpoint (default public STUN, plus any `--turn`/`--turn-user`/`--turn-pass` you pass for symmetric-NAT relay), and the game page fetches it. `-l -g` keeps everything on the LAN — `__ice` returns `[]`, so no public STUN is contacted and nothing leaves your network. Either way the offer/answer never touch a game server; only the two browsers exchange them via the share.
-
-Funnel caveat (same as any subpath host): the site lives under `https://<host>.ts.net/<token>/`, so **use relative asset paths** (`href="style.css"`, `src="js/app.js"`) — they resolve correctly. Root-absolute paths (`/style.css`) escape the mount and 404; if your generator emits those, set its base URL to the share path and pair with `--name` for a stable prefix. Always share the link **with its trailing slash**.
 
 ## Folders run on copyparty
 

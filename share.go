@@ -170,6 +170,10 @@ func cmdShare(args []string) {
 	if err := parseArgs(args, c); err != nil {
 		os.Exit(2)
 	}
+	if c.WebWiz {
+		runWebwiz(args)
+		return
+	}
 	if c.Once {
 		c.MaxDL = 1
 	}
@@ -216,6 +220,15 @@ func runShare(c *config) error {
 	if c.GameLink {
 		c.Site = true
 		c.AllowUpload = true
+	}
+
+	// --root publishes a website, so a folder or .html given with it means
+	// --site: `tshare --root ./blog` just works. (run/host/-s apps are servers.)
+	if c.Root && !c.Site && len(c.RunCmd) == 0 && !c.Server && len(c.Paths) == 1 && !looksLikeURL(c.Paths[0]) {
+		if fi, err := os.Stat(c.Paths[0]); err == nil &&
+			(fi.IsDir() || strings.EqualFold(filepath.Ext(c.Paths[0]), ".html") || strings.EqualFold(filepath.Ext(c.Paths[0]), ".htm")) {
+			c.Site = true
+		}
 	}
 
 	// Websites and the hub are long-term by nature, so they default to never.
@@ -704,7 +717,13 @@ func runShare(c *config) error {
 	// listener — bind all interfaces when we also want direct LAN reach
 	// (always in --local; otherwise unless --no-lan). tailscaled still proxies
 	// funnel/serve traffic via loopback, so this only ADDS a LAN path.
-	lanOn := c.Local || (c.LAN && !c.NoLAN)
+	if c.Root && s.mode != "site" && s.mode != "server" {
+		return errors.New("--root is for websites and apps (--site, tshare host, tshare run, -s);\n" +
+			"  files and folders keep their secret link")
+	}
+	// A --root share has no secret path. Off --local it's reached only through
+	// the tailscale mount, so it must not ALSO answer token-less on the LAN.
+	lanOn := c.Local || (c.LAN && !c.NoLAN && !c.Root)
 	bind := "127.0.0.1:"
 	if lanOn {
 		bind = "0.0.0.0:"
@@ -739,6 +758,9 @@ func runShare(c *config) error {
 	// public/tailnet URL + tailscale registration
 	if c.Local {
 		s.baseURL = fmt.Sprintf("%s://%s:%d/%s", scheme, lanIP(), port, s.token)
+		if c.Root {
+			s.baseURL = fmt.Sprintf("%s://%s:%d", scheme, lanIP(), port)
+		}
 	} else {
 		ts, err := tsStatus(c)
 		if err != nil {
@@ -748,15 +770,21 @@ func runShare(c *config) error {
 		if host == "" {
 			return errors.New("no MagicDNS name; enable MagicDNS + HTTPS in the Tailscale admin console")
 		}
-		if nameInUse(s.token) {
+		mount := s.token
+		if c.Root {
+			if owner := rootInUse(); owner != "" {
+				return fmt.Errorf("the funnel root is already served by share %s — stop it first (tshare rm %s)", owner, owner)
+			}
+			mount = ""
+		} else if nameInUse(s.token) {
 			return fmt.Errorf("path /%s is already used by another tshare share", s.token)
 		}
-		if out, err := tsMount(c, s.token, port); err != nil {
+		if out, err := tsMount(c, mount, port); err != nil {
 			// #68: Funnel not available (attribute off, etc.) — automatically
 			// fall back to tailnet-only serve so the share still works, unless
 			// the user explicitly asked for funnel-only behavior.
 			if !c.Tailnet && funnelUnavailable(out) {
-				if out2, err2 := tsMount(&config{Tailnet: true, HTTPSPort: c.HTTPSPort, TSBin: c.TSBin}, s.token, port); err2 == nil {
+				if out2, err2 := tsMount(&config{Tailnet: true, HTTPSPort: c.HTTPSPort, TSBin: c.TSBin}, mount, port); err2 == nil {
 					c.Tailnet = true
 					fmt.Fprintln(os.Stderr, "  ⚠ Funnel unavailable — fell back to tailnet-only (serve).")
 					fmt.Fprintln(os.Stderr, "    enable Funnel for public links: https://tailscale.com/kb/1223/funnel")
@@ -767,10 +795,14 @@ func runShare(c *config) error {
 				return fmt.Errorf("tailscale %s failed:\n%s\n  hint: run `tshare doctor` (Funnel needs the funnel node attribute and HTTPS certs: https://tailscale.com/kb/1223/funnel)", verb(c), strings.TrimSpace(out))
 			}
 		}
-		if c.HTTPSPort == 443 {
-			s.baseURL = fmt.Sprintf("https://%s/%s", host, s.token)
-		} else {
-			s.baseURL = fmt.Sprintf("https://%s:%d/%s", host, c.HTTPSPort, s.token)
+		origin := "https://" + host
+		if c.HTTPSPort != 443 {
+			origin = fmt.Sprintf("https://%s:%d", host, c.HTTPSPort)
+		}
+		s.baseURL = origin + "/" + s.token
+		if c.Root {
+			s.baseURL = origin
+			s.mtRootMounted = true // unmounted on exit; reaped by `tshare rm`
 		}
 		// Warn if this "public" funnel link won't actually resolve on the public
 		// internet (Tailscale hasn't published the *.ts.net DNS record) — else the
@@ -855,6 +887,9 @@ func runShare(c *config) error {
 				log.Printf("  ⚠ --local room: browsers block cam/mic on plain HTTP except on this machine — use funnel/serve for real calls")
 			}
 		} else {
+			if owner := rootInUse(); owner != "" {
+				return fmt.Errorf("the funnel root is already served by share %s — stop it first (tshare rm %s)", owner, owner)
+			}
 			if out, err := tsMount(c, "", c.MirotalkPort); err != nil {
 				return fmt.Errorf("mounting MiroTalk at the %s root failed:\n%s", verb(c), strings.TrimSpace(out))
 			}
@@ -884,6 +919,9 @@ func runShare(c *config) error {
 		if c.Local { // LAN-only: reach Kuma directly, no funnel root mount
 			s.kumaURL = fmt.Sprintf("http://%s:%d/", lanIP(), c.KumaPort)
 		} else {
+			if owner := rootInUse(); owner != "" {
+				return fmt.Errorf("the funnel root is already served by share %s — stop it first (tshare rm %s)", owner, owner)
+			}
 			if out, err := tsMount(c, "", c.KumaPort); err != nil {
 				return fmt.Errorf("mounting Uptime Kuma at the %s root failed:\n%s", verb(c), strings.TrimSpace(out))
 			}
@@ -1179,6 +1217,9 @@ func (s *share) announce(port int) {
 		}
 		if c.Local {
 			scope = "local network only"
+		}
+		if c.Root {
+			scope += " · root, no secret path"
 		}
 		exp := "never"
 		if t := s.getExpires(); !t.IsZero() {

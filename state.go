@@ -127,6 +127,17 @@ func writeJSON(fp string, v any) error {
 	return os.Rename(tmp, fp)
 }
 
+// rootInUse returns the id of a live share holding the funnel/serve ROOT path
+// (a --root site, a room, Kuma), or "". Only one share can own "/".
+func rootInUse() string {
+	for _, r := range loadStates() {
+		if r.RootMount && recAlive(r) {
+			return r.ID
+		}
+	}
+	return ""
+}
+
 func nameInUse(mount string) bool {
 	des, err := os.ReadDir(stateDir())
 	if err != nil {

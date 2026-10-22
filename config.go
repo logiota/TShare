@@ -36,6 +36,8 @@ type config struct {
 	AllowUpload bool
 	Zip         bool
 	Site        bool // serve a folder as a live static website (index.html)
+	Root        bool // publish a website/app at the funnel ROOT (https://<host>/), no secret path
+	WebWiz      bool // --webwiz: interactive checklist of every option, then run the result
 	GameLink    bool // --gamelink: --site --allow-upload + pre-minted GIGA-NET/1-L host/join links (one-command game hosting)
 	Local       bool
 	LAN         bool // also serve directly on the LAN (default on)
@@ -194,6 +196,8 @@ func registerFlags(fs *flag.FlagSet, c *config) {
 	fs.BoolVar(&c.Zip, "zip", c.Zip, "")
 	fs.BoolVar(&c.Site, "site", c.Site, "")
 	fs.BoolVar(&c.Site, "web", c.Site, "")
+	fs.BoolVar(&c.Root, "root", c.Root, "")
+	fs.BoolVar(&c.WebWiz, "webwiz", c.WebWiz, "")
 	fs.BoolVar(&c.GameLink, "gamelink", c.GameLink, "")
 	fs.BoolVar(&c.GameLink, "g", c.GameLink, "")
 	fs.BoolVar(&c.Local, "l", c.Local, "")
