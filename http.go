@@ -146,8 +146,10 @@ func (s *share) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	seg, rest, _ := strings.Cut(p, "/")
 	if subtle.ConstantTimeCompare([]byte(seg), []byte(s.token)) == 1 {
 		p = rest // token present → strip it
-	} else if !proxied {
-		http.NotFound(rec, r) // direct hit without the token
+	} else if !proxied && !s.cfg.Root {
+		// direct hit without the token. A --root share has no secret path by
+		// design; it only binds the LAN at all under --local.
+		http.NotFound(rec, r)
 		return
 	}
 
@@ -259,6 +261,11 @@ func (s *share) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 			s.handleHub(rec, r, rel, ub)
 			return
 		}
+	}
+
+	if s.mode == "room" && rel == "" && r.Method == http.MethodPost {
+		s.handleRoomToken(rec, r)
+		return
 	}
 
 	if r.Method != http.MethodGet && r.Method != http.MethodHead {
@@ -420,110 +427,6 @@ func (s *share) confined(root, rel string) (string, bool, bool) {
 		return "", false, false
 	}
 	return real, fi.IsDir(), true
-}
-
-// resolveSite validates the --site target and returns the web root + default
-// document. A folder is served as-is; a single .html serves its parent folder.
-func resolveSite(paths []string) (root, index string, err error) {
-	if len(paths) != 1 {
-		return "", "", errors.New("--site takes exactly one folder (or one .html file)")
-	}
-	abs, err := filepath.Abs(paths[0])
-	if err != nil {
-		return "", "", err
-	}
-	if abs, err = filepath.EvalSymlinks(abs); err != nil {
-		return "", "", err
-	}
-	fi, err := os.Stat(abs)
-	if err != nil {
-		return "", "", err
-	}
-	if fi.IsDir() {
-		return abs, "index.html", nil
-	}
-	if ext := strings.ToLower(filepath.Ext(abs)); ext != ".html" && ext != ".htm" {
-		return "", "", errors.New("--site needs a folder or an .html file")
-	}
-	// a lone .html: serve its folder as the root (so sibling assets load)
-	return filepath.Dir(abs), filepath.Base(abs), nil
-}
-
-// siteContentType returns an explicit, correct MIME type for web assets — vital
-// because tshare sends X-Content-Type-Options: nosniff, so a wrong/empty type
-// would make the browser refuse to run scripts/styles.
-func siteContentType(name string) string {
-	switch strings.ToLower(filepath.Ext(name)) {
-	case ".html", ".htm":
-		return "text/html; charset=utf-8"
-	case ".js", ".mjs":
-		return "text/javascript; charset=utf-8"
-	case ".css":
-		return "text/css; charset=utf-8"
-	case ".json", ".map":
-		return "application/json; charset=utf-8"
-	case ".svg":
-		return "image/svg+xml"
-	case ".wasm":
-		return "application/wasm"
-	case ".webmanifest", ".manifest":
-		return "application/manifest+json"
-	case ".xml":
-		return "application/xml; charset=utf-8"
-	case ".txt":
-		return "text/plain; charset=utf-8"
-	case ".ico":
-		return "image/x-icon"
-	}
-	return mime.TypeByExtension(strings.ToLower(filepath.Ext(name)))
-}
-
-// serveSite routes a request within a --site share: directories resolve to
-// index.html, missing paths fall back to 404.html if present, and assets are
-// served inline with correct types and NO download/sandbox so the site runs.
-func (s *share) serveSite(w *respRec, r *http.Request, rel string) {
-	root := s.roots[0].Abs
-	abs, isDir, ok := s.confined(root, rel)
-	if !ok {
-		if p := filepath.Join(root, "404.html"); fileExists(p) {
-			if b, err := os.ReadFile(p); err == nil {
-				w.Header().Set("Content-Type", "text/html; charset=utf-8")
-				w.WriteHeader(http.StatusNotFound)
-				w.Write(b)
-				return
-			}
-		}
-		http.NotFound(w, r)
-		return
-	}
-	if isDir {
-		idx := filepath.Join(abs, s.siteIndex)
-		if !fileExists(idx) {
-			idx = filepath.Join(abs, "index.htm")
-		}
-		if !fileExists(idx) {
-			s.renderSiteList(w, rel, abs) // no index → browsable listing
-			return
-		}
-		abs = idx
-	}
-	f, err := os.Open(abs)
-	if err != nil {
-		http.NotFound(w, r)
-		return
-	}
-	defer f.Close()
-	fi, err := f.Stat()
-	if err != nil || fi.IsDir() {
-		http.NotFound(w, r)
-		return
-	}
-	if ct := siteContentType(abs); ct != "" {
-		w.Header().Set("Content-Type", ct)
-	}
-	// ServeContent adds Last-Modified + ETag and handles Range/If-Modified-Since
-	// (304) — good caching for a long-lived site, with no forced download.
-	http.ServeContent(w, r, filepath.Base(abs), fi.ModTime(), f)
 }
 
 // renderSiteList shows a minimal browsable listing for a --site folder that has
@@ -938,7 +841,34 @@ func (s *share) reportAlert(who, label string) {
 }
 
 // ---------------------------------------------------------------------------
-// zip streaming
+// room token endpoint: POST with {name: "..."} returns a sealed join URL
+// containing a JWT with room + visitor name, so neither appears in the URL.
+func (s *share) handleRoomToken(rec http.ResponseWriter, r *http.Request) {
+	if s.mirotalkJWTKey == "" {
+		http.Error(rec, "403 room token sealing not configured", http.StatusForbidden)
+		return
+	}
+	var req struct {
+		Name string `json:"name"`
+	}
+	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+		http.Error(rec, "400 bad request", http.StatusBadRequest)
+		return
+	}
+	claims := map[string]interface{}{
+		"room": s.roomName,
+	}
+	if req.Name != "" {
+		claims["name"] = req.Name
+	}
+	token, err := makeJWT(s.mirotalkJWTKey, claims, 0)
+	if err != nil {
+		http.Error(rec, "500 internal error", http.StatusInternalServerError)
+		return
+	}
+	rec.Header().Set("Content-Type", "application/json")
+	fmt.Fprintf(rec, `{"url":"%s/join?token=%s"}`, s.roomOrigin, url.PathEscape(token))
+}
 
 func (s *share) handleZip(w *respRec, r *http.Request, dirRel string) {
 	if r.Method != http.MethodGet {

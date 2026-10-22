@@ -94,6 +94,12 @@ curl -u :pw -F f=@notes.txt https://…/<token>/__upload        # send a file
 curl -o all.zip https://…/<token>/__zip                       # folder as zip
 ```
 
+## Not sure which flags? `--webwiz`
+
+`tshare --webwiz [path]` opens an interactive checklist of **every** option, grouped and explained, with the command it adds up to shown live underneath. Tick with space, type values with ⏎, `/` to filter, `tab` to jump sections; then `r` runs it, `p` prints it, `c` copies it. Point it at a folder and it starts in website mode (`tshare host`), with what it detected shown — so publishing a site or an app is a few keystrokes. Flags you already typed come pre-ticked (`tshare --webwiz -p pw ~/blog`), passwords stay masked on screen, and with no terminal (`tshare --webwiz | less`) it prints the same checklist as plain text.
+
+The wizard keeps no list of its own: the rows come from tshare's real flag set and the explanations from `--help`, so it can't fall out of date, and a test fails if an option ever ships without an explanation.
+
 ## Share a running server (`-s`)
 
 `-s` / `--server` reverse-proxies an already-running local server over the funnel — dev servers, notebooks, any `http://localhost:PORT`. A localhost URL is auto-detected as a server (so it's proxied, not downloaded by yt-dlp). tshare's token/password/expiry/limits sit in front; the upstream's `Host` header is rewritten so dev-server host checks pass, and WebSockets/HMR pass through.
@@ -105,7 +111,7 @@ tshare -s http://localhost:3000 -p pw  # password-gate it
 tshare -s http://192.168.1.9:9000      # any reachable host:port with -s
 ```
 
-Same subpath caveat as `--site`: the app is served under `/<token>/`, so **relative asset paths** work; root-absolute (`/assets/…`) need your dev server's base path set to the share path (pair with `--name`). For Vite/webpack that's `base`/`publicPath`.
+The app is served under `/<token>/`, so **relative asset paths** work out of the box. Root-absolute ones (`/assets/…`, what Vite and webpack emit by default) need either `--root` — `tshare -s --root http://localhost:5173` publishes at `https://<host>.ts.net/` and the app works unchanged — or your dev server's base path set to the share path (`base`/`publicPath`, paired with `--name` for a stable prefix).
 
 ## One-stop hosting: run & expose any local server
 
@@ -118,7 +124,7 @@ tshare host ~/myapp                          # auto-detect the stack in a folder
 tshare host ~/site --tmux -p pw              # …in tmux, password-gated
 ```
 
-`tshare host` sniffs the folder — `package.json` → node (`npm start` or `server.js`), `compose.yml` → `docker compose up`, `app.py`/`manage.py` → python, `index.php` → PHP's built-in server, `index.html` → a static `--site`. The upstream **port is auto-detected** (tshare watches which port the process opens, via `lsof`) so you rarely pass `--port`; a `--port` that's already taken is reported as a conflict. tshare **bundles no runtimes** — if `node`/`python`/`docker` is missing it just tells you the `brew install` to run. Under the hood this is the same managed-server engine `--room` (MiroTalk) uses, so it inherits health-checks, WebSocket pass-through, and clean shutdown.
+`tshare host` sniffs the folder — `package.json` → node (`npm start` or `server.js`), a lone **`.js` server** (no `package.json`) → `node <file>`, `compose.yml` → `docker compose up`, `app.py`/`manage.py` → python, `index.php` → PHP's built-in server, `index.html` → a static `--site`. A `.js` file only counts as a server if it actually starts one (`createServer`, `Bun.serve`, or `.listen(` next to an `http`/`express`-style import) — browser assets are served, never executed — and when a folder has both a server and an `index.html`, the server wins, because it can serve that page itself on the same path (see [`examples/`](examples)). The upstream **port is auto-detected** (tshare watches which port the process opens, via `lsof`) so you rarely pass `--port`; a `--port` that's already taken is reported as a conflict. tshare **bundles no runtimes** — if `node`/`python`/`docker` is missing it just tells you the `brew install` to run. Under the hood this is the same managed-server engine `--room` (MiroTalk) uses, so it inherits health-checks, WebSocket pass-through, and clean shutdown.
 
 ### Watch them in tmux (`--tmux`)
 
@@ -142,6 +148,12 @@ tshare agent status / uninstall
 ```
 
 It's shaped like what Homebrew generates, so once tshare is installed from a tap the same thing is available as `brew services start tshare` (see the `service` block in `Formula/tshare.rb`). On Linux, `tshare agent` points you at the equivalent `systemd --user` one-liner.
+
+**What a resumed share keeps.** `--persist` records the share's *identity*, not just its command, so `tshare resume` brings back **the same link**: same secret token, same backend port, and the same absolute expiry (changing it live with `tshare set -e` updates the record too, so a restart restores what the share is *now*). A share whose deadline passed while the machine was off is dropped instead of resurrected. Resume also waits for `tailscaled` before restarting funnel/serve shares — at login it otherwise races the daemon and dies with "tailscale not ready" — and reaps any upstream server orphaned by an unclean shutdown, which would otherwise still be holding the port. Links you handed out before the reboot keep working.
+
+A share stopped **on purpose** — Ctrl-C, `tshare rm`, an expiry — is forgotten and stays gone. A share still running when the **machine** goes down keeps its record: at shutdown the OS SIGTERMs every process, and tshare treats that as "I'll be back", not "forget me".
+
+You don't have to set anything up: the first `--persist` share **installs the login agent itself** (it says so, and `tshare agent uninstall` undoes it), because a resume record restores nothing unless something runs `tshare resume` for you. One thing to know: the agent runs at **login**, not at boot, so a Mac that reboots to the login window restores shares once you log in. On Linux there's no launchd, so tshare tells you to run `resume` from your own session startup instead.
 
 ## Video rooms (local MiroTalk, auto-managed)
 
@@ -214,23 +226,37 @@ The page has four tiles: **📤 Send files** (upload from the phone straight to 
 
 ## Static websites over Funnel (`--site`)
 
-`--site` (or `--web`) serves a folder as a **live website** instead of a file browser — `index.html` routing, correct content-types, scripts run (no sandbox, no forced download), `404.html` fallback if present, and `ServeContent` caching (Last-Modified/ETag/304). Expiry defaults to **never** since sites are long-term.
+`--site` (or `--web`) serves a folder as a **live website** instead of a file browser, behaving the way a modern static host does. Expiry defaults to **never** since sites are long-term.
 
 ```sh
 tshare --site ~/blog                 # serve the folder as a website
-tshare --site ~/blog/index.html      # same — a lone .html uses its folder as root
+tshare --root ~/blog                 # …at https://<host>.ts.net/ — /absolute paths just work
+tshare --site ~/blog/index.html      # a lone .html uses its folder as root
 tshare --name blog --site ~/blog     # stable path: https://<host>.ts.net/blog/
 tshare --site -p hunter2 ~/blog      # password-gated site
 tshare --site --allow-upload ~/app   # site whose pages can ALSO POST files to __upload
+tshare --webwiz ~/blog               # not sure which options? tick them in a checklist
 ```
+
+What a request gets:
+
+| Request | Served |
+|---|---|
+| `/docs/` | `docs/index.html` (or a browsable listing if there's none) |
+| `/docs` | a `301` to `docs/`, so relative links inside that page resolve |
+| `/about` | `about.html` when there's no `about` — clean URLs |
+| `/app/settings` from a browser | `index.html`: a single-page app's client-side route survives a reload or a shared deep link |
+| `/missing.js`, or a `fetch()` | a plain `404` — never an HTML page in place of an asset |
+
+Ship a `404.html` and it's used for every miss instead, which turns the single-page-app fallback off (the [Cloudflare Pages](https://developers.cloudflare.com/pages/configuration/serving-pages/) convention). Text assets are **gzipped** when the browser accepts it (skipped for range requests and tiny files), and every file carries `Last-Modified`/`ETag` for `304` revalidation. Scripts run: there's no sandbox and no forced download.
+
+**Absolute paths: `--root`.** A share normally lives under its secret `/<token>/` path, so a page that links `/style.css` or calls `fetch('/api')` escapes the share and 404s — relative paths (`style.css`) are fine. `--root` publishes at the root of your node, `https://<host>.ts.net/`, so a site or app works exactly as written, with no base-path setting. That trade is deliberate: a root URL isn't secret, so it's for things meant to be public — add `-p` to gate it. Only one share can hold the root (rooms and Kuma use it too, and tshare refuses rather than clobber). A folder or `.html` given with `--root` implies `--site`, and it works the same for apps: `tshare host --root ~/myapp`, `tshare run --root -- npm start`, `tshare -s --root http://localhost:5173`. Under `--local` it serves `http://<lan-ip>:<port>/` without a token; otherwise a root share is reachable only through Tailscale, never token-less on the LAN.
 
 `--site --allow-upload` keeps the pages running as a live site *and* enables the `__upload` endpoint (uploads land in the site root). That lets an in-page app use the share as its own tiny data channel — e.g. the Giga games' [GIGA-NET/1-L automatic multiplayer links](../GigaSnake/WEBRTC-MULTIPLAYER.md), where WebRTC offer/answer files ride the share instead of being copy-pasted.
 
 `-g` / `--gamelink <game.html>` goes one step further and makes game hosting a **single command**: it implies `--site --allow-upload`, pre-mints a GIGA-NET/1-L session id, prints a 🎮 **join** link (also copied to your clipboard, and the QR if enabled) and a 🎮 **host** link, then auto-opens the host link here (`--no-open` prints it instead) — the page starts hosting by itself via its `#gnhost` fragment, and the other player just clicks the join link. `--quiet` prints only the join link; `--json` adds `game_join`/`game_host`. One session per link: re-run for a rematch.
 
 **LAN or internet.** `-g` follows the share's scope. Default (Tailscale Funnel) makes the join link a public HTTPS URL *and* lets the game connect across the internet: tshare serves the ICE config at a token-gated `__ice` endpoint (default public STUN, plus any `--turn`/`--turn-user`/`--turn-pass` you pass for symmetric-NAT relay), and the game page fetches it. `-l -g` keeps everything on the LAN — `__ice` returns `[]`, so no public STUN is contacted and nothing leaves your network. Either way the offer/answer never touch a game server; only the two browsers exchange them via the share.
-
-Funnel caveat (same as any subpath host): the site lives under `https://<host>.ts.net/<token>/`, so **use relative asset paths** (`href="style.css"`, `src="js/app.js"`) — they resolve correctly. Root-absolute paths (`/style.css`) escape the mount and 404; if your generator emits those, set its base URL to the share path and pair with `--name` for a stable prefix. Always share the link **with its trailing slash**.
 
 ## Folders run on copyparty
 
@@ -240,7 +266,10 @@ Single-folder browse / upload / inbox shares are handed to [copyparty](https://g
 pip install copyparty            # then folders "just work"
 tshare ~/Designs                 # browse via copyparty behind your secret link
 tshare --allow-upload ~/proj     # collaborative (read+write)
+tshare --full ~/proj             # full copyparty rights (read/write/move/delete)
 tshare -u                        # write-only drop-box inbox
+tshare -u --full                 # uploads folder with full rights (browse + manage)
+tshare -u --ro                   # share the uploads folder read-only
 tshare --no-copyparty ~/Designs  # force the built-in native folder server
 tshare --copyparty-bin ./copyparty-sfx.py ~/x   # explicit binary / sfx
 ```
@@ -292,9 +321,11 @@ Nice defaults (each individually disableable): the link is **copied to your clip
 | `-e, --expires` | auto-stop: `30m`, `2h`, `1d`, `1w`, `never` (default: **15d**) |
 | `--filename` | public name for stdin shares / rename a single-file share |
 | `-n, --max` / `--once` | stop after N / 1 completed downloads |
-| `-u, --upload [dir]` | inbox mode (default `./tshare-inbox`) |
+| `-u, --upload [dir]` | inbox mode (default `./tshare-inbox`); write-only drop-box unless paired with `--full` / `--ro` |
 | `-i, --blackhole` | write-only sink: uploads read + counted + notified, **bytes discarded** (nothing on disk) |
 | `--allow-upload` | folder share also accepts uploads (also works with `--site`: pages run *and* `__upload` accepts POSTs — e.g. in-page signalling like GIGA-NET/1-L) |
+| `--full` | full copyparty rights (`A` = read/write/move/delete/admin) on a folder or `-u` uploads folder |
+| `--ro`, `--read-only` | force read-only access; with `-u`, browse the uploads folder without further uploads |
 | `--max-rate` | throttle served bandwidth, e.g. `2M` = ~2 MB/s (default: off) |
 | `--min-free` | refuse uploads when free disk space drops below this (default **32G**; `0` = off) |
 | `--abuse-contact` | show a small-font takedown/abuse line on public share pages (email/URL auto-linked) |

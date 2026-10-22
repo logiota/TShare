@@ -16,16 +16,10 @@ import (
 )
 
 // ---------------------------------------------------------------------------
-// Uptime Kuma (--kuma): reuse/start a persistent Uptime Kuma monitor and expose
-// it at the funnel ROOT (Uptime Kuma is a root-path SPA — it can't be proxied
-// under /<token>/). Docker is the primary, official deploy; a manually-run
-// git+npm instance is reused if already listening. tshare NEVER stops Kuma —
-// it's a standing service (restart=always) — it only mounts/unmounts the root.
-
-// ---------------------------------------------------------------------------
 // native Node apps: --room (MiroTalk) and --kuma (Uptime Kuma). Both are
 // installed from GitHub (git clone + npm) and run NATIVELY through the shared
-// managed-server engine, so they start on demand and shut down with the share.
+// managed-server engine, so they start on demand and shut down with the share
+// (an instance already listening on the app's port is reused, never stopped).
 // Each is exposed at the funnel ROOT (they're root-path SPAs). No Docker.
 
 type nodeApp struct {
@@ -132,11 +126,11 @@ func (a *nodeApp) start(s *share) error {
 	if a.key == "kuma" {
 		env = append(env, fmt.Sprintf("UPTIME_KUMA_PORT=%d", port)) // Kuma's own port var
 	}
-	p, err := s.launchServer(a.key+"-"+s.id, a.dir(c), env, append([]string{}, a.run...), port)
+	p, err := s.launchServer(srvSpec{name: a.key + "-" + s.id, dir: a.dir(c), env: env, argv: a.run, port: port, tmux: true})
 	if err != nil {
 		return err
 	}
-	s.procs = append(s.procs, p)
+	s.adopt(p)
 	if !c.Quiet {
 		where := "log " + p.logPath
 		if p.tmuxWin != "" {
@@ -227,6 +221,11 @@ func (a *nodeApp) handleSetup(args []string, c *config) bool {
 		return false
 	}
 	return true
+}
+
+func init() {
+	register(cmdRoom, "room")
+	register(cmdKuma, "kuma", "uptime-kuma")
 }
 
 func cmdKuma(args []string) {

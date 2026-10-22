@@ -182,6 +182,8 @@ func decryptFile(in io.Reader, out io.Writer, key []byte) error {
 	}
 }
 
+func init() { register(cmdDecrypt, "decrypt") }
+
 func cmdDecrypt(args []string) {
 	fs := flag.NewFlagSet("decrypt", flag.ExitOnError)
 	pw := fs.String("p", "", "passphrase")
