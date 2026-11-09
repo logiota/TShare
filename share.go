@@ -170,9 +170,12 @@ func cmdShare(args []string) {
 	if err := parseArgs(args, c); err != nil {
 		os.Exit(2)
 	}
-	if c.WebWiz {
-		runWebwiz(args)
-		return
+	if c.WebWiz { // optional front end: present only when webwiz.go is built in
+		if run := commands["webwiz"]; run != nil {
+			run(args)
+			return
+		}
+		log.Fatal("tshare: this build has no --webwiz (built with -tags nowebwiz)")
 	}
 	if c.Once {
 		c.MaxDL = 1

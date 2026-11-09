@@ -23,6 +23,8 @@ USAGE
   tshare --hub [dir]                  homescreen-style 2-way remote: upload + grab URLs + browse
   tshare run [--port N] -- <cmd…>     launch any server (auto-detect its port) & expose it
   tshare --webwiz [path]              checklist wizard: every option explained → command
+  tshare gui                          point-and-click in your browser: pick, tick, share, manage
+  tshare mcp [--allow dir]            MCP server so AI agents can share and manage (see AI.md)
   tshare host [dir]                   auto-detect the stack in a folder & host it
                                       (package.json / a .js server / py / docker / php / static)
   tshare tmux                         list servers running in the shared 'tshare' tmux session

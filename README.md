@@ -94,6 +94,24 @@ curl -u :pw -F f=@notes.txt https://…/<token>/__upload        # send a file
 curl -o all.zip https://…/<token>/__zip                       # folder as zip
 ```
 
+## Point and click: `tshare gui`
+
+`tshare gui` opens tshare in your browser. Pick a file or folder with your system's own chooser (or paste a path or URL), tick what you want — **survive reboots**, password, expiry, publish at the root, tailnet-only, uploads, or anything from the full option list, each explained — and press **Share**. Folders with a website or app are detected and offered website mode. The command it adds up to is shown live, so the GUI doubles as a way to learn the flags.
+
+Below that, every running share: copy, open, QR code, stop. Two switches in the header turn the **dashboard** on and off (its link and password shown right there) and install or remove the **reboot-restore agent** that brings `--persist` shares back after a restart.
+
+Shares started from the GUI run in the background, so closing the tab or quitting `tshare gui` never stops them. The GUI listens on `127.0.0.1` only, behind a random secret path, and refuses cross-site requests and DNS-rebinding tricks — a web page you visit can't use it to publish your files. `--no-open` prints the address instead of opening a browser; `go build -tags nogui` leaves it out entirely.
+
+## AI agents: `tshare mcp`
+
+`tshare mcp` is a [Model Context Protocol](https://modelcontextprotocol.io) server, so Claude Code, Claude Desktop or any MCP client can share files, publish sites, and list, change and stop shares for you — fenced by options *you* set (`--allow <dir>`, `--tailnet-only`, `--read-only`), with short default expiries for anything an agent creates:
+
+```sh
+claude mcp add tshare -- /usr/local/bin/tshare mcp --allow ~/Shared
+```
+
+**[AI.md](AI.md)** covers setup for each client, every tool, the safety model, and the plain command-line interface for agents that run shell commands instead.
+
 ## Not sure which flags? `--webwiz`
 
 `tshare --webwiz [path]` opens an interactive checklist of **every** option, grouped and explained, with the command it adds up to shown live underneath. Tick with space, type values with ⏎, `/` to filter, `tab` to jump sections; then `r` runs it, `p` prints it, `c` copies it. Point it at a folder and it starts in website mode (`tshare host`), with what it detected shown — so publishing a site or an app is a few keystrokes. Flags you already typed come pre-ticked (`tshare --webwiz -p pw ~/blog`), passwords stay masked on screen, and with no terminal (`tshare --webwiz | less`) it prints the same checklist as plain text.

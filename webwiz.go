@@ -1,4 +1,4 @@
-//go:build unix
+//go:build unix && !nowebwiz
 
 package main
 
@@ -8,21 +8,17 @@ package main
 // Nothing here is a second copy of the options. Rows come from registerFlags
 // (aliases folded together by the variable they set); explanations and
 // sections come from the --help text. So a flag can't be missing from the
-// wizard, and its explanation can't drift from --help. Stdlib only: the
+// builder, and its explanation can't drift from --help. Stdlib only: the
 // terminal goes raw via stty, and without a terminal the same checklist is
 // printed as plain text instead.
 
 import (
-	"flag"
 	"fmt"
 	"io"
 	"os"
 	"os/exec"
 	"os/signal"
-	"path/filepath"
-	"reflect"
 	"regexp"
-	"sort"
 	"strings"
 	"syscall"
 	"unicode"
@@ -33,427 +29,14 @@ import (
 func init() { register(func(args []string) { runWebwiz(args) }, "webwiz", "wiz") }
 
 // ---------------------------------------------------------------------------
-// the option catalogue: flag set + --help, joined
-
-type helpEntry struct {
-	section string
-	names   []string // as listed: "p", "password"
-	hint    string   // "<pw>", "[dir]"
-	desc    string
-	order   int
-}
-
-var (
-	helpHeadingRe = regexp.MustCompile(`^[A-Z][A-Z0-9 &/,'-]+$`)
-)
-
-// parseHelp reads the flag rows out of a --help text: section headings are
-// all-caps lines, a flag row starts with "-x, --long <hint>" and its
-// explanation continues on deeper-indented lines.
-func parseHelp(text string) []helpEntry {
-	var out []helpEntry
-	section := ""
-	var cur []int // the entries a continuation line extends (a combo row has two)
-	for _, line := range strings.Split(text, "\n") {
-		trimmed := strings.TrimSpace(line)
-		switch {
-		case trimmed == "":
-			cur = nil
-		case !strings.HasPrefix(line, " ") && helpHeadingRe.MatchString(headingName(trimmed)):
-			section, cur = headingName(trimmed), nil
-		case strings.HasPrefix(trimmed, "-") && len(line)-len(strings.TrimLeft(line, " ")) <= 6:
-			spec, desc := splitHelpRow(line)
-			groups, hint := splitHelpSpec(spec)
-			cur = nil
-			for _, g := range groups {
-				out = append(out, helpEntry{section: section, names: g, hint: hint, desc: desc, order: len(out)})
-				cur = append(cur, len(out)-1)
-			}
-		case cur != nil && strings.HasPrefix(line, "                    "):
-			for _, i := range cur {
-				out[i].desc = strings.TrimSpace(out[i].desc + " " + trimmed)
-			}
-		default:
-			cur = nil
-		}
-	}
-	return out
-}
-
-// helpDescCol is where --help starts every explanation column.
-const helpDescCol = 26
-
-// headingName drops a heading's parenthetical: "MEDIA TRANSFORMS (need …)".
-func headingName(h string) string {
-	if i := strings.Index(h, " ("); i > 0 {
-		return h[:i]
-	}
-	return h
-}
-
-// splitHelpRow separates "  -p, --password <pw>     require a password" into
-// spec and explanation. Most rows reach the explanation column with two or
-// more spaces; a long spec can arrive with just one ("--abuse-contact <s> show"),
-// so the column itself wins when it lines up.
-func splitHelpRow(line string) (spec, desc string) {
-	if len(line) > helpDescCol && line[helpDescCol-1] == ' ' && line[helpDescCol] != ' ' {
-		return line[:helpDescCol], strings.TrimSpace(line[helpDescCol:])
-	}
-	body := strings.TrimLeft(line, " ")
-	if i := strings.Index(body, "  "); i >= 0 {
-		return body[:i], strings.TrimSpace(body[i:])
-	}
-	return body, ""
-}
-
-// splitHelpSpec turns a row's spec into alias groups: "-p, --password <pw>" is
-// one option ([[p password]], "<pw>"), while "--mirotalk-dir/-port" is two
-// options that share a row ([[mirotalk-dir] [mirotalk-port]]).
-func splitHelpSpec(spec string) (groups [][]string, hint string) {
-	var aliases []string
-	for _, tok := range strings.Fields(strings.ReplaceAll(spec, ",", " ")) {
-		switch {
-		case strings.HasPrefix(tok, "-"):
-			base, alt, combo := strings.Cut(strings.TrimLeft(tok, "-"), "/-")
-			if !combo {
-				aliases = append(aliases, base)
-				continue
-			}
-			groups = append(groups, []string{base})
-			if i := strings.LastIndex(base, "-"); i > 0 {
-				groups = append(groups, []string{base[:i+1] + alt})
-			}
-		case hint == "":
-			hint = tok
-		default:
-			hint += " " + tok
-		}
-	}
-	if len(aliases) > 0 {
-		groups = append([][]string{aliases}, groups...)
-	}
-	return groups, hint
-}
-
-type wizOpt struct {
-	names   []string // every alias, short first
-	primary string   // the name used in the composed command
-	section string
-	desc    string
-	hint    string
-	isBool  bool
-	secret  bool
-	order   int
-	def     string // the flag's default, offered when you start typing a value
-	defOn   bool   // a boolean that's ON by default (--copy, --lan)
-
-	on    bool
-	value string
-}
-
-func (o *wizOpt) flag() string {
-	if len(o.primary) == 1 {
-		return "-" + o.primary
-	}
-	return "--" + o.primary
-}
-
-// label is how a row names itself: "-p, --password".
-func (o *wizOpt) label() string {
-	var short []string
-	for _, n := range o.names {
-		if len(n) == 1 && n != o.primary {
-			short = append(short, "-"+n)
-		}
-	}
-	return strings.Join(append(short, o.flag()), ", ")
-}
-
-const otherSection = "OTHER"
-
-// wizOptions builds one row per real option. Aliases (-p/--password,
-// --site/--web, --room/--mirotalk) are registered on the same variable, so
-// they're folded by the address their flag.Value points at.
-func wizOptions() []*wizOpt {
-	fs := flag.NewFlagSet("webwiz", flag.ContinueOnError)
-	fs.SetOutput(io.Discard)
-	registerFlags(fs, defaultConfig())
-
-	helpEntries := parseHelp(usageText)
-	help := map[string]helpEntry{}
-	for _, e := range helpEntries {
-		for _, n := range e.names {
-			if _, seen := help[n]; !seen {
-				help[n] = e
-			}
-		}
-	}
-
-	// Fold aliases into one row. Two signals, joined with a union-find: flags
-	// registered on the same variable (-p/--password share a *string), and
-	// flags --help lists together (-e, --expires wrap their duration in a
-	// fresh flag.Value each, so pointers alone miss them).
-	var flags []*flag.Flag
-	fs.VisitAll(func(f *flag.Flag) {
-		if !strings.HasPrefix(f.Name, "__") && f.Name != "webwiz" {
-			flags = append(flags, f)
-		}
-	})
-	parent := map[string]string{}
-	var find func(string) string
-	find = func(x string) string {
-		if parent[x] != x {
-			parent[x] = find(parent[x])
-		}
-		return parent[x]
-	}
-	union := func(a, b string) { parent[find(a)] = find(b) }
-	for _, f := range flags {
-		parent[f.Name] = f.Name
-	}
-	byVar := map[uintptr]string{}
-	for _, f := range flags {
-		if rv := reflect.ValueOf(f.Value); rv.Kind() == reflect.Pointer {
-			if first, ok := byVar[rv.Pointer()]; ok {
-				union(f.Name, first)
-			} else {
-				byVar[rv.Pointer()] = f.Name
-			}
-		}
-	}
-	for _, e := range helpEntries {
-		for _, n := range e.names[1:] {
-			if _, ok := parent[n]; ok {
-				if _, ok := parent[e.names[0]]; ok {
-					union(n, e.names[0])
-				}
-			}
-		}
-	}
-	byRoot := map[string]*wizOpt{}
-	var opts []*wizOpt
-	for _, f := range flags {
-		root := find(f.Name)
-		o := byRoot[root]
-		if o == nil {
-			b, isBool := f.Value.(interface{ IsBoolFlag() bool })
-			o = &wizOpt{isBool: isBool && b.IsBoolFlag(), def: f.DefValue}
-			o.defOn = o.isBool && f.DefValue == "true"
-			o.on = o.defOn
-			byRoot[root] = o
-			opts = append(opts, o)
-		}
-		o.names = append(o.names, f.Name)
-	}
-
-	for _, o := range opts {
-		sort.Slice(o.names, func(i, j int) bool {
-			if len(o.names[i]) == 1 != (len(o.names[j]) == 1) {
-				return len(o.names[i]) == 1
-			}
-			return o.names[i] < o.names[j]
-		})
-		o.section, o.order = otherSection, 1<<20
-		for _, n := range o.names {
-			if e, ok := help[n]; ok {
-				o.section, o.desc, o.hint, o.order = e.section, e.desc, e.hint, e.order
-				for _, hn := range e.names { // the help's own long name leads
-					if len(hn) > 1 && hasName(o.names, hn) {
-						o.primary = hn
-						break
-					}
-				}
-				break
-			}
-		}
-		if o.primary == "" {
-			o.primary = o.names[len(o.names)-1]
-			for _, n := range o.names {
-				if len(n) > len(o.primary) {
-					o.primary = n
-				}
-			}
-		}
-		if o.desc == "" {
-			o.desc = "(not described in --help)"
-		}
-		for _, n := range o.names {
-			if strings.Contains(n, "pass") || strings.Contains(n, "jwt-key") {
-				o.secret = true
-			}
-		}
-	}
-	sort.SliceStable(opts, func(i, j int) bool {
-		if opts[i].order != opts[j].order {
-			return opts[i].order < opts[j].order
-		}
-		return opts[i].primary < opts[j].primary
-	})
-	return opts
-}
-
-func hasName(names []string, n string) bool {
-	for _, x := range names {
-		if x == n {
-			return true
-		}
-	}
-	return false
-}
-
-// ---------------------------------------------------------------------------
-// wizard state: what's ticked, and the command it adds up to
-
-const webSection = "WEBSITES & APPS" // pinned first: this is a website wizard
-
-type wizard struct {
-	opts     []*wizOpt
-	sections []string // display order
-	target   string
-	host     bool // website mode: compose `tshare host <dir>` (auto static/app)
-	stack    string
-}
-
-// newWizard prefills from the command line it was started with, so
-// `tshare --webwiz -p pw ./blog` opens with -p ticked and the target set.
-func newWizard(args []string) *wizard {
-	w := &wizard{opts: wizOptions()}
-	seen := map[string]bool{}
-	for _, o := range w.opts {
-		if !seen[o.section] {
-			seen[o.section] = true
-			w.sections = append(w.sections, o.section)
-		}
-	}
-	sort.SliceStable(w.sections, func(i, j int) bool {
-		rank := func(s string) int {
-			switch s {
-			case webSection:
-				return 0
-			case otherSection:
-				return 2
-			}
-			return 1
-		}
-		return rank(w.sections[i]) < rank(w.sections[j])
-	})
-
-	fs := flag.NewFlagSet("webwiz-prefill", flag.ContinueOnError)
-	fs.SetOutput(io.Discard)
-	registerFlags(fs, defaultConfig())
-	var clean []string
-	for _, a := range args {
-		if a != "--webwiz" && a != "-webwiz" {
-			clean = append(clean, a)
-		}
-	}
-	if fs.Parse(clean) == nil {
-		fs.Visit(func(f *flag.Flag) {
-			for _, o := range w.opts {
-				if hasName(o.names, f.Name) {
-					o.on, o.value = true, f.Value.String()
-					if o.isBool && o.value == "false" {
-						o.on = false
-					}
-				}
-			}
-		})
-		if rest := fs.Args(); len(rest) > 0 {
-			w.target = rest[0]
-		}
-	}
-	w.setTarget(w.target)
-	return w
-}
-
-// setTarget re-detects what the target is; a folder defaults to website mode.
-func (w *wizard) setTarget(t string) {
-	w.target, w.stack, w.host = t, "", false
-	if t == "" {
-		return
-	}
-	if fi, err := os.Stat(t); err == nil && fi.IsDir() {
-		abs, _ := filepath.Abs(t)
-		if _, kind := detectStack(abs); kind != "" {
-			w.stack, w.host = kind, true
-		}
-	}
-}
-
-func (w *wizard) isDirTarget() bool {
-	fi, err := os.Stat(w.target)
-	return err == nil && fi.IsDir()
-}
-
-// argv is the real command, with real values: exactly what `r` runs.
-func (w *wizard) argv() []string {
-	var flags []string
-	for _, o := range w.opts {
-		switch {
-		case o.isBool && o.on != o.defOn:
-			if o.on {
-				flags = append(flags, o.flag())
-			} else {
-				flags = append(flags, o.flag()+"=false")
-			}
-		case !o.isBool && o.on:
-			flags = append(flags, o.flag(), o.value)
-		}
-	}
-	if w.host && w.isDirTarget() {
-		return append([]string{"host", w.target}, flags...)
-	}
-	if w.target != "" {
-		flags = append(flags, w.target)
-	}
-	return flags
-}
-
-// commandLine renders argv for a shell, masking secrets when asked.
-func (w *wizard) commandLine(mask bool) string {
-	argv := w.argv()
-	parts := []string{"tshare"}
-	for i, a := range argv {
-		if mask && i > 0 && w.isSecretFlag(argv[i-1]) {
-			a = "••••••"
-		} else if a == "" || strings.ContainsAny(a, " \t'\"$`\\!*?[]{}()<>|&;#~") {
-			a = shQuote(a)
-		}
-		parts = append(parts, a)
-	}
-	return strings.Join(parts, " ")
-}
-
-func (w *wizard) isSecretFlag(tok string) bool {
-	name := flagName(tok)
-	for _, o := range w.opts {
-		if o.secret && !o.isBool && hasName(o.names, name) {
-			return true
-		}
-	}
-	return false
-}
-
-// selected counts options changed from their defaults.
-func (w *wizard) selected() int {
-	n := 0
-	for _, o := range w.opts {
-		if o.on != o.defOn {
-			n++
-		}
-	}
-	return n
-}
-
-// ---------------------------------------------------------------------------
 // no terminal: print the whole checklist as text
 
-func (w *wizard) printChecklist(out io.Writer) {
-	fmt.Fprintf(out, "tshare --webwiz — every option, explained (%d)\n", len(w.opts))
+func (b *builder) printChecklist(out io.Writer) {
+	fmt.Fprintf(out, "tshare --webwiz — every option, explained (%d)\n", len(b.opts))
 	fmt.Fprintln(out, "Run it in a terminal for the interactive checklist.")
-	for _, sec := range w.sections {
+	for _, sec := range b.sections {
 		fmt.Fprintf(out, "\n%s\n", sec)
-		for _, o := range w.opts {
+		for _, o := range b.opts {
 			if o.section != sec {
 				continue
 			}
@@ -471,7 +54,7 @@ func (w *wizard) printChecklist(out io.Writer) {
 			}
 		}
 	}
-	fmt.Fprintf(out, "\n$ %s\n", w.commandLine(true))
+	fmt.Fprintf(out, "\n$ %s\n", b.commandLine(true))
 }
 
 // ---------------------------------------------------------------------------
@@ -479,12 +62,12 @@ func (w *wizard) printChecklist(out io.Writer) {
 
 type wizRow struct {
 	kind string // "target", "mode", "section", "opt"
-	opt  *wizOpt
+	opt  *option
 	sec  string
 }
 
 type wizUI struct {
-	*wizard
+	*builder
 	cursor, scroll int
 	filter         string
 	mode           string // "", "filter", "edit"
@@ -495,22 +78,22 @@ type wizUI struct {
 }
 
 func runWebwiz(args []string) {
-	w := newWizard(args)
+	b := newBuilder(args)
 	if !isatty(os.Stdin) || !isatty(os.Stdout) {
-		w.printChecklist(os.Stdout)
+		b.printChecklist(os.Stdout)
 		return
 	}
-	ui := &wizUI{wizard: w, color: os.Getenv("NO_COLOR") == "" && os.Getenv("TERM") != "dumb"}
+	ui := &wizUI{builder: b, color: os.Getenv("NO_COLOR") == "" && os.Getenv("TERM") != "dumb"}
 	action, err := ui.run()
 	if err != nil {
 		fmt.Fprintf(os.Stderr, "tshare --webwiz: %v\n", err)
-		w.printChecklist(os.Stdout)
+		b.printChecklist(os.Stdout)
 		os.Exit(1)
 	}
 	switch action {
 	case "run":
-		argv := w.argv()
-		fmt.Printf("$ %s\n", w.commandLine(true))
+		argv := b.argv()
+		fmt.Printf("$ %s\n", b.commandLine(true))
 		exe, err := os.Executable()
 		if err != nil {
 			fmt.Fprintf(os.Stderr, "tshare: %v\n", err)
@@ -520,7 +103,7 @@ func runWebwiz(args []string) {
 		fmt.Fprintf(os.Stderr, "tshare: could not start: %v\n", err)
 		os.Exit(1)
 	case "print":
-		fmt.Println(w.commandLine(false))
+		fmt.Println(b.commandLine(false))
 	}
 }
 
@@ -710,7 +293,7 @@ func (u *wizUI) handle(k string) string {
 			u.status = "clipboard unavailable (pbcopy / wl-copy / xclip)"
 		}
 	case "r":
-		if u.target == "" && !u.hasTargetlessMode() {
+		if u.target == "" && !u.needsNoTarget() {
 			u.status = "set a TARGET first (the folder, file or URL to share) — or tick a mode that needs none"
 			return ""
 		}
@@ -727,19 +310,6 @@ func (u *wizUI) handle(k string) string {
 		u.cursor = sel - 1
 	}
 	return ""
-}
-
-// hasTargetlessMode: some shares need no path (-u inbox, --hub, --room, --call…).
-func (u *wizUI) hasTargetlessMode() bool {
-	for _, o := range u.opts {
-		if o.on && hasName(o.names, "upload") || o.on && hasName(o.names, "hub") ||
-			o.on && hasName(o.names, "room") || o.on && hasName(o.names, "call") ||
-			o.on && hasName(o.names, "blackhole") || o.on && hasName(o.names, "kuma") ||
-			o.on && hasName(o.names, "dashboard") {
-			return true
-		}
-	}
-	return false
 }
 
 func (u *wizUI) nextSection(dir int) {

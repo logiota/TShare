@@ -3,6 +3,7 @@
 package main
 
 import (
+	"errors"
 	"fmt"
 	"log"
 	"os"
@@ -154,11 +155,7 @@ func ensurePersistAgent(c *config) {
 		log.Printf("    run `tshare resume` at login (systemd --user service, .profile, …)")
 		return
 	}
-	path, err := writeAgent([]string{"resume"}, false)
-	if err == nil {
-		err = loadAgent(path)
-	}
-	if err != nil {
+	if err := installAgent(); err != nil {
 		log.Printf("  ⚠ --persist needs a login agent to restore shares, and installing it failed:")
 		log.Printf("    %v", err)
 		log.Printf("    install it yourself:  tshare agent install")
@@ -169,14 +166,34 @@ func ensurePersistAgent(c *config) {
 }
 
 func agentUninstall() {
+	if err := removeAgent(); err != nil {
+		log.Fatalf("tshare: %v", err)
+	}
+	fmt.Printf("  ✓ unloaded and removed %s\n", agentPlistPath())
+}
+
+// installAgent writes and loads the login agent that runs `tshare resume`.
+func installAgent() error {
+	if runtime.GOOS != "darwin" {
+		return errors.New("the login agent is macOS-only (launchd); elsewhere run `tshare resume` at login")
+	}
+	path, err := writeAgent([]string{"resume"}, false)
+	if err != nil {
+		return err
+	}
+	return loadAgent(path)
+}
+
+// removeAgent unloads and deletes the login agent.
+func removeAgent() error {
 	path := agentPlistPath()
 	uid := strconv.Itoa(os.Getuid())
 	exec.Command("launchctl", "bootout", "gui/"+uid+"/"+agentLabel).Run()
 	exec.Command("launchctl", "unload", "-w", path).Run() // belt & braces
 	if err := os.Remove(path); err != nil && !os.IsNotExist(err) {
-		log.Fatalf("tshare: %v", err)
+		return err
 	}
-	fmt.Printf("  ✓ unloaded and removed %s\n", path)
+	return nil
 }
 
 func agentStatus() {
