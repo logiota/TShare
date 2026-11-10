@@ -94,6 +94,17 @@ curl -u :pw -F f=@notes.txt https://…/<token>/__upload        # send a file
 curl -o all.zip https://…/<token>/__zip                       # folder as zip
 ```
 
+## Clean up after crashes: `tshare cleanup`
+
+A share that's killed hard (`kill -9`, a crash, a power cut) can't tidy up after itself, and leaves things behind: a **Tailscale mount that points at nothing**, so visitors to that link get an error page; a record of a share that's gone, plus any server it had started; and half-finished downloads in `~/.tshare/tmp`. `tshare cleanup` finds and removes them:
+
+```sh
+tshare cleanup -n     # show what it would remove, change nothing
+tshare cleanup        # remove it
+```
+
+It only removes what is provably dead. A mount goes only when nothing is listening behind it **and** it's recognisably tshare's: a random-token path, or one a tshare record names. A dead mount that doesn't look like tshare's (say `/my-dashboard`, or one you made with `tailscale serve` yourself) is listed with the command to remove it by hand, and left alone. A download that's still being written survives even when its share isn't up yet, and `--persist` resume records are never touched, because they're how shares come back after a reboot.
+
 ## Point and click: `tshare gui`
 
 `tshare gui` opens tshare in your browser. Pick a file or folder with your system's own chooser (or paste a path or URL), tick what you want — **survive reboots**, password, expiry, publish at the root, tailnet-only, uploads, or anything from the full option list, each explained — and press **Share**. Folders with a website or app are detected and offered website mode. The command it adds up to is shown live, so the GUI doubles as a way to learn the flags.
@@ -381,6 +392,22 @@ Nice defaults (each individually disableable): the link is **copied to your clip
 | `--lan-https` | self-signed HTTPS for `-l` LAN shares |
 
 Full list with defaults: `tshare help`.
+
+## How the code fits together
+
+`main.go` is tshare's core, and it builds and runs on its own: `go build main.go` gives a working tshare that shares a file or folder behind a secret link over Tailscale Funnel (`-t` tailnet-only, `-l` LAN only, `-p` password), with the same safety rules as the full engine: a secret path, nothing outside the shared folder reachable (symlinks included), dotfiles hidden, and served pages sandboxed. The core also holds what everything else builds on: the command registry, and share control, meaning the state every share publishes and the code to start, list, change and stop shares.
+
+Every other file is a module that registers what it adds when it's built in. The full share engine (`share.go`, `http.go`, `config.go` and the files around them) replaces the core's small one, and the rest add commands and front ends. Those add-ons are optional, so you can leave any of them out:
+
+| Leave out | Build with | You lose |
+|---|---|---|
+| the browser GUI | `-tags nogui` | `tshare gui` |
+| the MCP server | `-tags nomcp` | `tshare mcp` |
+| the terminal wizard | `-tags nowebwiz` | `tshare --webwiz` |
+| cleanup | `-tags nocleanup` | `tshare cleanup` |
+| the login agent | `-tags noagent` | `tshare agent`, and `--persist` installing it for you |
+
+Deleting the file works too. Every combination builds and passes its tests, and the core alone passes its own.
 
 ## Security model
 

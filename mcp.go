@@ -5,7 +5,7 @@ package main
 // `tshare mcp`: a Model Context Protocol server, so an AI agent (Claude Code,
 // Claude Desktop, any MCP client) can share files, publish websites, and list,
 // change and stop shares. JSON-RPC 2.0 over stdio, stdlib only. Shares launch
-// detached (control.go), so they outlive the agent's session.
+// detached (lifecycle.go), so they outlive the agent's session.
 // Optional — build with -tags nomcp to leave it out.
 //
 // An agent can be talked into things (a hostile web page, a poisoned file), and

@@ -10,60 +10,14 @@ import (
 	"os"
 	"os/exec"
 	"path/filepath"
-	"regexp"
-	"runtime"
 	"strconv"
 	"strings"
-	"sync"
 	"syscall"
 	"time"
 )
 
 // ---------------------------------------------------------------------------
 // state files (~/.tshare/shares/<id>.json)
-
-type stateRec struct {
-	ID        string    `json:"id"`
-	PID       int       `json:"pid"`
-	Token     string    `json:"token"`
-	Mode      string    `json:"mode"`
-	Title     string    `json:"title,omitempty"` // short human label (filename, host, room name, …)
-	URL       string    `json:"url"`
-	Target    string    `json:"target"`
-	Tailnet   bool      `json:"tailnet_only"`
-	Local     bool      `json:"local"`
-	HTTPSPort int       `json:"https_port"`
-	Port      int       `json:"port"`
-	Password  bool      `json:"password"`
-	MaxDL     int64     `json:"max_downloads"`
-	Downloads int64     `json:"downloads"`
-	Uploads   int64     `json:"uploads"`
-	Created   time.Time `json:"created"`
-	Expires   time.Time `json:"expires,omitempty"`
-	Procs     []procRec `json:"procs,omitempty"`      // managed servers we own (run/host/room) → reap on rm/panic
-	RootMount bool      `json:"root_mount,omitempty"` // we hold the funnel/serve root path
-	GameJoin  string    `json:"game_join,omitempty"`  // --gamelink: the JOIN link (child's live session id)
-	GameHost  string    `json:"game_host,omitempty"`  // --gamelink: the auto-host (#gnhost) link
-}
-
-// procRec is how a managed server is recorded in the share state so another
-// process (tshare rm / panic) can reap it: a process-group pid, or a tmux window.
-type procRec struct {
-	Pid  int    `json:"pid,omitempty"`
-	Tmux string `json:"tmux,omitempty"`
-}
-
-func stateDir() string {
-	home, err := os.UserHomeDir()
-	if err != nil {
-		home = os.TempDir()
-	}
-	d := filepath.Join(home, ".tshare", "shares")
-	os.MkdirAll(d, 0o700)
-	return d
-}
-
-func stateFile(id string) string { return filepath.Join(stateDir(), id+".json") }
 
 func (s *share) stateRec(port int) stateRec {
 	target := s.describe()
@@ -115,18 +69,6 @@ func (s *share) flushStateLocked() {
 	s.stateDirty = false
 }
 
-func writeJSON(fp string, v any) error {
-	b, err := json.MarshalIndent(v, "", "  ")
-	if err != nil {
-		return err
-	}
-	tmp := fp + ".tmp"
-	if err := os.WriteFile(tmp, b, 0o600); err != nil {
-		return err
-	}
-	return os.Rename(tmp, fp)
-}
-
 // rootInUse returns the id of a live share holding the funnel/serve ROOT path
 // (a --root site, a room, Kuma), or "". Only one share can own "/".
 func rootInUse() string {
@@ -156,82 +98,8 @@ func nameInUse(mount string) bool {
 	return false
 }
 
-// recAlive reports whether a share recorded in state is really still running.
-// After a reboot the old state files survive with pids that the kernel has
-// since handed to unrelated processes, so a bare pid check reports phantom
-// shares (and can make `rm` signal a stranger). A record written before the
-// current boot is dead by definition.
-func recAlive(r stateRec) bool {
-	if !pidAlive(r.PID) {
-		return false
-	}
-	if b := bootTime(); !b.IsZero() && r.Created.Before(b) {
-		return false
-	}
-	return true
-}
-
-var (
-	bootOnce sync.Once
-	bootAt   time.Time
-)
-
-// bootTime is when this machine last booted (zero if it can't be determined,
-// in which case callers fall back to the plain pid check).
-func bootTime() time.Time {
-	bootOnce.Do(func() {
-		if runtime.GOOS == "darwin" {
-			// kern.boottime: "{ sec = 1789000000, usec = 0 } Tue Sep  9 ..."
-			out, err := exec.Command("sysctl", "-n", "kern.boottime").Output()
-			if err != nil {
-				return
-			}
-			if m := regexp.MustCompile(`sec\s*=\s*(\d+)`).FindSubmatch(out); m != nil {
-				if n, err := strconv.ParseInt(string(m[1]), 10, 64); err == nil {
-					bootAt = time.Unix(n, 0)
-				}
-			}
-			return
-		}
-		if b, err := os.ReadFile("/proc/uptime"); err == nil { // linux
-			if f := strings.Fields(string(b)); len(f) > 0 {
-				if secs, err := strconv.ParseFloat(f[0], 64); err == nil {
-					bootAt = time.Now().Add(-time.Duration(secs * float64(time.Second)))
-				}
-			}
-		}
-	})
-	return bootAt
-}
-
-func pidAlive(pid int) bool {
-	if pid <= 0 {
-		return false
-	}
-	return syscall.Kill(pid, 0) == nil
-}
-
 // ---------------------------------------------------------------------------
 // background mode
-
-// daemonEnv marks a process as a detached -b child. The argv markers below are
-// what the child parses; this is the backstop that makes a re-daemonize loop
-// impossible even if a future argv layout ever hides those markers.
-const daemonEnv = "TSHARE_DAEMON_CHILD"
-
-// insertArgs splices tshare-internal flags in right after the subcommand name
-// (or first, for a bare share) — never at the end, where `run … -- cmd` would
-// hand them to the user's command instead of to tshare.
-func insertArgs(args []string, extra ...string) []string {
-	at := 0
-	if len(args) > 0 && commands[args[0]] != nil {
-		at = 1
-	}
-	out := make([]string, 0, len(args)+len(extra))
-	out = append(out, args[:at]...)
-	out = append(out, extra...)
-	return append(out, args[at:]...)
-}
 
 func daemonize(s *share) error {
 	if os.Getenv(daemonEnv) != "" {
@@ -377,14 +245,6 @@ func (s *share) rePersist() {
 		log.Printf("warn: could not refresh resume record: %v", err)
 	}
 }
-
-func persistDir() string {
-	d := filepath.Join(filepath.Dir(stateDir()), "persist")
-	os.MkdirAll(d, 0o700)
-	return d
-}
-
-func persistFile(id string) string { return filepath.Join(persistDir(), id+".json") }
 
 func savePersist(s *share) error {
 	if s.tmpRoot != "" || s.grow != nil {

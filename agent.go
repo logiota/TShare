@@ -1,4 +1,4 @@
-//go:build unix
+//go:build unix && !noagent
 
 package main
 
@@ -26,7 +26,11 @@ func agentPlistPath() string {
 	return filepath.Join(home, "Library", "LaunchAgents", agentLabel+".plist")
 }
 
-func init() { register(cmdAgent, "agent", "service") }
+func init() {
+	register(cmdAgent, "agent", "service")
+	loginAgent = &agentHooks{Installed: agentInstalled, Install: installAgent, Remove: removeAgent,
+		ForPersist: ensurePersistAgent}
+}
 
 func cmdAgent(args []string) {
 	if runtime.GOOS != "darwin" {
@@ -146,8 +150,8 @@ func agentInstalled() bool { return fileExists(agentPlistPath()) }
 // Requiring the user to know that was the whole failure mode — a share flagged
 // --persist that quietly never came back — so the first --persist share installs
 // the login agent itself, says so, and says how to undo it.
-func ensurePersistAgent(c *config) {
-	if c.Quiet || agentInstalled() {
+func ensurePersistAgent(quiet bool) {
+	if quiet || agentInstalled() {
 		return
 	}
 	if runtime.GOOS != "darwin" {

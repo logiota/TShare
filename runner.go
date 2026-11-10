@@ -5,7 +5,6 @@ package main
 import (
 	"context"
 	"errors"
-	"flag"
 	"fmt"
 	"io"
 	"log"
@@ -612,56 +611,6 @@ func trailingShareFlags(cmd []string) []string {
 		return nil
 	}
 	return cluster
-}
-
-// tshare's own flags, derived from registerFlags so these can never drift from
-// the real flag set. The value is whether the flag consumes the next token:
-// `--name demo` does, `--tmux` doesn't — the same distinction the flag package
-// makes, read straight off each flag's Value. Hand-written copies of this list
-// are how `tshare run -- cmd` used to mis-split a newly added flag.
-var tshareFlags = sync.OnceValue(func() map[string]bool {
-	fs := flag.NewFlagSet("introspect", flag.ContinueOnError)
-	fs.SetOutput(io.Discard)
-	registerFlags(fs, defaultConfig())
-	m := make(map[string]bool, 128)
-	fs.VisitAll(func(f *flag.Flag) {
-		b, isBool := f.Value.(interface{ IsBoolFlag() bool })
-		m[f.Name] = !(isBool && b.IsBoolFlag())
-	})
-	return m
-})
-
-// flagName strips leading dashes, returning "" for a non-flag token (so a bare
-// command word is never mistaken for a flag).
-func flagName(tok string) string {
-	if !strings.HasPrefix(tok, "-") {
-		return ""
-	}
-	name, _, _ := strings.Cut(strings.TrimLeft(tok, "-"), "=")
-	return name
-}
-
-// isTshareFlag reports whether tok names one of tshare's own flags, so
-// trailing-flag lifting only ever peels tshare flags off a command and never
-// touches an app's options.
-func isTshareFlag(tok string) bool {
-	name := flagName(tok)
-	if name == "" {
-		return false
-	}
-	_, known := tshareFlags()[name]
-	return known
-}
-
-// runValueFlag reports whether a tshare flag consumes the following token.
-func runValueFlag(tok string) bool {
-	return tshareFlags()[flagName(tok)]
-}
-
-// tshareInternalFlag reports whether a flag is one of the private --__ markers
-// daemonize/resume pass to a child (never part of a persisted command line).
-func tshareInternalFlag(tok string) bool {
-	return strings.HasPrefix(flagName(tok), "__")
 }
 
 // tshareIntent: unlike the sets above, this is a deliberate POLICY list, not a

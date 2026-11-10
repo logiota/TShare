@@ -9,7 +9,7 @@ package main
 //
 // Stdlib only: a loopback HTTP server on a random port, behind a random secret
 // path, serving one page embedded below. Shares are launched as detached
-// `tshare -b` processes (control.go), so closing the GUI takes nothing down.
+// `tshare -b` processes (lifecycle.go), so closing the GUI takes nothing down.
 // Optional — build with -tags nogui to leave it out.
 //
 // A local server that can publish your files is a target for every website
@@ -179,10 +179,13 @@ func (g *guiServer) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		if !g.decode(w, r, &req) {
 			return
 		}
-		if req.On {
-			g.result(w, installAgent())
-		} else {
-			g.result(w, removeAgent())
+		switch {
+		case loginAgent == nil:
+			g.json(w, map[string]any{"error": "this build has no login agent"})
+		case req.On:
+			g.result(w, loginAgent.Install())
+		default:
+			g.result(w, loginAgent.Remove())
 		}
 	case "api/dash":
 		var req struct{ On bool }
@@ -302,7 +305,7 @@ func (g *guiServer) state() map[string]any {
 	_, qrErr := exec.LookPath("qrencode")
 	return map[string]any{
 		"shares": shares, "dashboard": dash,
-		"agent": agentInstalled(), "agentSupported": runtime.GOOS == "darwin",
+		"agent": loginAgent != nil && loginAgent.Installed(), "agentSupported": loginAgent != nil && runtime.GOOS == "darwin",
 		"pickers": pickerAvailable(), "qr": qrErr == nil,
 	}
 }

@@ -42,6 +42,8 @@ USAGE
   tshare ls [--json]                  list active shares
   tshare rm <id>... | --all           stop share(s), remove funnel mount
   tshare panic                        kill ALL shares NOW & wipe every token/state
+  tshare cleanup [-n]                 clear what dead shares left: Tailscale mounts pointing
+                                      at nothing, stale records, orphaned downloads (-n: preview)
   tshare template save/ls/rm          manage reusable flag presets (templates)
   tshare resume                       restart shares saved with --persist
   tshare decrypt [-p pw] <f.enc>...   decrypt files received by an --encrypt inbox

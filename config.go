@@ -177,6 +177,10 @@ func defaultConfig() *config {
 		Copy: true, LAN: true, Password: os.Getenv("TSHARE_PASSWORD")}
 }
 
+// Give the core (main.go) the flag definitions, so it can tell tshare's own
+// flags from a launched command's and vet flags a caller passes through.
+func init() { defineFlags = func(fs *flag.FlagSet) { registerFlags(fs, defaultConfig()) } }
+
 func registerFlags(fs *flag.FlagSet, c *config) {
 	fs.StringVar(&c.Password, "p", c.Password, "")
 	fs.StringVar(&c.Password, "password", c.Password, "")

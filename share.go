@@ -708,8 +708,8 @@ func runShare(c *config) error {
 	// something to run `tshare resume` at login. Do it here, before the -b
 	// hand-off, so the interactive process reports it to the terminal rather
 	// than the detached child's log file.
-	if c.Persist && !c.daemonChild {
-		ensurePersistAgent(c)
+	if c.Persist && !c.daemonChild && loginAgent != nil {
+		loginAgent.ForPersist(c.Quiet)
 	}
 
 	// background: re-exec a detached child, wait for it to publish its state

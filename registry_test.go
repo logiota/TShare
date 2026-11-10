@@ -67,7 +67,7 @@ func TestSubcommandsRegistered(t *testing.T) {
 	for _, name := range []string{
 		"ls", "list", "rm", "stop", "set", "extend", "info", "doctor", "panic",
 		"run", "host", "tmux", "room", "kuma", "dash", "dashboard",
-		"agent", "service", "resume", "decrypt", "template", "version", "help",
+		"resume", "decrypt", "template", "version", "help",
 	} {
 		if commands[name] == nil {
 			t.Errorf("subcommand %q is not registered", name)

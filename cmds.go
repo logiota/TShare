@@ -17,7 +17,6 @@ import (
 	"os"
 	"os/exec"
 	"path/filepath"
-	"sort"
 	"strconv"
 	"strings"
 	"syscall"
@@ -26,30 +25,6 @@ import (
 
 // ---------------------------------------------------------------------------
 // subcommands
-
-func loadStates() []stateRec {
-	out := []stateRec{} // non-nil so ls --json prints [] not null
-	des, err := os.ReadDir(stateDir())
-	if err != nil {
-		return out
-	}
-	for _, de := range des {
-		if !strings.HasSuffix(de.Name(), ".json") {
-			continue
-		}
-		b, err := os.ReadFile(filepath.Join(stateDir(), de.Name()))
-		if err != nil {
-			continue
-		}
-		var rec stateRec
-		if json.Unmarshal(b, &rec) != nil {
-			continue
-		}
-		out = append(out, rec)
-	}
-	sort.Slice(out, func(i, j int) bool { return out[i].Created.Before(out[j].Created) })
-	return out
-}
 
 func init() {
 	register(cmdLs, "ls", "list")
@@ -130,6 +105,7 @@ func cmdRm(args []string) {
 			continue
 		}
 		n++
+		killed := false
 		if recAlive(r) { // never signal a pid the kernel reused after a reboot
 			syscall.Kill(r.PID, syscall.SIGTERM)
 			for i := 0; i < 30 && pidAlive(r.PID); i++ {
@@ -137,17 +113,21 @@ func cmdRm(args []string) {
 			}
 			if pidAlive(r.PID) {
 				syscall.Kill(r.PID, syscall.SIGKILL)
+				killed = true
 			}
 		}
 		// belt & braces: remove funnel mount + state even if process is gone;
 		// reap owned managed servers (run/host/room) if the share died uncleanly.
-		if !recAlive(r) {
+		// A share we just SIGKILLed never ran its own cleanup, and its pid can
+		// still read as alive for a moment — so `killed` decides, not a re-probe.
+		dead := killed || !recAlive(r)
+		if dead {
 			reapProcs(r.Procs, syscall.SIGTERM)
 		}
 		if !r.Local {
 			c := &config{Tailnet: r.Tailnet, HTTPSPort: r.HTTPSPort}
 			tsUnmount(c, r.Token)
-			if r.RootMount && !recAlive(r) {
+			if r.RootMount && dead {
 				tsUnmount(c, "")
 			}
 		}

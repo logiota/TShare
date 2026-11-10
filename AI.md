@@ -119,4 +119,4 @@ Errors go to stderr prefixed `tshare:`, with a non-zero exit (1 for a failed sha
 
 ## Building without it
 
-The MCP server is one optional file. `go build -tags nomcp` leaves it out, as `-tags nogui` does the GUI and `-tags nowebwiz` the terminal wizard; tshare builds and works the same either way.
+The MCP server is one optional file, `mcp.go`. `go build -tags nomcp` leaves it out, and everything else builds and works the same. The README's [How the code fits together](README.md#how-the-code-fits-together) lists the other optional modules.
