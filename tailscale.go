@@ -12,6 +12,7 @@ import (
 	"os/exec"
 	"runtime"
 	"strconv"
+	"strings"
 	"time"
 )
 
@@ -94,13 +95,18 @@ func tsMount(c *config, mount string, port int) (string, error) {
 	return string(out), err
 }
 
-func tsUnmount(c *config, mount string) {
+// tsUnmount removes a funnel/serve mount. Most callers are best-effort
+// cleanup and ignore the result; `tshare cleanup` checks it.
+func tsUnmount(c *config, mount string) error {
 	bin, err := tsBin(c)
 	if err != nil {
-		return
+		return err
 	}
 	args := []string{verb(c),
 		"--https=" + strconv.Itoa(c.HTTPSPort),
 		"--set-path=/" + mount, "off"}
-	exec.Command(bin, args...).CombinedOutput()
+	if out, err := exec.Command(bin, args...).CombinedOutput(); err != nil {
+		return fmt.Errorf("%v: %s", err, strings.TrimSpace(string(out)))
+	}
+	return nil
 }

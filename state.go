@@ -6,9 +6,11 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"log"
 	"os"
 	"os/exec"
 	"path/filepath"
+	"strconv"
 	"strings"
 	"syscall"
 	"time"
@@ -16,48 +18,6 @@ import (
 
 // ---------------------------------------------------------------------------
 // state files (~/.tshare/shares/<id>.json)
-
-type stateRec struct {
-	ID        string    `json:"id"`
-	PID       int       `json:"pid"`
-	Token     string    `json:"token"`
-	Mode      string    `json:"mode"`
-	URL       string    `json:"url"`
-	Target    string    `json:"target"`
-	Tailnet   bool      `json:"tailnet_only"`
-	Local     bool      `json:"local"`
-	HTTPSPort int       `json:"https_port"`
-	Port      int       `json:"port"`
-	Password  bool      `json:"password"`
-	MaxDL     int64     `json:"max_downloads"`
-	Downloads int64     `json:"downloads"`
-	Uploads   int64     `json:"uploads"`
-	Created   time.Time `json:"created"`
-	Expires   time.Time `json:"expires,omitempty"`
-	Procs     []procRec `json:"procs,omitempty"`      // managed servers we own (run/host/room) → reap on rm/panic
-	RootMount bool      `json:"root_mount,omitempty"` // we hold the funnel/serve root path
-	GameJoin  string    `json:"game_join,omitempty"`  // --gamelink: the JOIN link (child's live session id)
-	GameHost  string    `json:"game_host,omitempty"`  // --gamelink: the auto-host (#gnhost) link
-}
-
-// procRec is how a managed server is recorded in the share state so another
-// process (tshare rm / panic) can reap it: a process-group pid, or a tmux window.
-type procRec struct {
-	Pid  int    `json:"pid,omitempty"`
-	Tmux string `json:"tmux,omitempty"`
-}
-
-func stateDir() string {
-	home, err := os.UserHomeDir()
-	if err != nil {
-		home = os.TempDir()
-	}
-	d := filepath.Join(home, ".tshare", "shares")
-	os.MkdirAll(d, 0o700)
-	return d
-}
-
-func stateFile(id string) string { return filepath.Join(stateDir(), id+".json") }
 
 func (s *share) stateRec(port int) stateRec {
 	target := s.describe()
@@ -67,7 +27,7 @@ func (s *share) stateRec(port int) stateRec {
 	}
 	gameJoin, gameHost := s.gameLinks()
 	return stateRec{
-		ID: s.id, PID: os.Getpid(), Token: s.token, Mode: s.mode,
+		ID: s.id, PID: os.Getpid(), Token: s.token, Mode: s.mode, Title: s.title(),
 		URL: s.prettyURL(), Target: target, Tailnet: s.cfg.Tailnet, Local: s.cfg.Local,
 		HTTPSPort: s.cfg.HTTPSPort, Port: port, Password: s.getPassword() != "",
 		MaxDL: s.maxDL.Load(), Downloads: s.dl.Load(), Uploads: s.upCount.Load(),
@@ -109,16 +69,15 @@ func (s *share) flushStateLocked() {
 	s.stateDirty = false
 }
 
-func writeJSON(fp string, v any) error {
-	b, err := json.MarshalIndent(v, "", "  ")
-	if err != nil {
-		return err
+// rootInUse returns the id of a live share holding the funnel/serve ROOT path
+// (a --root site, a room, Kuma), or "". Only one share can own "/".
+func rootInUse() string {
+	for _, r := range loadStates() {
+		if r.RootMount && recAlive(r) {
+			return r.ID
+		}
 	}
-	tmp := fp + ".tmp"
-	if err := os.WriteFile(tmp, b, 0o600); err != nil {
-		return err
-	}
-	return os.Rename(tmp, fp)
+	return ""
 }
 
 func nameInUse(mount string) bool {
@@ -132,24 +91,20 @@ func nameInUse(mount string) bool {
 		if err != nil || json.Unmarshal(b, &rec) != nil {
 			continue
 		}
-		if rec.Token == mount && pidAlive(rec.PID) {
+		if rec.Token == mount && recAlive(rec) {
 			return true
 		}
 	}
 	return false
 }
 
-func pidAlive(pid int) bool {
-	if pid <= 0 {
-		return false
-	}
-	return syscall.Kill(pid, 0) == nil
-}
-
 // ---------------------------------------------------------------------------
 // background mode
 
 func daemonize(s *share) error {
+	if os.Getenv(daemonEnv) != "" {
+		return errors.New("internal: a background child tried to background itself again (daemon markers lost) — refusing")
+	}
 	exe, err := os.Executable()
 	if err != nil {
 		return err
@@ -157,6 +112,7 @@ func daemonize(s *share) error {
 	// re-exec with daemon markers (child sees --bg too, but daemonChild
 	// short-circuits re-daemonizing, so flags and defaults stay identical)
 	args := append([]string{}, os.Args[1:]...)
+	var extra []string
 	if s.tmpRoot != "" {
 		// stdin/yt input was already produced by THIS parent — the child can't
 		// re-read stdin or re-download, so hand it the materialized path and
@@ -169,22 +125,22 @@ func daemonize(s *share) error {
 			}
 		}
 		if s.mode == "file" {
-			args = append(args, "--filename", s.roots[0].Name)
+			extra = append(extra, "--filename", s.roots[0].Name)
 		}
 		if s.tmpFile != "" {
-			args = append(args, "--__tmp", s.tmpFile)
+			extra = append(extra, "--__tmp", s.tmpFile)
 		}
 		if s.tmpDir != "" {
-			args = append(args, "--__tmpdir", s.tmpDir)
+			extra = append(extra, "--__tmpdir", s.tmpDir)
 		}
 	}
 	if s.cfg.encKeyHex != "" { // hand the inbox key to the child so it stays stable
-		args = append(args, "--__enckey", s.cfg.encKeyHex)
+		extra = append(extra, "--__enckey", s.cfg.encKeyHex)
 	}
 	if s.gameSid != "" { // hand the game session id to the child so its join link matches what we advertise
-		args = append(args, "--__gamesid", s.gameSid)
+		extra = append(extra, "--__gamesid", s.gameSid)
 	}
-	args = append(args, "--__daemon", "--__id", s.id)
+	args = insertArgs(args, append(extra, "--__daemon", "--__id", s.id)...)
 
 	logDir := filepath.Join(filepath.Dir(stateDir()), "logs")
 	os.MkdirAll(logDir, 0o700)
@@ -195,7 +151,12 @@ func daemonize(s *share) error {
 	}
 	defer lf.Close()
 
+	// A crashed predecessor with this id may have left its state file behind;
+	// drop it so it can't be mistaken for the new child's.
+	os.Remove(stateFile(s.id))
+
 	cmd := exec.Command(exe, args...)
+	cmd.Env = append(os.Environ(), daemonEnv+"=1")
 	cmd.Stdout = lf
 	cmd.Stderr = lf
 	cmd.SysProcAttr = &syscall.SysProcAttr{Setsid: true}
@@ -205,20 +166,22 @@ func daemonize(s *share) error {
 	pid := cmd.Process.Pid
 	cmd.Process.Release()
 
-	// wait for the child to publish its state (max ~8s)
+	// Wait for the child to publish its state. Bounded generously (60s) because
+	// a share that launches a server first (run/host/--room/--kuma) only writes
+	// state once that server is up; a child that dies is detected immediately
+	// below, so a healthy-but-slow start is never reported as a failure.
 	sf := stateFile(s.id)
-	for i := 0; i < 80; i++ {
+	for i := 0; i < 600; i++ {
 		time.Sleep(100 * time.Millisecond)
 		b, err := os.ReadFile(sf)
-		if err != nil {
+		var rec stateRec
+		// only state published by THIS child means it's up — a leftover file
+		// from an earlier run of the same id must not read as success
+		if err != nil || json.Unmarshal(b, &rec) != nil || rec.PID != pid || rec.URL == "" {
 			if !pidAlive(pid) {
 				lb, _ := os.ReadFile(filepath.Join(logDir, s.id+".log"))
 				return fmt.Errorf("background share failed to start:\n%s", string(lb))
 			}
-			continue
-		}
-		var rec stateRec
-		if json.Unmarshal(b, &rec) != nil || rec.URL == "" {
 			continue
 		}
 		if s.cfg.Quiet {
@@ -267,15 +230,21 @@ type persistRec struct {
 	Args    []string  `json:"args"`
 	Cwd     string    `json:"cwd"`
 	Created time.Time `json:"created"`
+	Token   string    `json:"token,omitempty"`   // the secret path — replayed so links survive the restart
+	Expires time.Time `json:"expires,omitempty"` // absolute deadline — replayed so a restart doesn't extend it
+	Port    int       `json:"port,omitempty"`    // backend port — replayed when free, so LAN links stay identical too
 }
 
-func persistDir() string {
-	d := filepath.Join(filepath.Dir(stateDir()), "persist")
-	os.MkdirAll(d, 0o700)
-	return d
+// rePersist refreshes a live share's resume record (new expiry, new password
+// state) so a restart restores what the share is NOW, not what it was at start.
+func (s *share) rePersist() {
+	if !s.cfg.Persist {
+		return
+	}
+	if err := savePersist(s); err != nil && !s.cfg.Quiet {
+		log.Printf("warn: could not refresh resume record: %v", err)
+	}
 }
-
-func persistFile(id string) string { return filepath.Join(persistDir(), id+".json") }
 
 func savePersist(s *share) error {
 	if s.tmpRoot != "" || s.grow != nil {
@@ -286,12 +255,12 @@ func savePersist(s *share) error {
 	// --__gamesid is stripped here and re-appended below so exactly one (the live
 	// session id) survives — resume then reuses it, keeping distributed join links valid.
 	var args []string
-	skip := map[string]bool{"--__daemon": true, "--__id": true, "--__tmp": true, "--__tmpdir": true, "--__enckey": true, "--__gamesid": true}
-	for i := 0; i < len(os.Args[1:]); i++ {
-		a := os.Args[1:][i]
-		if skip[a] {
-			if a != "--__daemon" {
-				i++ // also skip its value
+	argv := os.Args[1:]
+	for i := 0; i < len(argv); i++ {
+		a := argv[i]
+		if tshareInternalFlag(a) { // --__daemon/--__id/--__token/… are per-run, never persisted
+			if runValueFlag(a) && !strings.Contains(a, "=") {
+				i++ // skip its value too
 			}
 			continue
 		}
@@ -300,9 +269,15 @@ func savePersist(s *share) error {
 	if s.gameSid != "" { // pin the session id so `tshare resume` doesn't re-mint one and orphan links already shared
 		args = append(args, "--__gamesid", s.gameSid)
 	}
-	rec := persistRec{ID: s.id, Args: args, Cwd: cwd, Created: time.Now()}
+	s.stateMu.Lock()
+	port := s.lastPort
+	s.stateMu.Unlock()
+	rec := persistRec{ID: s.id, Args: args, Cwd: cwd, Created: time.Now(),
+		Token: s.token, Expires: s.getExpires(), Port: port}
 	return writeJSON(persistFile(s.id), rec)
 }
+
+func init() { register(cmdResume, "resume") }
 
 func cmdResume(args []string) {
 	des, err := os.ReadDir(persistDir())
@@ -312,12 +287,12 @@ func cmdResume(args []string) {
 	}
 	live := map[string]bool{}
 	for _, r := range loadStates() {
-		if pidAlive(r.PID) {
+		if recAlive(r) { // boot-aware: a pre-reboot record is dead, pid or not
 			live[r.ID] = true
 		}
 	}
-	exe, _ := os.Executable()
-	n := 0
+	// read every record first, so we know whether to wait for tailscale at all
+	var recs []persistRec
 	for _, de := range des {
 		if !strings.HasSuffix(de.Name(), ".json") {
 			continue
@@ -330,10 +305,67 @@ func cmdResume(args []string) {
 		if live[rec.ID] {
 			continue // already running
 		}
-		ra := append([]string{}, rec.Args...)
-		if !hasArg(ra, "-b") && !hasArg(ra, "--bg") {
-			ra = append(ra, "-b") // resume detached
+		// a share whose deadline passed while we were off should stay gone
+		if !rec.Expires.IsZero() && time.Now().After(rec.Expires) {
+			os.Remove(persistFile(rec.ID))
+			fmt.Printf("  ⌛ %s expired while offline — record dropped\n", rec.ID)
+			continue
 		}
+		// a live share may already hold this record's name/token (e.g. it was
+		// resumed earlier under a different id) — don't start a duplicate.
+		if name := persistName(rec.Args); name != "" && nameInUse(name) {
+			continue
+		}
+		// A share killed uncleanly (crash, SIGKILL) leaves its managed servers
+		// orphaned — still holding the very ports the resumed share needs.
+		if b, err := os.ReadFile(stateFile(rec.ID)); err == nil {
+			var old stateRec
+			if json.Unmarshal(b, &old) == nil && !recAlive(old) {
+				reapProcs(old.Procs, syscall.SIGTERM)
+				os.Remove(stateFile(rec.ID))
+			}
+		}
+		recs = append(recs, rec)
+	}
+	if len(recs) == 0 {
+		fmt.Println("resumed 0 share(s)")
+		return
+	}
+	// At login (launchd) we can easily beat tailscaled to the punch, and a
+	// funnel/serve share started too early dies with "tailscale not ready".
+	for _, rec := range recs {
+		if !hasArg(rec.Args, "-l") && !hasArg(rec.Args, "--local") {
+			waitTailscale(2 * time.Minute)
+			break
+		}
+	}
+
+	exe, _ := os.Executable()
+	n := 0
+	for _, rec := range recs {
+		ra := append([]string{}, rec.Args...)
+		var extra []string
+		if !hasArg(ra, "-b") && !hasArg(ra, "--bg") {
+			extra = append(extra, "-b") // resume detached
+		}
+		if !hasArg(ra, "--__id") {
+			extra = append(extra, "--__id", rec.ID) // reuse the persist id so resume is idempotent
+		}
+		// replay the share's identity: same secret path, same deadline — the
+		// whole point of --persist is that the link you handed out still works.
+		if rec.Token != "" && !hasArg(ra, "--__token") {
+			extra = append(extra, "--__token", rec.Token)
+		}
+		if !rec.Expires.IsZero() && !hasArg(ra, "--__expires") {
+			extra = append(extra, "--__expires", rec.Expires.Format(time.RFC3339))
+		}
+		// Reuse the same backend port, so a --local link (which carries the
+		// port) also comes back unchanged. --__bindport rather than --port,
+		// because in run/host mode --port means the UPSTREAM server's port.
+		if rec.Port > 0 && !hasArg(ra, "--__bindport") {
+			extra = append(extra, "--__bindport", strconv.Itoa(rec.Port))
+		}
+		ra = insertArgs(ra, extra...)
 		cmd := exec.Command(exe, ra...)
 		cmd.Dir = rec.Cwd
 		cmd.Stdout, cmd.Stderr = os.Stdout, os.Stderr
@@ -344,4 +376,41 @@ func cmdResume(args []string) {
 		n++
 	}
 	fmt.Printf("resumed %d share(s)\n", n)
+}
+
+// waitTailscale blocks until tailscaled is up with a MagicDNS name, or limit
+// passes. Resuming at boot/login otherwise races the daemon and loses.
+func waitTailscale(limit time.Duration) {
+	c := defaultConfig()
+	ready := func() bool {
+		ts, err := tsStatus(c)
+		return err == nil && ts.Self.DNSName != ""
+	}
+	if ready() {
+		return
+	}
+	fmt.Printf("  … waiting for tailscale (up to %s)\n", limit)
+	deadline := time.Now().Add(limit)
+	for time.Now().Before(deadline) {
+		time.Sleep(2 * time.Second)
+		if ready() {
+			fmt.Println("  ✓ tailscale ready")
+			return
+		}
+	}
+	fmt.Println("  ⚠ tailscale still not ready — resuming anyway")
+}
+
+// persistName extracts the --name/-n token from a persisted record's args, if
+// any, so resume can detect that the name is already served by a live share.
+func persistName(args []string) string {
+	for i, a := range args {
+		if (a == "--name" || a == "-n") && i+1 < len(args) {
+			return args[i+1]
+		}
+		if strings.HasPrefix(a, "--name=") {
+			return strings.TrimPrefix(a, "--name=")
+		}
+	}
+	return ""
 }

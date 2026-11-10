@@ -140,8 +140,3 @@ func freePort() (int, error) {
 	defer ln.Close()
 	return ln.Addr().(*net.TCPAddr).Port, nil
 }
-
-func fileExists(p string) bool {
-	fi, err := os.Stat(p)
-	return err == nil && !fi.IsDir()
-}
