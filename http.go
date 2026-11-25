@@ -74,23 +74,36 @@ func (r *respRec) ReadFrom(src io.Reader) (int64, error) {
 	return n, err
 }
 
+// caller says who is making a request, believing only what can't be forged.
+// tailscaled reaches us over loopback, sets X-Forwarded-For and the
+// Tailscale-User-* identity headers itself, and strips any a client sent — so
+// those are trusted only on a proxied request. A direct connection (a LAN peer,
+// or anything under --local) can put whatever it likes in them: there they're
+// ignored, or a stranger could name themselves a tailnet user and silence the
+// "invalid access" alert, or forge the address in the access log.
+func (s *share) caller(r *http.Request) (who string, authed, proxied bool) {
+	who = r.RemoteAddr
+	proxied = !s.cfg.Local && remoteIsLoopback(r.RemoteAddr)
+	if !proxied {
+		return who, false, false
+	}
+	if fwd := r.Header.Get("X-Forwarded-For"); fwd != "" {
+		who = fwd
+	}
+	if login := r.Header.Get("Tailscale-User-Login"); login != "" {
+		return who + " (" + login + ")", true, true
+	}
+	return who, false, true
+}
+
 func (s *share) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	rec := &respRec{ResponseWriter: w, limiter: s.limiter}
 	start := time.Now()
 	s.viewers.Add(1) // #61 presence: in-flight viewers
 	defer s.viewers.Add(-1)
-	who := r.Header.Get("X-Forwarded-For")
-	if who == "" {
-		who = r.RemoteAddr
-	}
-	// A tailnet identity is injected by tailscaled only for authenticated tailnet
-	// users coming through the secret mount — not anonymous public Funnel hits. A
-	// 404/401 from such a known person is a typo or a stale link, not a scanner
-	// probing us, so it shouldn't raise the ⚠ marker or an "invalid access" alert.
-	authed := r.Header.Get("Tailscale-User-Login") != ""
-	if u := r.Header.Get("Tailscale-User-Login"); u != "" {
-		who += " (" + u + ")"
-	}
+	// A 404/401 from a known tailnet user is a typo or a stale link, not a
+	// scanner probing us, so it doesn't raise the ⚠ marker or an alert.
+	who, authed, proxied := s.caller(r)
 	senderTab := s.senderReq(r) // --p2p local sender: free (loopback, not funnel egress)
 	defer func() {
 		// #13 byte cap: tally served bytes; stop at the 1.5× hard ceiling
@@ -141,7 +154,6 @@ func (s *share) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	// port, or anything in --local mode — is NOT proxied, so it must present
 	// the token in the path. This keeps the LAN URL just as secret-gated as
 	// the funnel one.
-	proxied := !s.cfg.Local && remoteIsLoopback(r.RemoteAddr)
 	p := strings.TrimPrefix(r.URL.Path, "/")
 	seg, rest, _ := strings.Cut(p, "/")
 	if subtle.ConstantTimeCompare([]byte(seg), []byte(s.token)) == 1 {
@@ -340,7 +352,8 @@ func (s *share) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 			s.renderP2PRecv(rec)
 			return
 		}
-		s.serveFile(rec, r, s.roots[0].Abs, s.roots[0].Name)
+		f := s.file()
+		s.serveFile(rec, r, f.Abs, f.Name)
 	case "dir", "multi":
 		// --p2p folder share (e.g. --rar volumes): the root becomes the
 		// per-file direct-transfer page; every file stays reachable directly.
@@ -547,8 +560,10 @@ func (s *share) serveFile(w *respRec, r *http.Request, abs, name string) {
 			http.Error(w, "502 download failed", http.StatusBadGateway)
 			return
 		}
-		// done OK → roots[0] now points at the finished file; fall through.
-		abs, name = s.roots[0].Abs, s.roots[0].Name
+		// done OK → serve the finished file (it may have landed between the
+		// caller's look and this one, so ask again rather than trust the args).
+		f := s.file()
+		abs, name = f.Abs, f.Name
 	}
 
 	// #49 progressive/live: the file is still being written. Serve the media
@@ -1110,7 +1125,10 @@ func sanitizeName(n string) string {
 		}
 		b.WriteRune(r)
 	}
-	out := strings.TrimSpace(b.String())
+	// No leading dots: listings hide dotfiles, so an uploader could otherwise
+	// plant a file the owner never sees — a .envrc or .gitconfig in a shared
+	// project folder runs or reconfigures things the next time they work there.
+	out := strings.TrimLeft(strings.TrimSpace(b.String()), ". ")
 	for strings.HasPrefix(out, "__") { // never collide with __upload/__zip endpoints
 		out = out[1:]
 	}
@@ -1122,7 +1140,7 @@ func createUnique(dir, name string) (*os.File, string, error) {
 	base := strings.TrimSuffix(name, ext)
 	try := name
 	for i := 1; i < 1000; i++ {
-		f, err := os.OpenFile(filepath.Join(dir, try), os.O_CREATE|os.O_EXCL|os.O_WRONLY, 0o644)
+		f, err := os.OpenFile(filepath.Join(dir, try), os.O_CREATE|os.O_EXCL|os.O_WRONLY, 0o600) // received files are the owner's alone
 		if err == nil {
 			return f, try, nil
 		}

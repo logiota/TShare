@@ -44,12 +44,12 @@ func TestDashNameFallbacks(t *testing.T) {
 
 func TestPrettyFileTitle(t *testing.T) {
 	cases := map[string]string{
-		"photo.png": "photo",
-		"Branches-of-Philosophy.png": "Branches of Philosophy",
-		"my_cool_clip.mp4":           "my cool clip",
-		"Hello World.pdf":            "Hello World",
+		"photo.png":                    "photo",
+		"Branches-of-Philosophy.png":   "Branches of Philosophy",
+		"my_cool_clip.mp4":             "my cool clip",
+		"Hello World.pdf":              "Hello World",
 		"Song Title [aqz-KE-bpKQ].mp3": "Song Title",
-		"A ｜ B [abcdef12].m4a":        "A · B",
+		"A ｜ B [abcdef12].m4a":         "A · B",
 	}
 	for in, want := range cases {
 		if got := prettyFileTitle(in); got != want {

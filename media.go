@@ -267,23 +267,35 @@ type ytPending struct {
 	percent float64
 	done    bool
 	err     error
+	file    rootEnt // the finished download; valid once done with no error
 }
 
 func (p *ytPending) set(pct float64) { p.mu.Lock(); p.percent = pct; p.mu.Unlock() }
 
-func (p *ytPending) finish(err error) {
+// finish records how the download ended: the file it produced, or why not.
+func (p *ytPending) finish(file rootEnt, err error) {
 	p.mu.Lock()
-	p.done = true
-	if p.err == nil {
-		p.err = err
+	defer p.mu.Unlock()
+	if p.done {
+		return
 	}
-	p.mu.Unlock()
+	p.done, p.err = true, err
+	if err == nil {
+		p.file, p.percent = file, 100
+	}
 }
 
 func (p *ytPending) state() (pct float64, done bool, err error) {
 	p.mu.Lock()
 	defer p.mu.Unlock()
 	return p.percent, p.done, p.err
+}
+
+// finished returns the downloaded file once there is one.
+func (p *ytPending) finished() (rootEnt, bool) {
+	p.mu.Lock()
+	defer p.mu.Unlock()
+	return p.file, p.done && p.err == nil
 }
 
 type growing struct {

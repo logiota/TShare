@@ -8,6 +8,7 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	"log"
 	"mime"
 	"net/http"
 	"net/url"
@@ -325,7 +326,7 @@ var ytFmtCountRe = regexp.MustCompile(`Downloading (\d+) format\(s\)`)
 func ytDownload(c *config, s *share) {
 	bin, err := ytBin()
 	if err != nil {
-		s.ytPend.finish(err)
+		s.ytPend.finish(rootEnt{}, err)
 		return
 	}
 	dir := s.tmpDir
@@ -341,7 +342,10 @@ func ytDownload(c *config, s *share) {
 	pr, pw := io.Pipe()
 	cmd.Stdout = pw
 	cmd.Stderr = pw
+	var ytErr string // yt-dlp's own last ERROR line: the reason, if it fails
+	scanned := make(chan struct{})
 	go func() {
+		defer close(scanned)
 		sc := bufio.NewScanner(pr)
 		sc.Buffer(make([]byte, 64<<10), 1<<20)
 		total := 1      // download passes yt-dlp will make (e.g. video + audio)
@@ -351,6 +355,9 @@ func ytDownload(c *config, s *share) {
 		inProg := false // terminal: currently sitting on an in-place progress line
 		for sc.Scan() {
 			line := sc.Text()
+			if strings.HasPrefix(line, "ERROR:") {
+				ytErr = strings.TrimSpace(strings.TrimPrefix(line, "ERROR:"))
+			}
 			// "Downloading 2 format(s): 137+140" → expect 2 passes; collapse them
 			// into a single 0→100 so the bar doesn't restart per stream.
 			if m := ytFmtCountRe.FindStringSubmatch(line); m != nil {
@@ -396,8 +403,21 @@ func ytDownload(c *config, s *share) {
 	}()
 	runErr := cmd.Run()
 	pw.Close()
+	<-scanned // the scanner owns ytErr until it has read everything
+	// The link is already live and visitors are waiting on it, so a failure
+	// must reach the owner whatever stderr is — yt-dlp's output is only echoed
+	// to a terminal, and a background or redirected share showed nothing while
+	// its visitors got a bare 502.
+	fail := func(err error) {
+		s.ytPend.finish(rootEnt{}, err)
+		log.Printf("  ✗ download failed — visitors now get a 502: %v", err)
+	}
 	if runErr != nil {
-		s.ytPend.finish(fmt.Errorf("yt-dlp failed: %v", runErr))
+		if ytErr != "" {
+			fail(errors.New("yt-dlp: " + ytErr))
+		} else {
+			fail(fmt.Errorf("yt-dlp failed: %v", runErr))
+		}
 		return
 	}
 	roots, err := collectMedia(dir)
@@ -405,16 +425,13 @@ func ytDownload(c *config, s *share) {
 		err = errors.New("yt-dlp produced no media file (check the URL / format)")
 	}
 	if err != nil {
-		s.ytPend.finish(err)
+		fail(err)
 		return
 	}
-	// Swap the placeholder root for the real file *before* marking done; the
-	// handler reads `done` under ytPend.mu before touching s.roots, which gives
-	// the happens-before so it never sees a half-updated root.
-	s.roots[0] = roots[0]
-	s.tmpRoot = roots[0].Abs
-	s.ytPend.set(100)
-	s.ytPend.finish(nil)
+	// The share is already live, so the result is handed over under ytPend's
+	// lock rather than written into s.roots, which requests and the state
+	// writer read without one. s.file() is how they see it.
+	s.ytPend.finish(roots[0], nil)
 	if !c.Quiet {
 		fmt.Fprintf(os.Stderr, "  ✓ downloaded %s (%s)\n", roots[0].Name, humanSize(roots[0].Size))
 	}

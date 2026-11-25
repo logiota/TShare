@@ -140,7 +140,11 @@ func daemonize(s *share) error {
 	if s.gameSid != "" { // hand the game session id to the child so its join link matches what we advertise
 		extra = append(extra, "--__gamesid", s.gameSid)
 	}
-	args = insertArgs(args, append(extra, "--__daemon", "--__id", s.id)...)
+	extra = append(extra, "--__daemon")
+	if !hasArg(args, "--__id") { // a resumed share already carries its id
+		extra = append(extra, "--__id", s.id)
+	}
+	args = insertArgs(args, extra...)
 
 	logDir := filepath.Join(filepath.Dir(stateDir()), "logs")
 	os.MkdirAll(logDir, 0o700)
@@ -155,6 +159,10 @@ func daemonize(s *share) error {
 	// drop it so it can't be mistaken for the new child's.
 	os.Remove(stateFile(s.id))
 
+	logStart := int64(0) // the log is appended per id: remember where this launch begins
+	if fi, err := lf.Stat(); err == nil {
+		logStart = fi.Size()
+	}
 	cmd := exec.Command(exe, args...)
 	cmd.Env = append(os.Environ(), daemonEnv+"=1")
 	cmd.Stdout = lf
@@ -164,7 +172,12 @@ func daemonize(s *share) error {
 		return err
 	}
 	pid := cmd.Process.Pid
-	cmd.Process.Release()
+	// Reap the child if it dies while we wait. An exited child nobody has
+	// waited for is a zombie, and a zombie still answers kill(pid, 0) — so a
+	// share that failed at once looked alive, and we sat out the whole deadline
+	// and then said "timed out" instead of showing its error.
+	exited := make(chan struct{})
+	go func() { cmd.Wait(); close(exited) }()
 
 	// Wait for the child to publish its state. Bounded generously (60s) because
 	// a share that launches a server first (run/host/--room/--kuma) only writes
@@ -178,9 +191,14 @@ func daemonize(s *share) error {
 		// only state published by THIS child means it's up — a leftover file
 		// from an earlier run of the same id must not read as success
 		if err != nil || json.Unmarshal(b, &rec) != nil || rec.PID != pid || rec.URL == "" {
-			if !pidAlive(pid) {
+			select {
+			case <-exited:
 				lb, _ := os.ReadFile(filepath.Join(logDir, s.id+".log"))
-				return fmt.Errorf("background share failed to start:\n%s", string(lb))
+				if int64(len(lb)) >= logStart {
+					lb = lb[logStart:] // only what THIS launch wrote
+				}
+				return fmt.Errorf("background share failed to start:\n%s", strings.TrimSpace(string(lb)))
+			default:
 			}
 			continue
 		}

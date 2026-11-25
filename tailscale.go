@@ -5,12 +5,9 @@ package main
 import (
 	"context"
 	"encoding/json"
-	"errors"
 	"fmt"
 	"net"
-	"os"
 	"os/exec"
-	"runtime"
 	"strconv"
 	"strings"
 	"time"
@@ -25,24 +22,7 @@ type tsInfo struct {
 	CertDomains  []string
 }
 
-func tsBin(c *config) (string, error) {
-	if c.TSBin != "" {
-		return c.TSBin, nil
-	}
-	if env := os.Getenv("TAILSCALE"); env != "" {
-		return env, nil
-	}
-	if p, err := exec.LookPath("tailscale"); err == nil {
-		return p, nil
-	}
-	if runtime.GOOS == "darwin" {
-		mac := "/Applications/Tailscale.app/Contents/MacOS/Tailscale"
-		if _, err := os.Stat(mac); err == nil {
-			return mac, nil
-		}
-	}
-	return "", errors.New("tailscale CLI not found (install Tailscale, or pass --tailscale-bin)")
-}
+func tsBin(c *config) (string, error) { return tailscaleBin(c.TSBin) }
 
 // resolvesPublicly reports whether host has a public A/AAAA record, asking a
 // public resolver directly (not the local one, which on a tailnet answers for

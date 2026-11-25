@@ -56,15 +56,6 @@ func remoteIsLoopback(remoteAddr string) bool {
 	return ip != nil && ip.IsLoopback()
 }
 
-func lanIP() string {
-	conn, err := net.Dial("udp", "192.0.2.1:9") // no packets sent; just routes
-	if err != nil {
-		return "127.0.0.1"
-	}
-	defer conn.Close()
-	return conn.LocalAddr().(*net.UDPAddr).IP.String()
-}
-
 func copyClipboard(text string) bool {
 	var cands [][]string
 	if runtime.GOOS == "darwin" {

@@ -21,7 +21,6 @@ import (
 	"context"
 	"crypto/rand"
 	"crypto/subtle"
-	"encoding/base64"
 	"encoding/json"
 	"errors"
 	"flag"
@@ -528,7 +527,7 @@ func builtinShare(args []string) {
 		log.Fatalf("tshare: %v", err)
 	}
 	port := ln.Addr().(*net.TCPAddr).Port
-	token := builtinToken(16)
+	token := randToken(16)
 	link, unmount, err := builtinPublish(*tailnet, *local, token, port)
 	if err != nil {
 		log.Fatalf("tshare: %v", err)
@@ -537,7 +536,7 @@ func builtinShare(args []string) {
 		link += url.PathEscape(fi.Name())
 	}
 
-	id := builtinToken(6)
+	id := randToken(6)
 	mode := "dir"
 	if !fi.IsDir() {
 		mode = "file"
@@ -567,15 +566,11 @@ func builtinShare(args []string) {
 // link and how to take it down again.
 func builtinPublish(tailnet, local bool, token string, port int) (link string, unmount func(), err error) {
 	if local {
-		return fmt.Sprintf("http://%s:%d/%s/", builtinLANIP(), port, token), func() {}, nil
+		return fmt.Sprintf("http://%s:%d/%s/", lanIP(), port, token), func() {}, nil
 	}
-	bin, err := exec.LookPath("tailscale")
+	bin, err := tailscaleBin("")
 	if err != nil {
-		if mac := "/Applications/Tailscale.app/Contents/MacOS/Tailscale"; fileExists(mac) {
-			bin, err = mac, nil
-		} else {
-			return "", nil, errors.New("tailscale not found — install it, or share on your LAN with -l")
-		}
+		return "", nil, fmt.Errorf("%v — or share on your LAN with -l", err)
 	}
 	out, err := exec.Command(bin, "status", "--json").Output()
 	var st struct{ Self struct{ DNSName string } }
@@ -709,20 +704,44 @@ func builtinList(w http.ResponseWriter, rel, dir string) {
 	w.Write([]byte(b.String()))
 }
 
-func builtinToken(n int) string {
+// randToken returns n random URL-safe characters (6 bits each): share ids,
+// secret paths, minted passwords.
+func randToken(n int) string {
+	const cs = "abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789-_"
 	b := make([]byte, n)
 	if _, err := rand.Read(b); err != nil {
 		panic(err)
 	}
-	return base64.RawURLEncoding.EncodeToString(b)[:n]
+	for i := range b {
+		b[i] = cs[b[i]&63]
+	}
+	return string(b)
 }
 
-// builtinLANIP is this machine's address on the local network.
-func builtinLANIP() string {
+// lanIP is this machine's address on the local network.
+func lanIP() string {
 	conn, err := net.Dial("udp", "192.0.2.1:9") // no packets sent: just picks the route
 	if err != nil {
 		return "127.0.0.1"
 	}
 	defer conn.Close()
 	return conn.LocalAddr().(*net.UDPAddr).IP.String()
+}
+
+// tailscaleBin finds the tailscale CLI: an explicit path, $TAILSCALE, PATH,
+// then the macOS app bundle (which doesn't put itself on PATH).
+func tailscaleBin(explicit string) (string, error) {
+	if explicit != "" {
+		return explicit, nil
+	}
+	if env := os.Getenv("TAILSCALE"); env != "" {
+		return env, nil
+	}
+	if p, err := exec.LookPath("tailscale"); err == nil {
+		return p, nil
+	}
+	if mac := "/Applications/Tailscale.app/Contents/MacOS/Tailscale"; runtime.GOOS == "darwin" && fileExists(mac) {
+		return mac, nil
+	}
+	return "", errors.New("tailscale CLI not found (install Tailscale, or pass --tailscale-bin)")
 }

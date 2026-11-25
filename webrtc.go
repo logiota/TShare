@@ -258,7 +258,7 @@ func rarSplit(c *config, root rootEnt, id string) (string, error) {
 // regular files of a folder share (RAR volumes), sorted by name.
 func (s *share) p2pFiles() []rootEnt {
 	if s.mode == "file" {
-		return []rootEnt{s.roots[0]}
+		return []rootEnt{s.file()}
 	}
 	des, err := os.ReadDir(s.roots[0].Abs)
 	if err != nil {
