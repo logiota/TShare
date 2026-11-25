@@ -13,7 +13,7 @@ import (
 
 func testGUI() *guiServer {
 	return &guiServer{secret: "s3cr3t", hosts: map[string]bool{"127.0.0.1:9": true},
-		origins: map[string]bool{"http://127.0.0.1:9": true}, dashPW: map[string]string{}}
+		origins: map[string]bool{"http://127.0.0.1:9": true}}
 }
 
 func guiDo(g *guiServer, method, path, body string, hdr ...string) *httptest.ResponseRecorder {

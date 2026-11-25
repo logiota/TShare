@@ -189,7 +189,7 @@ func cmdShare(args []string) {
 			run(args)
 			return
 		}
-		log.Fatal("tshare: this build has no --webwiz (built with -tags nowebwiz)")
+		log.Fatal("tshare: this build has no terminal UI (built with -tags notui)")
 	}
 	if c.Once {
 		c.MaxDL = 1

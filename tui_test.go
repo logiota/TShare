@@ -1,4 +1,4 @@
-//go:build unix && !nowebwiz
+//go:build unix && !notui
 
 package main
 

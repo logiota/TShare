@@ -22,6 +22,7 @@ import (
 	"sort"
 	"strconv"
 	"strings"
+	"sync"
 )
 
 // ---------------------------------------------------------------------------
@@ -497,4 +498,96 @@ func (b *builder) selected() int {
 		}
 	}
 	return n
+}
+
+// ---------------------------------------------------------------------------
+// what a running share looks like to a front end
+
+// shareLink is one address a running share answers on.
+type shareLink struct {
+	Icon  string // what it is at a glance — and, in the TUI, what you click to copy it
+	Label string // "link", "LAN", "download", "join", "host"
+	URL   string
+}
+
+// shareLinks lists every address worth handing out for a share, the main one
+// first: the link itself, the game join/host links, the direct LAN address,
+// and for a file its forced-download form.
+func shareLinks(r stateRec) []shareLink {
+	links := []shareLink{{shareIcon(r), "link", r.URL}}
+	if r.GameJoin != "" {
+		links = append(links, shareLink{"🎮", "join", r.GameJoin})
+	}
+	if r.GameHost != "" {
+		links = append(links, shareLink{"🎯", "host", r.GameHost})
+	}
+	if r.LAN != "" && r.LAN != r.URL {
+		links = append(links, shareLink{"🏠", "LAN", r.LAN})
+	}
+	if r.Mode == "file" && r.URL != "" {
+		sep := "?"
+		if strings.Contains(r.URL, "?") {
+			sep = "&"
+		}
+		links = append(links, shareLink{"💾", "download", r.URL + sep + "dl=1"})
+	}
+	return links
+}
+
+// shareIcon is the share's kind as one emoji. A few of the dashboard's icons
+// (🖼 🖥 ☎️) are text-presentation characters that terminals draw one column
+// wide or two depending on the font; those are swapped for always-wide ones so
+// a row of icons lines up everywhere.
+func shareIcon(r stateRec) string {
+	icon := dashIcon(r.Mode, dashRawName(r))
+	if r.Mode == "dashboard" {
+		icon = "📋"
+	}
+	if wide, ok := map[string]string{"🖼": "📷", "🖥": "💻", "☎️": "📞"}[icon]; ok {
+		return wide
+	}
+	return icon
+}
+
+// dashboardCtl turns the dashboard share on and off for a front end, and
+// remembers the password it minted: the share itself only records that it has
+// one, so whoever starts it is the only one who can show it.
+type dashboardCtl struct {
+	mu sync.Mutex
+	pw map[string]string // share id → password
+}
+
+// running returns the live dashboard share and, if this front end started it,
+// its password.
+func (d *dashboardCtl) running() (rec stateRec, password string, ok bool) {
+	for _, r := range liveShares() {
+		if r.Mode == "dashboard" {
+			d.mu.Lock()
+			defer d.mu.Unlock()
+			return r, d.pw[r.ID], true
+		}
+	}
+	return stateRec{}, "", false
+}
+
+func (d *dashboardCtl) set(on bool) error {
+	rec, _, running := d.running()
+	switch {
+	case on == running:
+		return nil
+	case !on:
+		return stopShare(rec.ID)
+	}
+	pw := randToken(6)
+	rec, err := launchShare([]string{"dash", "-p", pw})
+	if err != nil {
+		return err
+	}
+	d.mu.Lock()
+	if d.pw == nil {
+		d.pw = map[string]string{}
+	}
+	d.pw[rec.ID] = pw
+	d.mu.Unlock()
+	return nil
 }

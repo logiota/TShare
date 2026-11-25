@@ -34,7 +34,6 @@ import (
 	"sort"
 	"strconv"
 	"strings"
-	"sync"
 	"syscall"
 	"time"
 )
@@ -55,7 +54,6 @@ func cmdGUI(args []string) {
 	g := &guiServer{
 		secret: randToken(24),
 		hosts:  map[string]bool{fmt.Sprintf("127.0.0.1:%d", p): true, fmt.Sprintf("localhost:%d", p): true},
-		dashPW: map[string]string{},
 	}
 	g.origins = map[string]bool{}
 	for h := range g.hosts {
@@ -79,8 +77,7 @@ type guiServer struct {
 	secret  string
 	hosts   map[string]bool
 	origins map[string]bool
-	mu      sync.Mutex
-	dashPW  map[string]string // dashboard share id → the password we minted for it
+	dash    dashboardCtl
 }
 
 func (g *guiServer) ServeHTTP(w http.ResponseWriter, r *http.Request) {
@@ -192,7 +189,7 @@ func (g *guiServer) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		if !g.decode(w, r, &req) {
 			return
 		}
-		g.result(w, g.setDashboard(req.On))
+		g.result(w, g.dash.set(req.On))
 	case "api/qr":
 		guiQR(w, r.URL.Query().Get("url"))
 	default:
@@ -275,11 +272,12 @@ type guiShare struct {
 	ID, Title, URL, Mode, Expires string
 	Password, Persisted           bool
 	Downloads, Uploads            int64
+	Links                         []shareLink // every address it answers on, main one first
 }
 
 func guiShareView(r stateRec) guiShare {
 	v := guiShare{ID: r.ID, Title: dashName(r), URL: r.URL, Mode: r.Mode, Password: r.Password,
-		Persisted: isPersisted(r.ID), Downloads: r.Downloads, Uploads: r.Uploads}
+		Persisted: isPersisted(r.ID), Downloads: r.Downloads, Uploads: r.Uploads, Links: shareLinks(r)}
 	if r.GameJoin != "" {
 		v.URL = r.GameJoin
 	}
@@ -291,16 +289,14 @@ func guiShareView(r stateRec) guiShare {
 
 func (g *guiServer) state() map[string]any {
 	shares := []guiShare{}
-	var dash map[string]any
 	for _, r := range liveShares() {
-		if r.Mode == "dashboard" {
-			g.mu.Lock()
-			pw := g.dashPW[r.ID]
-			g.mu.Unlock()
-			dash = map[string]any{"id": r.ID, "url": r.URL, "password": pw}
-			continue
+		if r.Mode != "dashboard" {
+			shares = append(shares, guiShareView(r))
 		}
-		shares = append(shares, guiShareView(r))
+	}
+	var dash map[string]any
+	if r, pw, ok := g.dash.running(); ok {
+		dash = map[string]any{"id": r.ID, "url": r.URL, "password": pw}
 	}
 	_, qrErr := exec.LookPath("qrencode")
 	return map[string]any{
@@ -308,32 +304,6 @@ func (g *guiServer) state() map[string]any {
 		"agent": loginAgent != nil && loginAgent.Installed(), "agentSupported": loginAgent != nil && runtime.GOOS == "darwin",
 		"pickers": pickerAvailable(), "qr": qrErr == nil,
 	}
-}
-
-// setDashboard starts or stops the dashboard share. The GUI mints its password
-// itself, so it can show it — the share's own auto-minted one never leaves the
-// detached child.
-func (g *guiServer) setDashboard(on bool) error {
-	for _, r := range liveShares() {
-		if r.Mode == "dashboard" {
-			if on {
-				return nil
-			}
-			return stopShare(r.ID)
-		}
-	}
-	if !on {
-		return nil
-	}
-	pw := randToken(4)
-	rec, err := launchShare([]string{"dash", "-p", pw})
-	if err != nil {
-		return err
-	}
-	g.mu.Lock()
-	g.dashPW[rec.ID] = pw
-	g.mu.Unlock()
-	return nil
 }
 
 // pickPath opens the OS's own file or folder chooser and returns the choice.
@@ -548,7 +518,7 @@ let qrOn={},state={};
 function shareRow(s,canQR){
   const meta=[s.Mode,s.Expires?"expires in "+s.Expires:"never expires",s.Downloads?s.Downloads+" downloads":null,s.Uploads?s.Uploads+" uploads":null].filter(Boolean).join(" · ");
   const acts=el("div",{class:"acts"},
-    el("button",{onclick:()=>navigator.clipboard.writeText(s.URL)},"Copy"),
+    ...(s.Links||[]).map(l=>el("button",{title:"copy the "+l.Label+" · "+l.URL,onclick:e=>{navigator.clipboard.writeText(l.URL);e.target.textContent="✓ copied"}},l.Icon+" "+l.Label)),
     el("button",{onclick:()=>window.open(s.URL,"_blank","noreferrer")},"Open"),
     canQR?el("button",{onclick:()=>{qrOn[s.ID]=!qrOn[s.ID];render()}},"QR"):null,
     el("button",{class:"danger",onclick:async()=>{if(!confirm("Stop sharing “"+s.Title+"”? The link stops working."))return;const r=await api("stop",{ID:s.ID});if(r.error)alert(r.error);refresh()}},"Stop"));

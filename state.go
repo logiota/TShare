@@ -33,6 +33,7 @@ func (s *share) stateRec(port int) stateRec {
 		MaxDL: s.maxDL.Load(), Downloads: s.dl.Load(), Uploads: s.upCount.Load(),
 		Created: s.createdAt, Expires: s.getExpires(),
 		Procs: procs, RootMount: s.mtRootMounted,
+		LAN:      s.lanLink(),
 		GameJoin: gameJoin, GameHost: gameHost,
 	}
 }

@@ -492,6 +492,11 @@ func mcpShareView(r stateRec) map[string]any {
 	if r.GameJoin != "" {
 		v["url"], v["host_url"] = r.GameJoin, r.GameHost
 	}
+	links := map[string]string{} // every address it answers on: link, LAN, download, join, host
+	for _, l := range shareLinks(r) {
+		links[strings.ToLower(l.Label)] = l.URL
+	}
+	v["links"] = links
 	if !r.Expires.IsZero() {
 		v["expires_in"] = humanDur(time.Until(r.Expires))
 	}

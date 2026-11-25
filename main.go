@@ -121,6 +121,7 @@ type stateRec struct {
 	Expires   time.Time `json:"expires,omitempty"`
 	Procs     []procRec `json:"procs,omitempty"`      // managed servers we own (run/host/room) → reap on rm/panic
 	RootMount bool      `json:"root_mount,omitempty"` // we hold the funnel/serve root path
+	LAN       string    `json:"lan_url,omitempty"`    // the same share reached directly on the local network
 	GameJoin  string    `json:"game_join,omitempty"`  // --gamelink: the JOIN link (child's live session id)
 	GameHost  string    `json:"game_host,omitempty"`  // --gamelink: the auto-host (#gnhost) link
 }
