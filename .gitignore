@@ -9,3 +9,10 @@
 # macOS / editor / sync cruft
 .DS_Store
 .stfolder/
+*.sync-conflict-*
+
+# local app checkouts (third-party repos run natively by --room / --kuma)
+/mirotalk/
+
+# graft's local graph cache — regenerable, not committed (run `graft build`).
+/graft/

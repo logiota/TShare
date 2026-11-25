@@ -74,23 +74,36 @@ func (r *respRec) ReadFrom(src io.Reader) (int64, error) {
 	return n, err
 }
 
+// caller says who is making a request, believing only what can't be forged.
+// tailscaled reaches us over loopback, sets X-Forwarded-For and the
+// Tailscale-User-* identity headers itself, and strips any a client sent — so
+// those are trusted only on a proxied request. A direct connection (a LAN peer,
+// or anything under --local) can put whatever it likes in them: there they're
+// ignored, or a stranger could name themselves a tailnet user and silence the
+// "invalid access" alert, or forge the address in the access log.
+func (s *share) caller(r *http.Request) (who string, authed, proxied bool) {
+	who = r.RemoteAddr
+	proxied = !s.cfg.Local && remoteIsLoopback(r.RemoteAddr)
+	if !proxied {
+		return who, false, false
+	}
+	if fwd := r.Header.Get("X-Forwarded-For"); fwd != "" {
+		who = fwd
+	}
+	if login := r.Header.Get("Tailscale-User-Login"); login != "" {
+		return who + " (" + login + ")", true, true
+	}
+	return who, false, true
+}
+
 func (s *share) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	rec := &respRec{ResponseWriter: w, limiter: s.limiter}
 	start := time.Now()
 	s.viewers.Add(1) // #61 presence: in-flight viewers
 	defer s.viewers.Add(-1)
-	who := r.Header.Get("X-Forwarded-For")
-	if who == "" {
-		who = r.RemoteAddr
-	}
-	// A tailnet identity is injected by tailscaled only for authenticated tailnet
-	// users coming through the secret mount — not anonymous public Funnel hits. A
-	// 404/401 from such a known person is a typo or a stale link, not a scanner
-	// probing us, so it shouldn't raise the ⚠ marker or an "invalid access" alert.
-	authed := r.Header.Get("Tailscale-User-Login") != ""
-	if u := r.Header.Get("Tailscale-User-Login"); u != "" {
-		who += " (" + u + ")"
-	}
+	// A 404/401 from a known tailnet user is a typo or a stale link, not a
+	// scanner probing us, so it doesn't raise the ⚠ marker or an alert.
+	who, authed, proxied := s.caller(r)
 	senderTab := s.senderReq(r) // --p2p local sender: free (loopback, not funnel egress)
 	defer func() {
 		// #13 byte cap: tally served bytes; stop at the 1.5× hard ceiling
@@ -141,13 +154,14 @@ func (s *share) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	// port, or anything in --local mode — is NOT proxied, so it must present
 	// the token in the path. This keeps the LAN URL just as secret-gated as
 	// the funnel one.
-	proxied := !s.cfg.Local && remoteIsLoopback(r.RemoteAddr)
 	p := strings.TrimPrefix(r.URL.Path, "/")
 	seg, rest, _ := strings.Cut(p, "/")
 	if subtle.ConstantTimeCompare([]byte(seg), []byte(s.token)) == 1 {
 		p = rest // token present → strip it
-	} else if !proxied {
-		http.NotFound(rec, r) // direct hit without the token
+	} else if !proxied && !s.cfg.Root {
+		// direct hit without the token. A --root share has no secret path by
+		// design; it only binds the LAN at all under --local.
+		http.NotFound(rec, r)
 		return
 	}
 
@@ -261,6 +275,11 @@ func (s *share) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		}
 	}
 
+	if s.mode == "room" && rel == "" && r.Method == http.MethodPost {
+		s.handleRoomToken(rec, r)
+		return
+	}
+
 	if r.Method != http.MethodGet && r.Method != http.MethodHead {
 		http.Error(rec, "405 method not allowed", http.StatusMethodNotAllowed)
 		return
@@ -333,7 +352,8 @@ func (s *share) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 			s.renderP2PRecv(rec)
 			return
 		}
-		s.serveFile(rec, r, s.roots[0].Abs, s.roots[0].Name)
+		f := s.file()
+		s.serveFile(rec, r, f.Abs, f.Name)
 	case "dir", "multi":
 		// --p2p folder share (e.g. --rar volumes): the root becomes the
 		// per-file direct-transfer page; every file stays reachable directly.
@@ -420,110 +440,6 @@ func (s *share) confined(root, rel string) (string, bool, bool) {
 		return "", false, false
 	}
 	return real, fi.IsDir(), true
-}
-
-// resolveSite validates the --site target and returns the web root + default
-// document. A folder is served as-is; a single .html serves its parent folder.
-func resolveSite(paths []string) (root, index string, err error) {
-	if len(paths) != 1 {
-		return "", "", errors.New("--site takes exactly one folder (or one .html file)")
-	}
-	abs, err := filepath.Abs(paths[0])
-	if err != nil {
-		return "", "", err
-	}
-	if abs, err = filepath.EvalSymlinks(abs); err != nil {
-		return "", "", err
-	}
-	fi, err := os.Stat(abs)
-	if err != nil {
-		return "", "", err
-	}
-	if fi.IsDir() {
-		return abs, "index.html", nil
-	}
-	if ext := strings.ToLower(filepath.Ext(abs)); ext != ".html" && ext != ".htm" {
-		return "", "", errors.New("--site needs a folder or an .html file")
-	}
-	// a lone .html: serve its folder as the root (so sibling assets load)
-	return filepath.Dir(abs), filepath.Base(abs), nil
-}
-
-// siteContentType returns an explicit, correct MIME type for web assets — vital
-// because tshare sends X-Content-Type-Options: nosniff, so a wrong/empty type
-// would make the browser refuse to run scripts/styles.
-func siteContentType(name string) string {
-	switch strings.ToLower(filepath.Ext(name)) {
-	case ".html", ".htm":
-		return "text/html; charset=utf-8"
-	case ".js", ".mjs":
-		return "text/javascript; charset=utf-8"
-	case ".css":
-		return "text/css; charset=utf-8"
-	case ".json", ".map":
-		return "application/json; charset=utf-8"
-	case ".svg":
-		return "image/svg+xml"
-	case ".wasm":
-		return "application/wasm"
-	case ".webmanifest", ".manifest":
-		return "application/manifest+json"
-	case ".xml":
-		return "application/xml; charset=utf-8"
-	case ".txt":
-		return "text/plain; charset=utf-8"
-	case ".ico":
-		return "image/x-icon"
-	}
-	return mime.TypeByExtension(strings.ToLower(filepath.Ext(name)))
-}
-
-// serveSite routes a request within a --site share: directories resolve to
-// index.html, missing paths fall back to 404.html if present, and assets are
-// served inline with correct types and NO download/sandbox so the site runs.
-func (s *share) serveSite(w *respRec, r *http.Request, rel string) {
-	root := s.roots[0].Abs
-	abs, isDir, ok := s.confined(root, rel)
-	if !ok {
-		if p := filepath.Join(root, "404.html"); fileExists(p) {
-			if b, err := os.ReadFile(p); err == nil {
-				w.Header().Set("Content-Type", "text/html; charset=utf-8")
-				w.WriteHeader(http.StatusNotFound)
-				w.Write(b)
-				return
-			}
-		}
-		http.NotFound(w, r)
-		return
-	}
-	if isDir {
-		idx := filepath.Join(abs, s.siteIndex)
-		if !fileExists(idx) {
-			idx = filepath.Join(abs, "index.htm")
-		}
-		if !fileExists(idx) {
-			s.renderSiteList(w, rel, abs) // no index → browsable listing
-			return
-		}
-		abs = idx
-	}
-	f, err := os.Open(abs)
-	if err != nil {
-		http.NotFound(w, r)
-		return
-	}
-	defer f.Close()
-	fi, err := f.Stat()
-	if err != nil || fi.IsDir() {
-		http.NotFound(w, r)
-		return
-	}
-	if ct := siteContentType(abs); ct != "" {
-		w.Header().Set("Content-Type", ct)
-	}
-	// ServeContent adds Last-Modified + ETag and handles Range/If-Modified-Since
-	// (304) — good caching for a long-lived site, with no forced download.
-	http.ServeContent(w, r, filepath.Base(abs), fi.ModTime(), f)
 }
 
 // renderSiteList shows a minimal browsable listing for a --site folder that has
@@ -644,8 +560,10 @@ func (s *share) serveFile(w *respRec, r *http.Request, abs, name string) {
 			http.Error(w, "502 download failed", http.StatusBadGateway)
 			return
 		}
-		// done OK → roots[0] now points at the finished file; fall through.
-		abs, name = s.roots[0].Abs, s.roots[0].Name
+		// done OK → serve the finished file (it may have landed between the
+		// caller's look and this one, so ask again rather than trust the args).
+		f := s.file()
+		abs, name = f.Abs, f.Name
 	}
 
 	// #49 progressive/live: the file is still being written. Serve the media
@@ -938,7 +856,34 @@ func (s *share) reportAlert(who, label string) {
 }
 
 // ---------------------------------------------------------------------------
-// zip streaming
+// room token endpoint: POST with {name: "..."} returns a sealed join URL
+// containing a JWT with room + visitor name, so neither appears in the URL.
+func (s *share) handleRoomToken(rec http.ResponseWriter, r *http.Request) {
+	if s.mirotalkJWTKey == "" {
+		http.Error(rec, "403 room token sealing not configured", http.StatusForbidden)
+		return
+	}
+	var req struct {
+		Name string `json:"name"`
+	}
+	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+		http.Error(rec, "400 bad request", http.StatusBadRequest)
+		return
+	}
+	claims := map[string]interface{}{
+		"room": s.roomName,
+	}
+	if req.Name != "" {
+		claims["name"] = req.Name
+	}
+	token, err := makeJWT(s.mirotalkJWTKey, claims, 0)
+	if err != nil {
+		http.Error(rec, "500 internal error", http.StatusInternalServerError)
+		return
+	}
+	rec.Header().Set("Content-Type", "application/json")
+	fmt.Fprintf(rec, `{"url":"%s/join?token=%s"}`, s.roomOrigin, url.PathEscape(token))
+}
 
 func (s *share) handleZip(w *respRec, r *http.Request, dirRel string) {
 	if r.Method != http.MethodGet {
@@ -1180,7 +1125,10 @@ func sanitizeName(n string) string {
 		}
 		b.WriteRune(r)
 	}
-	out := strings.TrimSpace(b.String())
+	// No leading dots: listings hide dotfiles, so an uploader could otherwise
+	// plant a file the owner never sees — a .envrc or .gitconfig in a shared
+	// project folder runs or reconfigures things the next time they work there.
+	out := strings.TrimLeft(strings.TrimSpace(b.String()), ". ")
 	for strings.HasPrefix(out, "__") { // never collide with __upload/__zip endpoints
 		out = out[1:]
 	}
@@ -1192,7 +1140,7 @@ func createUnique(dir, name string) (*os.File, string, error) {
 	base := strings.TrimSuffix(name, ext)
 	try := name
 	for i := 1; i < 1000; i++ {
-		f, err := os.OpenFile(filepath.Join(dir, try), os.O_CREATE|os.O_EXCL|os.O_WRONLY, 0o644)
+		f, err := os.OpenFile(filepath.Join(dir, try), os.O_CREATE|os.O_EXCL|os.O_WRONLY, 0o600) // received files are the owner's alone
 		if err == nil {
 			return f, try, nil
 		}

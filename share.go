@@ -4,8 +4,11 @@ package main
 
 import (
 	"context"
+	"crypto/hmac"
 	"crypto/rand"
+	"crypto/sha256"
 	"crypto/tls"
+	"encoding/base64"
 	"encoding/json"
 	"errors"
 	"fmt"
@@ -86,25 +89,39 @@ type share struct {
 	ytPend        *ytPending   // yt-dlp download still running: hold visitors until ready
 	afterAnnounce func()       // run once after the link/QR is printed (e.g. start the yt-dlp download)
 
-	cpCmd   *exec.Cmd              // copyparty subprocess (folder engine), if used
-	cpProxy *httputil.ReverseProxy // reverse proxy to copyparty on loopback
-	cpPort  int
+	cpProxy *httputil.ReverseProxy // reverse proxy to copyparty on loopback (its proc is in procs)
 
 	srvProxy *httputil.ReverseProxy // -s: reverse proxy to a user-run server
 	srvURL   string                 // its target URL (for display)
 
-	roomName      string // --room: MiroTalk room id
-	roomURL       string // --room: full MiroTalk join URL
-	roomLocal     bool   // --room: using the local MiroTalk install
-	kuma          bool   // --kuma: exposing Uptime Kuma at the funnel root
-	kumaURL       string // the root dashboard URL
-	mtRootMounted bool   // we mounted the funnel/serve ROOT path → unmount on exit
+	roomName       string // --room: MiroTalk room id
+	roomURL        string // --room: full MiroTalk join URL (with sealed JWT token)
+	roomLocal      bool   // --room: using the local MiroTalk install
+	roomOrigin     string // --room: MiroTalk base URL (scheme+host+port) for generating sealed tokens
+	mirotalkJWTKey string // MiroTalk JWT signing key for sealed room tokens
+	kuma           bool   // --kuma: exposing Uptime Kuma at the funnel root
+	kumaURL        string // the root dashboard URL
+	mtRootMounted  bool   // we mounted the funnel/serve ROOT path → unmount on exit
 
 	procs []*serverProc // managed local servers we launched (run/host/room) — stopped on exit
 
 	senderKey string  // --p2p: secret that authenticates the local sender tab
 	hub       *rtcHub // --p2p / --call: in-memory WebRTC signaling relay
 	jobs      *jobHub // --hub: web-grab job registry
+}
+
+// file is the one file a "file" share serves. s.roots is fixed once a share is
+// serving — requests and the state writer read it without a lock — but a yt-dlp
+// share goes live before its download exists and only learns the real name and
+// size afterwards. That late answer is kept in ytPend, under its lock, and this
+// is where the two are joined.
+func (s *share) file() rootEnt {
+	if s.ytPend != nil {
+		if f, ok := s.ytPend.finished(); ok {
+			return f
+		}
+	}
+	return s.roots[0]
 }
 
 func (s *share) getPassword() string {
@@ -150,7 +167,132 @@ func (s *share) doExtend(spec string) (string, error) {
 	return "expiry +" + spec + " → " + s.expiresAt.Format("Jan 2 15:04"), nil
 }
 
+// keepsResumeRecord reports whether a stop for this reason must PRESERVE the
+// share's --persist record. Only a SIGTERM does: that's what the OS sends every
+// process at shutdown, which is precisely the case --persist exists for. Every
+// other reason is a deliberate stop, and a share stopped on purpose should stay
+// stopped across the next boot.
+func keepsResumeRecord(reason string) bool { return reason == "terminated" }
+
+func init() { defaultRun = cmdShare }
+
+// cmdShare is the bare `tshare [flags] <path…>` entry: build the config
+// (defaults < config file/profile < CLI flags, #71) and run the share.
+func cmdShare(args []string) {
+	c := defaultConfig()
+	applyConfig(c, args)
+	if err := parseArgs(args, c); err != nil {
+		os.Exit(2)
+	}
+	if c.WebWiz { // optional front end: present only when webwiz.go is built in
+		if run := commands["webwiz"]; run != nil {
+			run(args)
+			return
+		}
+		log.Fatal("tshare: this build has no terminal UI (built with -tags notui)")
+	}
+	if c.Once {
+		c.MaxDL = 1
+	}
+	if c.Live {
+		c.Progress = true // live implies progressive serving
+	}
+	if c.H265 { // --265: hardware HEVC to a temp file at constant quality
+		c.Transcode, c.Hevc = true, true
+		if c.CQ <= 0 || c.CQ > 63 {
+			c.CQ = 50
+		}
+	}
+	if err := runShare(c); err != nil {
+		log.Fatalf("tshare: %v", err)
+	}
+}
+
+// runShare is the life of one share, start to finish. Each stage is a method
+// below; the order matters and is the whole story:
+//
+//	prepareConfig   reject contradictory flags, fill in defaults and policy
+//	newShare        mint the id and the secret path
+//	resolveTarget   work out WHAT is shared: file, folder, site, server, room…
+//	applyModifiers  options that reshape it: --rar, --p2p, --filename
+//	applyLimits     caps and runtime-changeable settings
+//	listen/publish  bind the port; mount it on Tailscale (or just the LAN)
+//	startBackends   servers a share fronts: MiroTalk, Uptime Kuma, copyparty
+//	serve           answer requests until a signal, an expiry or `stop`
+//
+// Everything a stage starts is undone by cleanup, however the share ends.
 func runShare(c *config) error {
+	if err := prepareConfig(c); err != nil {
+		return err
+	}
+	s, err := newShare(c)
+	if err != nil {
+		return err
+	}
+	// Servers launched during setup (run/host) must not outlive a setup
+	// failure; the full cleanup below takes them over once it's deferred.
+	cleanupArmed := false
+	defer func() {
+		if !cleanupArmed {
+			stopAll(s.procs)
+		}
+	}()
+	if err := s.resolveTarget(); err != nil {
+		return err
+	}
+	if err := s.applyModifiers(); err != nil {
+		return err
+	}
+	if err := s.applyLimits(); err != nil {
+		return err
+	}
+
+	// --persist is a promise that these shares come back, and that needs
+	// something to run `tshare resume` at login. Do it here, before the -b
+	// hand-off, so the interactive process reports it to the terminal rather
+	// than the detached child's log file.
+	if c.Persist && !c.daemonChild && loginAgent != nil {
+		loginAgent.ForPersist(c.Quiet)
+	}
+
+	// background: re-exec a detached child, wait for it to publish its state
+	if c.Background && !c.daemonChild {
+		return daemonize(s)
+	}
+
+	ep, err := s.listen()
+	if err != nil {
+		return err
+	}
+	if err := s.publish(ep); err != nil {
+		return err
+	}
+	if err := s.saveState(ep.port); err != nil {
+		log.Printf("warn: %v", err)
+	}
+	stopReason := "" // why we stopped; decides whether the resume record survives
+	defer func() { s.cleanup(stopReason) }()
+	cleanupArmed = true
+
+	// After the cleanup is armed, so a backend that fails to start can't leak.
+	if err := s.startBackends(); err != nil {
+		return err
+	}
+	s.ctlServe() // control socket for `tshare set` / `tshare info`
+	s.announce(ep.port)
+	s.openLocalPages(ep.port)
+	// start any deferred work that should run only after the link/QR is printed
+	// (e.g. the background yt-dlp download for a single-file share)
+	if s.afterAnnounce != nil {
+		s.afterAnnounce()
+	}
+
+	stopReason, err = s.serve(ep.ln)
+	return err
+}
+
+// prepareConfig rejects contradictory flags and fills in defaults and policy.
+func prepareConfig(c *config) error {
 	if c.HTTPSPort != 443 && c.HTTPSPort != 8443 && c.HTTPSPort != 10000 {
 		return errors.New("--https-port must be 443, 8443 or 10000")
 	}
@@ -159,6 +301,15 @@ func runShare(c *config) error {
 	}
 	if c.Upload && c.Zip {
 		return errors.New("-u and -z don't combine")
+	}
+	if c.Full && c.ReadOnly {
+		return errors.New("--full and --ro/--read-only don't combine")
+	}
+	if c.ReadOnly && c.AllowUpload {
+		return errors.New("--ro/--read-only and --allow-upload don't combine")
+	}
+	if (c.Full || c.ReadOnly) && c.Blackhole {
+		return errors.New("--full/--ro don't apply to blackhole (-i)")
 	}
 	// links default to a 15-day lifetime so forgotten public links don't
 	// live forever; any explicit -e (including "never") overrides, and a
@@ -170,6 +321,15 @@ func runShare(c *config) error {
 	if c.GameLink {
 		c.Site = true
 		c.AllowUpload = true
+	}
+
+	// --root publishes a website, so a folder or .html given with it means
+	// --site: `tshare --root ./blog` just works. (run/host/-s apps are servers.)
+	if c.Root && !c.Site && len(c.RunCmd) == 0 && !c.Server && len(c.Paths) == 1 && !looksLikeURL(c.Paths[0]) {
+		if fi, err := os.Stat(c.Paths[0]); err == nil &&
+			(fi.IsDir() || strings.EqualFold(filepath.Ext(c.Paths[0]), ".html") || strings.EqualFold(filepath.Ext(c.Paths[0]), ".htm")) {
+			c.Site = true
+		}
 	}
 
 	// Websites and the hub are long-term by nature, so they default to never.
@@ -192,20 +352,36 @@ func runShare(c *config) error {
 			}
 		}
 	}
+	return nil
+}
 
+// newShare mints a share's identity: its id and its secret path.
+func newShare(c *config) (*share, error) {
 	s := &share{cfg: c, shutdown: make(chan string, 1), createdAt: time.Now()}
-
 	// identity (needed before stdin buffering names its temp file)
 	s.id = c.daemonID
 	if s.id == "" {
 		s.id = randToken(6)
 	}
-	if c.Name != "" {
+	switch {
+	case c.tokenSeed != "":
+		// resumed/re-execed share: serve the SAME secret path, so every link
+		// handed out before the restart still works.
+		if !validSlug(c.tokenSeed) {
+			return nil, errors.New("--__token is not a valid share path")
+		}
+		s.token = c.tokenSeed
+	case c.Name != "":
 		s.token = c.Name
-	} else {
+	default:
 		s.token = randToken(c.TokenLen)
 	}
+	return s, nil
+}
 
+// resolveTarget works out what this share serves and sets its mode and roots.
+func (s *share) resolveTarget() error {
+	c := s.cfg
 	// resolve targets
 	oneInput := !c.Upload && !c.Blackhole && !c.Room && !c.Call && !c.Hub && !c.Kuma && !c.Dashboard && len(c.RunCmd) == 0 && len(c.Paths) == 1
 	// -s, or a localhost URL ("automatically if it is not a website"), means
@@ -289,6 +465,15 @@ func runShare(c *config) error {
 		// then download in the background. Resolve the eventual filename first so
 		// the printed link is real and visitors can be held with a percentage
 		// page until the file is ready.
+		if c.Background && !c.daemonChild {
+			// -b: the detached child is the one that stays up, so it does all of
+			// this itself — resolve the name, go live, download. Resolving here
+			// would hand it the path of a file that doesn't exist yet.
+			s.mode = "file"
+			s.roots = []rootEnt{{Name: "download"}}
+			s.ytPend = &ytPending{}
+			break
+		}
 		dir, err := ytMakeDir(s.id)
 		if err != nil {
 			return err
@@ -401,13 +586,19 @@ func runShare(c *config) error {
 		}
 		s.mode = "room"
 		s.roomName = name
+		s.mirotalkJWTKey = c.MirotalkJWTKey
 		base := strings.TrimRight(c.MirotalkURL, "/")
 		switch {
 		case base != "":
 			if !strings.HasPrefix(base, "http://") && !strings.HasPrefix(base, "https://") {
 				return errors.New("--mirotalk-url must be an http(s) URL")
 			}
-			s.roomURL = base + "/join?room=" + url.QueryEscape(name)
+			s.roomOrigin = base
+			var errRoom error
+			s.roomURL, errRoom = s.sealedRoomURL(base, name)
+			if errRoom != nil {
+				return errRoom
+			}
 		default:
 			// local instance: resolved/started later (needs the funnel host for the
 			// join URL). Verify it's locatable now so the error comes before mounting.
@@ -443,8 +634,18 @@ func runShare(c *config) error {
 		if err := os.MkdirAll(abs, 0o755); err != nil {
 			return err
 		}
-		s.mode, s.upDir = "inbox", abs
 		s.roots = []rootEnt{{Name: filepath.Base(abs), Abs: abs, IsDir: true}}
+		// Default -u is a write-only drop box. --full / --ro open the uploads
+		// folder for browsing: full rights (copyparty A) or read-only.
+		// Native fallback uses dir mode so listing works without copyparty.
+		switch {
+		case c.ReadOnly:
+			s.mode, s.upDir = "dir", ""
+		case c.Full:
+			s.mode, s.upDir = "dir", abs
+		default:
+			s.mode, s.upDir = "inbox", abs
+		}
 	case len(c.Paths) == 0:
 		fmt.Print(usageText)
 		return errors.New("nothing to share")
@@ -491,6 +692,16 @@ func runShare(c *config) error {
 				return errors.New("--allow-upload works with a single folder share")
 			}
 		}
+	}
+	return nil
+}
+
+// applyModifiers applies the options that reshape a resolved share.
+func (s *share) applyModifiers() error {
+	c := s.cfg
+	// --full / --ro only apply to a single folder (incl. -u uploads dir).
+	if (c.Full || c.ReadOnly) && s.mode != "dir" && s.mode != "inbox" {
+		return errors.New("--full/--ro apply to a folder share or -u uploads inbox")
 	}
 	if c.Zip && s.mode == "file" {
 		c.Zip = false // zipping one file is pointless; serve as-is
@@ -553,7 +764,12 @@ func runShare(c *config) error {
 			log.Printf("  ℹ folder has index.html — add --site to serve it as a live website")
 		}
 	}
+	return nil
+}
 
+// applyLimits sets the caps and the settings `tshare set` can change later.
+func (s *share) applyLimits() error {
+	c := s.cfg
 	var err error
 	s.maxUp, err = parseSize(c.MaxUpload)
 	if err != nil {
@@ -582,6 +798,14 @@ func runShare(c *config) error {
 		return err
 	}
 	s.blackhole = c.Blackhole
+	// An inbox on a nearly-full disk refuses every upload, and only the person
+	// uploading is told why. Say so now, to the one who can fix it.
+	if s.upDir != "" && !s.blackhole && s.minFree > 0 && !c.Quiet && !c.daemonChild {
+		if free, err := diskFree(s.upDir); err == nil && free < s.minFree {
+			log.Printf("  ⚠ uploads will be REFUSED: %s free here, and --min-free is %s.", humanSize(free), humanSize(s.minFree))
+			log.Printf("    free up space, or lower the guard:  --min-free 1G   (0 turns it off)")
+		}
+	}
 
 	// #10: at-rest encryption key for received files. Reuse the bg-inherited
 	// key, else derive from the password, else generate and print one once.
@@ -594,26 +818,54 @@ func runShare(c *config) error {
 	// runtime-mutable settings (changeable later via `tshare set`)
 	s.password = c.Password
 	s.maxDL.Store(c.MaxDL)
-	if c.Expires > 0 {
+	if c.expiresPin != "" {
+		// resumed share: restore the original deadline instead of starting the
+		// clock over, so a reboot can't quietly extend a share's life.
+		t, err := time.Parse(time.RFC3339, c.expiresPin)
+		if err != nil {
+			return fmt.Errorf("bad --__expires %q: %v", c.expiresPin, err)
+		}
+		s.expiresAt = t
+	} else if c.Expires > 0 {
 		s.expiresAt = time.Now().Add(c.Expires)
 	}
+	return nil
+}
 
-	// background: re-exec a detached child, wait for it to publish its state
-	if c.Background && !c.daemonChild {
-		return daemonize(s)
-	}
+// endpoint is where a share listens.
+type endpoint struct {
+	ln     net.Listener
+	port   int
+	scheme string // "http", or "https" with --lan-https
+	lanOn  bool   // also answering directly on the LAN, not just via tailscaled
+}
 
+// listen binds the share's port.
+func (s *share) listen() (*endpoint, error) {
+	c := s.cfg
 	// listener — bind all interfaces when we also want direct LAN reach
 	// (always in --local; otherwise unless --no-lan). tailscaled still proxies
 	// funnel/serve traffic via loopback, so this only ADDS a LAN path.
-	lanOn := c.Local || (c.LAN && !c.NoLAN)
+	if c.Root && s.mode != "site" && s.mode != "server" {
+		return nil, errors.New("--root is for websites and apps (--site, tshare host, tshare run, -s);\n" +
+			"  files and folders keep their secret link")
+	}
+	// A --root share has no secret path. Off --local it's reached only through
+	// the tailscale mount, so it must not ALSO answer token-less on the LAN.
+	lanOn := c.Local || (c.LAN && !c.NoLAN && !c.Root)
 	bind := "127.0.0.1:"
 	if lanOn {
 		bind = "0.0.0.0:"
 	}
+	// resumed share: take back the port it had, so a --local link (which
+	// carries the port) is byte-identical after a restart. Best effort — if
+	// something else took it meanwhile, fall through to a fresh one.
+	if c.bindPort > 0 && c.Port == 0 && !portListening(c.bindPort) {
+		c.Port = c.bindPort
+	}
 	ln, err := net.Listen("tcp", bind+strconv.Itoa(c.Port))
 	if err != nil {
-		return err
+		return nil, err
 	}
 	port := ln.Addr().(*net.TCPAddr).Port
 
@@ -622,19 +874,29 @@ func runShare(c *config) error {
 	scheme := "http"
 	if c.LanHTTPS {
 		if !c.Local {
-			return errors.New("--lan-https only applies with --local (Tailscale already provides HTTPS)")
+			return nil, errors.New("--lan-https only applies with --local (Tailscale already provides HTTPS)")
 		}
 		tc, err := selfSignedTLS([]string{lanIP(), "127.0.0.1", "localhost"})
 		if err != nil {
-			return err
+			return nil, err
 		}
 		ln = tls.NewListener(ln, tc)
 		scheme = "https"
 	}
+	return &endpoint{ln: ln, port: port, scheme: scheme, lanOn: lanOn}, nil
+}
 
+// publish gives the share its link: a Tailscale funnel/serve mount, or just
+// the LAN address under --local.
+func (s *share) publish(ep *endpoint) error {
+	c := s.cfg
+	port, scheme, lanOn := ep.port, ep.scheme, ep.lanOn
 	// public/tailnet URL + tailscale registration
 	if c.Local {
 		s.baseURL = fmt.Sprintf("%s://%s:%d/%s", scheme, lanIP(), port, s.token)
+		if c.Root {
+			s.baseURL = fmt.Sprintf("%s://%s:%d", scheme, lanIP(), port)
+		}
 	} else {
 		ts, err := tsStatus(c)
 		if err != nil {
@@ -644,15 +906,21 @@ func runShare(c *config) error {
 		if host == "" {
 			return errors.New("no MagicDNS name; enable MagicDNS + HTTPS in the Tailscale admin console")
 		}
-		if nameInUse(s.token) {
+		mount := s.token
+		if c.Root {
+			if owner := rootInUse(); owner != "" {
+				return fmt.Errorf("the funnel root is already served by share %s — stop it first (tshare rm %s)", owner, owner)
+			}
+			mount = ""
+		} else if nameInUse(s.token) {
 			return fmt.Errorf("path /%s is already used by another tshare share", s.token)
 		}
-		if out, err := tsMount(c, s.token, port); err != nil {
+		if out, err := tsMount(c, mount, port); err != nil {
 			// #68: Funnel not available (attribute off, etc.) — automatically
 			// fall back to tailnet-only serve so the share still works, unless
 			// the user explicitly asked for funnel-only behavior.
 			if !c.Tailnet && funnelUnavailable(out) {
-				if out2, err2 := tsMount(&config{Tailnet: true, HTTPSPort: c.HTTPSPort, TSBin: c.TSBin}, s.token, port); err2 == nil {
+				if out2, err2 := tsMount(&config{Tailnet: true, HTTPSPort: c.HTTPSPort, TSBin: c.TSBin}, mount, port); err2 == nil {
 					c.Tailnet = true
 					fmt.Fprintln(os.Stderr, "  ⚠ Funnel unavailable — fell back to tailnet-only (serve).")
 					fmt.Fprintln(os.Stderr, "    enable Funnel for public links: https://tailscale.com/kb/1223/funnel")
@@ -663,10 +931,14 @@ func runShare(c *config) error {
 				return fmt.Errorf("tailscale %s failed:\n%s\n  hint: run `tshare doctor` (Funnel needs the funnel node attribute and HTTPS certs: https://tailscale.com/kb/1223/funnel)", verb(c), strings.TrimSpace(out))
 			}
 		}
-		if c.HTTPSPort == 443 {
-			s.baseURL = fmt.Sprintf("https://%s/%s", host, s.token)
-		} else {
-			s.baseURL = fmt.Sprintf("https://%s:%d/%s", host, c.HTTPSPort, s.token)
+		origin := "https://" + host
+		if c.HTTPSPort != 443 {
+			origin = fmt.Sprintf("https://%s:%d", host, c.HTTPSPort)
+		}
+		s.baseURL = origin + "/" + s.token
+		if c.Root {
+			s.baseURL = origin
+			s.mtRootMounted = true // unmounted on exit; reaped by `tshare rm`
 		}
 		// Warn if this "public" funnel link won't actually resolve on the public
 		// internet (Tailscale hasn't published the *.ts.net DNS record) — else the
@@ -689,46 +961,51 @@ func runShare(c *config) error {
 			}
 		}
 	}
+	return nil
+}
 
-	// state file
-	if err := s.saveState(port); err != nil {
-		log.Printf("warn: %v", err)
+// cleanup undoes everything the share set up. It runs however the share ends
+// (signal, expiry, a failed backend) — but not on SIGKILL, which is what
+// `tshare rm` and `tshare cleanup` cover.
+func (s *share) cleanup(stopReason string) {
+	c := s.cfg
+	if !c.Local {
+		tsUnmount(c, s.token)
 	}
-	cleanup := func() {
-		if !c.Local {
-			tsUnmount(c, s.token)
-		}
-		os.Remove(stateFile(s.id))
-		if s.ctlPath != "" {
-			os.Remove(s.ctlPath)
-		}
-		if s.tmpFile != "" {
-			os.Remove(s.tmpFile)
-		}
-		if s.tmpDir != "" {
-			os.RemoveAll(s.tmpDir)
-		}
-		if c.daemonTmp != "" {
-			os.Remove(c.daemonTmp)
-		}
-		if c.daemonTmpDir != "" {
-			os.RemoveAll(c.daemonTmpDir)
-		}
-		// intentional stop/expiry → drop the resume record (reboot keeps it,
-		// because cleanup doesn't run when the process is killed by shutdown)
+	os.Remove(stateFile(s.id))
+	if s.ctlPath != "" {
+		os.Remove(s.ctlPath)
+	}
+	if s.tmpFile != "" {
+		os.Remove(s.tmpFile)
+	}
+	if s.tmpDir != "" {
+		os.RemoveAll(s.tmpDir)
+	}
+	if c.daemonTmp != "" {
+		os.Remove(c.daemonTmp)
+	}
+	if c.daemonTmpDir != "" {
+		os.RemoveAll(c.daemonTmpDir)
+	}
+	// Drop the resume record only when the stop was INTENTIONAL: Ctrl-C, an
+	// expiry, a byte cap, an explicit `stop`. SIGTERM is what the OS sends
+	// every process at shutdown (launchd and systemd both do), and cleanup
+	// does run then — dropping the record there would delete exactly the
+	// shares --persist exists to bring back. `tshare rm`/`panic` remove the
+	// record themselves, so stopping a share on purpose still forgets it.
+	if !keepsResumeRecord(stopReason) {
 		os.Remove(persistFile(s.id))
-		if s.cpCmd != nil && s.cpCmd.Process != nil {
-			s.cpCmd.Process.Kill()
-		}
-		if s.mtRootMounted {
-			tsUnmount(c, "") // root path we mounted for local MiroTalk
-		}
-		for _, p := range s.procs { // stop every managed server (run/host/room)
-			p.stop()
-		}
 	}
-	defer cleanup()
+	if s.mtRootMounted {
+		tsUnmount(c, "") // root path we mounted for local MiroTalk / Kuma
+	}
+	stopAll(s.procs) // every managed server: run/host/room/kuma/copyparty
+}
 
+// startBackends starts the servers this share fronts and wires them in.
+func (s *share) startBackends() error {
+	c := s.cfg
 	// --room with the LOCAL MiroTalk: start it (or reuse a running one), expose
 	// it at the funnel/serve ROOT path, and point the join URL at that origin.
 	// Runs after `defer cleanup()` so a failure can't leak the child process.
@@ -737,14 +1014,20 @@ func runShare(c *config) error {
 			return err
 		}
 		if c.Local {
-			// same-machine testing only: cam/mic need a secure context, so plain
-			// LAN HTTP works from this machine (localhost) but not from others.
 			origin := fmt.Sprintf("http://%s:%d", lanIP(), c.MirotalkPort)
-			s.roomURL = origin + "/join?room=" + url.QueryEscape(s.roomName)
+			s.roomOrigin = origin
+			var errRoom error
+			s.roomURL, errRoom = s.sealedRoomURL(origin, s.roomName)
+			if errRoom != nil {
+				return errRoom
+			}
 			if !c.Quiet {
 				log.Printf("  ⚠ --local room: browsers block cam/mic on plain HTTP except on this machine — use funnel/serve for real calls")
 			}
 		} else {
+			if owner := rootInUse(); owner != "" {
+				return fmt.Errorf("the funnel root is already served by share %s — stop it first (tshare rm %s)", owner, owner)
+			}
 			if out, err := tsMount(c, "", c.MirotalkPort); err != nil {
 				return fmt.Errorf("mounting MiroTalk at the %s root failed:\n%s", verb(c), strings.TrimSpace(out))
 			}
@@ -753,7 +1036,12 @@ func runShare(c *config) error {
 			if err != nil {
 				return err
 			}
-			s.roomURL = u.Scheme + "://" + u.Host + "/join?room=" + url.QueryEscape(s.roomName)
+			s.roomOrigin = u.Scheme + "://" + u.Host
+			var errRoom error
+			s.roomURL, errRoom = s.sealedRoomURL(s.roomOrigin, s.roomName)
+			if errRoom != nil {
+				return errRoom
+			}
 		}
 		s.roots[0].Abs = s.roomURL
 		s.updateState() // re-record: join URL + child pid + root mount now exist
@@ -769,6 +1057,9 @@ func runShare(c *config) error {
 		if c.Local { // LAN-only: reach Kuma directly, no funnel root mount
 			s.kumaURL = fmt.Sprintf("http://%s:%d/", lanIP(), c.KumaPort)
 		} else {
+			if owner := rootInUse(); owner != "" {
+				return fmt.Errorf("the funnel root is already served by share %s — stop it first (tshare rm %s)", owner, owner)
+			}
 			if out, err := tsMount(c, "", c.KumaPort); err != nil {
 				return fmt.Errorf("mounting Uptime Kuma at the %s root failed:\n%s", verb(c), strings.TrimSpace(out))
 			}
@@ -786,7 +1077,7 @@ func runShare(c *config) error {
 	// on loopback and reverse-proxy to it — tshare keeps the token gate,
 	// password, expiry, byte cap, logging and probe alerts in front.
 	if s.useCopyparty() {
-		if err := startCopyparty(s); err != nil {
+		if p, err := startCopyparty(s); err != nil {
 			if c.Copyparty { // explicitly requested → hard error
 				return err
 			}
@@ -794,7 +1085,7 @@ func runShare(c *config) error {
 				log.Printf("  copyparty failed to start — using native folder server:\n  %v", err)
 			}
 		} else if !c.Quiet {
-			log.Printf("  ▷ folders served by copyparty (pid %d) behind tshare", s.cpCmd.Process.Pid)
+			log.Printf("  ▷ folders served by copyparty (pid %d) behind tshare", p.pid())
 		}
 	} else if (s.mode == "dir" || s.mode == "inbox") && !c.NoCopyparty && s.encKey == nil && !c.Quiet {
 		// folder share, auto mode, copyparty simply not detected — say so, since
@@ -802,13 +1093,13 @@ func runShare(c *config) error {
 		log.Printf("  ℹ using built-in folder server (copyparty not found).")
 		log.Printf("     for resumable uploads/thumbnails: pip install copyparty   (check: tshare doctor)")
 	}
+	return nil
+}
 
-	// control socket for `tshare set` / `tshare info`
-	s.ctlServe()
-
-	// announce
-	s.announce(port)
-
+// openLocalPages opens the pages that must run on THIS machine: the game
+// host page (--gamelink) and the P2P sender tab (--p2p).
+func (s *share) openLocalPages(port int) {
+	c := s.cfg
 	// --gamelink: open this machine's browser straight into host mode — the page
 	// creates the WebRTC offer itself (#gnhost), so hosting needs zero clicks.
 	if s.gameSid != "" && !c.daemonChild {
@@ -831,13 +1122,11 @@ func runShare(c *config) error {
 			openBrowser(sendURL)
 		}
 	}
+}
 
-	// start any deferred work that should run only after the link/QR is printed
-	// (e.g. the background yt-dlp download for a single-file share)
-	if s.afterAnnounce != nil {
-		s.afterAnnounce()
-	}
-
+// serve answers requests until the share is told to stop, and reports why.
+func (s *share) serve(ln net.Listener) (reason string, err error) {
+	c := s.cfg
 	// serve
 	started := time.Now()
 	srv := &http.Server{
@@ -884,16 +1173,23 @@ func runShare(c *config) error {
 	sig := make(chan os.Signal, 2)
 	signal.Notify(sig, syscall.SIGINT, syscall.SIGTERM)
 
-	var reason string
 	select {
 	case sg := <-sig:
 		reason = sg.String()
 	case reason = <-s.shutdown:
 	case err := <-errCh:
-		return err // deferred cleanup runs
+		return "", err // the caller's deferred cleanup runs
 	}
 	if !c.Quiet {
 		log.Printf("⏹  stopping (%s)…", reason)
+	}
+	// A server we launched (run/host) is what holds proxied streams open —
+	// SSE, long polls — and those would pin the drain below for its whole 20s,
+	// past `tshare rm`'s patience (it SIGKILLs us, and cleanup never runs).
+	// Stop the upstream first so the drain ends at once; cleanup's stopAll is
+	// then a no-op.
+	if s.srvProxy != nil {
+		stopAll(s.procs)
 	}
 	ctx, cancel := context.WithTimeout(context.Background(), 20*time.Second)
 	defer cancel()
@@ -902,7 +1198,7 @@ func runShare(c *config) error {
 		log.Printf("  done · %d download(s) · %d upload(s) · up %s",
 			s.dl.Load(), s.upCount.Load(), time.Since(started).Round(time.Second))
 	}
-	return nil
+	return reason, nil
 }
 
 func (s *share) trigger(reason string) {
@@ -954,16 +1250,44 @@ func sanitizeRoomName(n string) string {
 	return out
 }
 
-func randToken(n int) string {
-	const cs = "abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789-_"
-	b := make([]byte, n)
-	if _, err := rand.Read(b); err != nil {
-		panic(err)
+// makeJWT creates a signed JWT token containing the given claims (room, name, etc.)
+// using HMAC-SHA256 signed with the provided key. No external deps — stdlib only.
+func makeJWT(key string, claims map[string]interface{}, expiry time.Duration) (string, error) {
+	header := base64.RawURLEncoding.EncodeToString([]byte(`{"alg":"HS256","typ":"JWT"}`))
+
+	now := time.Now().Unix()
+	if expiry > 0 {
+		claims["iat"] = now
+		claims["exp"] = now + int64(expiry.Seconds())
+	} else {
+		claims["iat"] = now
 	}
-	for i := range b {
-		b[i] = cs[b[i]&63]
+
+	payloadBytes, err := json.Marshal(claims)
+	if err != nil {
+		return "", err
 	}
-	return string(b)
+	payload := base64.RawURLEncoding.EncodeToString(payloadBytes)
+
+	signingInput := header + "." + payload
+	mac := hmac.New(sha256.New, []byte(key))
+	mac.Write([]byte(signingInput))
+	sig := base64.RawURLEncoding.EncodeToString(mac.Sum(nil))
+
+	return signingInput + "." + sig, nil
+}
+
+// sealedRoomURL builds a room join URL where all secret params (room, name, etc.)
+// are sealed inside a JWT token instead of visible as query parameters.
+func (s *share) sealedRoomURL(origin, roomName string) (string, error) {
+	claims := map[string]interface{}{
+		"room": roomName,
+	}
+	token, err := makeJWT(s.mirotalkJWTKey, claims, 0)
+	if err != nil {
+		return "", err
+	}
+	return origin + "/join?token=" + url.PathEscape(token), nil
 }
 
 // randSid mints a GIGA-NET/1-L session id — lowercase alphanumeric only, since
@@ -1015,6 +1339,9 @@ func (s *share) announce(port int) {
 		}
 		if c.Local {
 			scope = "local network only"
+		}
+		if c.Root {
+			scope += " · root, no secret path"
 		}
 		exp := "never"
 		if t := s.getExpires(); !t.IsZero() {
@@ -1085,6 +1412,74 @@ func linkExtras(c *config, link string) {
 	}
 }
 
+// title is a short human label for dashboards / lists: filename, host, room name, etc.
+func (s *share) title() string {
+	switch s.mode {
+	case "file":
+		if len(s.roots) > 0 && s.file().Name != "" {
+			return s.file().Name
+		}
+	case "server":
+		if len(s.roots) > 0 && s.roots[0].Name != "" {
+			return s.roots[0].Name
+		}
+		if u, err := url.Parse(s.srvURL); err == nil && u.Host != "" {
+			return u.Host
+		}
+		return s.srvURL
+	case "site", "dir":
+		if len(s.roots) > 0 {
+			if s.roots[0].Name != "" {
+				return s.roots[0].Name
+			}
+			if base := filepath.Base(s.roots[0].Abs); base != "" && base != "." {
+				return base
+			}
+		}
+	case "hub":
+		if base := filepath.Base(s.upDir); base != "" && base != "." {
+			return base
+		}
+		return "hub"
+	case "inbox":
+		if s.blackhole {
+			return "blackhole"
+		}
+		if base := filepath.Base(s.upDir); base != "" && base != "." {
+			return base
+		}
+		return "inbox"
+	case "room":
+		if s.roomName != "" {
+			return s.roomName
+		}
+		return "video room"
+	case "kuma":
+		return "Uptime Kuma"
+	case "call":
+		return "video call"
+	case "multi":
+		if n := len(s.roots); n > 0 {
+			if s.roots[0].Name != "" {
+				if n == 1 {
+					return s.roots[0].Name
+				}
+				return fmt.Sprintf("%s +%d", s.roots[0].Name, n-1)
+			}
+			return fmt.Sprintf("%d items", n)
+		}
+	case "dashboard":
+		return "shares"
+	}
+	if len(s.roots) > 0 && s.roots[0].Name != "" {
+		return s.roots[0].Name
+	}
+	if s.mode != "" {
+		return s.mode
+	}
+	return "share"
+}
+
 func (s *share) describe() string {
 	cp := ""
 	if s.cpProxy != nil {
@@ -1097,8 +1492,15 @@ func (s *share) describe() string {
 				return fmt.Sprintf("%s (downloading…)", s.roots[0].Name)
 			}
 		}
-		return fmt.Sprintf("%s (%s)", s.roots[0].Abs, humanSize(s.roots[0].Size))
+		f := s.file()
+		return fmt.Sprintf("%s (%s)", f.Abs, humanSize(f.Size))
 	case "server":
+		// Prefer the run/host app name when it isn't just the upstream host.
+		if len(s.roots) > 0 && s.roots[0].Name != "" {
+			if u, err := url.Parse(s.srvURL); err == nil && s.roots[0].Name != u.Host {
+				return s.roots[0].Name + " → " + s.srvURL
+			}
+		}
 		return "reverse proxy → " + s.srvURL
 	case "site":
 		return fmt.Sprintf("website %s (index: %s)", s.roots[0].Abs, s.siteIndex)
@@ -1121,7 +1523,12 @@ func (s *share) describe() string {
 		if s.cfg.Zip {
 			extra = " (as zip)"
 		}
-		if s.upDir != "" {
+		switch {
+		case s.cfg.Full:
+			extra = " (full access)"
+		case s.cfg.ReadOnly:
+			extra = " (read-only)"
+		case s.upDir != "":
 			extra = " (uploads allowed)"
 		}
 		return s.roots[0].Abs + extra + cp
@@ -1130,7 +1537,7 @@ func (s *share) describe() string {
 
 func (s *share) prettyURL() string {
 	if s.mode == "file" {
-		return s.baseURL + "/" + url.PathEscape(s.roots[0].Name)
+		return s.baseURL + "/" + url.PathEscape(s.file().Name)
 	}
 	return s.baseURL + "/"
 }
@@ -1152,7 +1559,7 @@ func (s *share) lanLink() string {
 		return ""
 	}
 	if s.mode == "file" {
-		return s.lanURL + "/" + url.PathEscape(s.roots[0].Name)
+		return s.lanURL + "/" + url.PathEscape(s.file().Name)
 	}
 	return s.lanURL + "/"
 }

@@ -5,13 +5,11 @@ package main
 import (
 	"context"
 	"encoding/json"
-	"errors"
 	"fmt"
 	"net"
-	"os"
 	"os/exec"
-	"runtime"
 	"strconv"
+	"strings"
 	"time"
 )
 
@@ -24,24 +22,7 @@ type tsInfo struct {
 	CertDomains  []string
 }
 
-func tsBin(c *config) (string, error) {
-	if c.TSBin != "" {
-		return c.TSBin, nil
-	}
-	if env := os.Getenv("TAILSCALE"); env != "" {
-		return env, nil
-	}
-	if p, err := exec.LookPath("tailscale"); err == nil {
-		return p, nil
-	}
-	if runtime.GOOS == "darwin" {
-		mac := "/Applications/Tailscale.app/Contents/MacOS/Tailscale"
-		if _, err := os.Stat(mac); err == nil {
-			return mac, nil
-		}
-	}
-	return "", errors.New("tailscale CLI not found (install Tailscale, or pass --tailscale-bin)")
-}
+func tsBin(c *config) (string, error) { return tailscaleBin(c.TSBin) }
 
 // resolvesPublicly reports whether host has a public A/AAAA record, asking a
 // public resolver directly (not the local one, which on a tailnet answers for
@@ -94,13 +75,18 @@ func tsMount(c *config, mount string, port int) (string, error) {
 	return string(out), err
 }
 
-func tsUnmount(c *config, mount string) {
+// tsUnmount removes a funnel/serve mount. Most callers are best-effort
+// cleanup and ignore the result; `tshare cleanup` checks it.
+func tsUnmount(c *config, mount string) error {
 	bin, err := tsBin(c)
 	if err != nil {
-		return
+		return err
 	}
 	args := []string{verb(c),
 		"--https=" + strconv.Itoa(c.HTTPSPort),
 		"--set-path=/" + mount, "off"}
-	exec.Command(bin, args...).CombinedOutput()
+	if out, err := exec.Command(bin, args...).CombinedOutput(); err != nil {
+		return fmt.Errorf("%v: %s", err, strings.TrimSpace(string(out)))
+	}
+	return nil
 }

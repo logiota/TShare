@@ -179,10 +179,17 @@ var roomTmpl = template.Must(template.New("room").Parse(`<!doctype html>
 </div>
 <script>
 (function(){
- var join=document.getElementById('join'), dn=document.getElementById('dn'), base=join.getAttribute('href');
- function upd(){ var n=dn.value.trim(); join.href = n ? base+(base.indexOf('?')<0?'?':'&')+'name='+encodeURIComponent(n) : base; }
- dn.addEventListener('input', upd);
- dn.addEventListener('keydown', function(e){ if(e.key==='Enter'){ upd(); join.click(); } });
+ var join=document.getElementById('join'),dn=document.getElementById('dn'),base=join.getAttribute('href');
+ function doJoin(){
+  var n=dn.value.trim();
+  if(!n){window.open(base,'_blank','noopener,noreferrer');return}
+  fetch('',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({name:n})})
+   .then(function(r){return r.json()})
+   .then(function(d){if(d.url)window.open(d.url,'_blank','noopener,noreferrer')})
+   .catch(function(){window.open(base,'_blank','noopener,noreferrer')});
+ }
+ join.addEventListener('click',function(e){var n=dn.value.trim();if(n)e.preventDefault();doJoin()});
+ dn.addEventListener('keydown',function(e){if(e.key==='Enter'){e.preventDefault();doJoin()}});
 })();
 </script>
 </body></html>`))
